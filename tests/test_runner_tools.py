@@ -6,7 +6,8 @@ from dradar.runner import CLAUDE_DISALLOWED_TOOLS, build_pier_command
 
 def _assignment(agent, model="gpt-5.5", effort="medium"):
     return {"assignment_id": "a1", "task_id": "abs-module-cache-flags",
-            "agent": agent, "model": model, "effort": effort}
+            "agent": agent, "model": model, "effort": effort,
+            "agent_version": "0.145.0"}
 
 
 def _stub_pier(monkeypatch):
@@ -179,6 +180,16 @@ from pathlib import Path
 
 import pytest
 from dradar.runner import RunnerError, ensure_pier, ensure_tasks_root
+
+
+@pytest.fixture(autouse=True)
+def _stub_latest_codex_version(monkeypatch, request):
+    """Unit tests must never depend on the live npm registry."""
+    if request.node.name.startswith("test_resolve_latest_codex_cli_version"):
+        return
+    monkeypatch.setattr(
+        runner_mod, "resolve_latest_codex_cli_version", lambda *a, **k: "0.145.0",
+    )
 
 
 def test_ensure_pier_noop_when_required_version_present(monkeypatch):
@@ -480,3 +491,151 @@ def test_summarize_result_corrupt_json(tmp_path):
     p = tmp_path / "result.json"
     p.write_text("{not json")
     assert summarize_result(p) == {}
+
+
+class _NpmResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+def test_resolve_latest_codex_cli_version_uses_uncached_stable_tag(monkeypatch):
+    seen = {}
+
+    def get(url, **kwargs):
+        seen["url"] = url
+        seen.update(kwargs)
+        return _NpmResponse({"version": "0.145.0"})
+
+    monkeypatch.setattr(runner_mod.httpx, "get", get)
+
+    assert runner_mod.resolve_latest_codex_cli_version() == "0.145.0"
+    assert seen["url"] == runner_mod.CODEX_NPM_LATEST_URL
+    assert seen["headers"]["Cache-Control"] == "no-cache"
+    assert seen["follow_redirects"] is True
+
+
+@pytest.mark.parametrize("version", ["latest", "0.146.0-alpha.1", "", None])
+def test_resolve_latest_codex_cli_version_rejects_non_stable_values(
+        monkeypatch, version):
+    calls = []
+    monkeypatch.setattr(
+        runner_mod.httpx,
+        "get",
+        lambda *a, **k: calls.append(True) or _NpmResponse({"version": version}),
+    )
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda _: None)
+
+    with pytest.raises(RunnerError, match="refusing to start"):
+        runner_mod.resolve_latest_codex_cli_version()
+    assert len(calls) == runner_mod.CODEX_VERSION_LOOKUP_ATTEMPTS
+
+
+def test_resolve_latest_codex_cli_version_fails_closed_after_network_errors(
+        monkeypatch):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(True)
+        raise runner_mod.httpx.ConnectError("registry unavailable")
+
+    monkeypatch.setattr(runner_mod.httpx, "get", fail)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda _: None)
+
+    with pytest.raises(RunnerError, match="no model quota is consumed"):
+        runner_mod.resolve_latest_codex_cli_version()
+    assert len(calls) == runner_mod.CODEX_VERSION_LOOKUP_ATTEMPTS
+
+
+def test_resolve_latest_codex_cli_version_accepts_fresh_server_fallback(
+        monkeypatch):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(True)
+        assert kwargs["timeout"] == (
+            runner_mod.CODEX_VERSION_FALLBACK_LOOKUP_TIMEOUT_SEC
+        )
+        raise runner_mod.httpx.ConnectError("local proxy unavailable")
+
+    monkeypatch.setattr(runner_mod.httpx, "get", fail)
+
+    assert runner_mod.resolve_latest_codex_cli_version(
+        "0.145.0", server_version_verified=True,
+    ) == "0.145.0"
+    assert calls == [True]
+
+
+def test_run_trial_overrides_stale_server_pin_before_start(
+        tmp_path, monkeypatch):
+    captured = {}
+
+    def resolve(server_version, server_version_verified):
+        captured["server_version"] = server_version
+        captured["server_version_verified"] = server_version_verified
+        return "0.145.0"
+
+    monkeypatch.setattr(runner_mod, "resolve_latest_codex_cli_version", resolve)
+
+    def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):
+        captured["version"] = assignment["agent_version"]
+        captured["job_name"] = job_name
+        return ["pier", "run", job_name]
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            trial = tmp_path / "jobs" / captured["job_name"] / "task__t0"
+            (trial / "artifacts").mkdir(parents=True)
+            (trial / "artifacts" / "model.patch").write_text("diff")
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
+    assignment = _assignment("codex") | {
+        "agent_version": "0.144.1",
+        "agent_version_verified": True,
+    }
+
+    art = run_trial(assignment, tmp_path, tmp_path)
+
+    assert captured["version"] == "0.145.0"
+    assert captured["server_version"] == "0.144.1"
+    assert captured["server_version_verified"] is True
+    assert art.codex_cli_version == "0.145.0"
+
+
+def test_run_trial_registry_failure_starts_nothing(tmp_path, monkeypatch):
+    started = []
+    marked_started = []
+    monkeypatch.setattr(
+        runner_mod,
+        "resolve_latest_codex_cli_version",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RunnerError("registry unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_mod.subprocess,
+        "Popen",
+        lambda *a, **k: started.append(True),
+    )
+
+    with pytest.raises(RunnerError, match="registry unavailable"):
+        run_trial(
+            _assignment("codex"),
+            tmp_path,
+            tmp_path,
+            on_started=lambda: marked_started.append(True),
+        )
+
+    assert started == []
+    assert marked_started == []
+    assert not (tmp_path / "jobs").exists()

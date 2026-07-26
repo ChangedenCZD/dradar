@@ -19,6 +19,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
+
 from .manifest import task_content_hash
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
@@ -44,6 +46,12 @@ ALLOWLIST_TOML = (
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
 CLAUDE_DISALLOWED_TOOLS = "WebSearch WebFetch EnterPlanMode"
 
+CODEX_NPM_LATEST_URL = "https://registry.npmjs.org/@openai%2Fcodex/latest"
+CODEX_VERSION_LOOKUP_ATTEMPTS = 3
+CODEX_VERSION_LOOKUP_TIMEOUT_SEC = 10.0
+CODEX_VERSION_FALLBACK_LOOKUP_TIMEOUT_SEC = 3.0
+_STABLE_CODEX_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
 CODEX_SUBMISSION_PROMPT = """{{ instruction }}
 
 Before finishing, after the implementation is complete and committed, create
@@ -65,10 +73,79 @@ class TrialArtifacts:
     returncode: int
     duration_sec: float
     log_path: Path
+    codex_cli_version: str | None = None
 
 
 class RunnerError(RuntimeError):
     pass
+
+
+def resolve_latest_codex_cli_version(
+    server_version: str | None = None,
+    server_version_verified: bool = False,
+) -> str:
+    """Resolve npm's current stable Codex CLI tag to an exact version.
+
+    Pier installs the agent in a Docker build layer. Passing the literal
+    ``latest`` leaves that layer cacheable forever, while an exact version
+    changes the install command whenever npm's stable tag moves. Refuse to
+    start when neither the registry nor a freshly verified server pin is
+    available: silently using an older image could consume a volunteer's
+    quota before Codex rejects the model.
+    """
+    last_error: Exception | None = None
+    headers = {
+        "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    trusted_server_version = (
+        server_version
+        if (
+            server_version_verified
+            and isinstance(server_version, str)
+            and _STABLE_CODEX_VERSION_RE.fullmatch(server_version)
+        )
+        else None
+    )
+    for attempt in range(1, CODEX_VERSION_LOOKUP_ATTEMPTS + 1):
+        try:
+            response = httpx.get(
+                CODEX_NPM_LATEST_URL,
+                headers=headers,
+                timeout=(
+                    CODEX_VERSION_FALLBACK_LOOKUP_TIMEOUT_SEC
+                    if trusted_server_version
+                    else CODEX_VERSION_LOOKUP_TIMEOUT_SEC
+                ),
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            version = payload.get("version") if isinstance(payload, dict) else None
+            if not isinstance(version, str) or not _STABLE_CODEX_VERSION_RE.fullmatch(
+                version
+            ):
+                raise ValueError(
+                    f"npm returned a non-stable or malformed version: {version!r}"
+                )
+            return version
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = exc
+            # The server refreshes this exact pin once a minute and only marks
+            # it verified while that check is still fresh. This avoids making
+            # every volunteer's local proxy/TLS path a single point of failure
+            # without trusting a static or stale server config value.
+            if trusted_server_version:
+                return trusted_server_version
+            if attempt < CODEX_VERSION_LOOKUP_ATTEMPTS:
+                time.sleep(0.5 * attempt)
+    raise RunnerError(
+        "could not verify npm's latest stable Codex CLI version after "
+        f"{CODEX_VERSION_LOOKUP_ATTEMPTS} attempts; refusing to start an "
+        "outdated agent container so no model quota is consumed. Check access "
+        "to registry.npmjs.org, then run `dradar resume`."
+    ) from last_error
 
 
 class BuildFlakeError(RunnerError):
@@ -240,15 +317,19 @@ def build_pier_command(
         ]
         if resume_checkpoint is not None:
             cmd += ["--ak", f"checkpoint_path={resume_checkpoint}"]
-        # Server-pinned agent version. pier bakes `npm install -g
-        # @openai/codex@latest` into a Docker layer, so "latest" freezes at
-        # whenever THIS machine first built the image — stale images then
-        # fail hard on newer models (400 "requires a newer version of
-        # Codex"). Pinning changes the install command string, which busts
-        # that cached layer on every volunteer machine automatically, and
-        # puts the whole fleet on one known-good version chosen server-side.
-        if assignment.get("agent_version"):
-            cmd += ["--ak", f"version={assignment['agent_version']}"]
+        # The caller must resolve npm's stable tag to an exact version before
+        # every task start. Pier bakes `npm install -g @openai/codex@...` into
+        # a Docker layer, so the literal "latest" can stay cached forever.
+        # Exact versions change the install command and invalidate that layer.
+        version = assignment.get("agent_version")
+        if not isinstance(version, str) or not _STABLE_CODEX_VERSION_RE.fullmatch(
+            version
+        ):
+            raise RunnerError(
+                "a verified exact stable Codex CLI version is required before "
+                "starting the task container"
+            )
+        cmd += ["--ak", f"version={version}"]
     elif agent == "claude-code":
         oauth_token = claude_oauth_token()
         if not oauth_token:
@@ -734,6 +815,22 @@ def run_trial(
     on_started: Callable[[], None] | None = None,
     resume_checkpoint: Path | None = None,
 ) -> TrialArtifacts:
+    effective_assignment = assignment
+    codex_cli_version = None
+    if (dev_agent or assignment["agent"]) == "codex":
+        # Resolve before creating the job, extending the lease, or starting
+        # Pier. A registry outage therefore consumes no model quota and leaves
+        # the assignment safely retryable.
+        codex_cli_version = resolve_latest_codex_cli_version(
+            assignment.get("agent_version"),
+            bool(assignment.get("agent_version_verified")),
+        )
+        effective_assignment = {
+            **assignment,
+            "agent_version": codex_cli_version,
+        }
+        print(f"verified latest stable Codex CLI: {codex_cli_version}")
+
     work_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = work_dir / "jobs"
     job_name = f"a{assignment['assignment_id']}"
@@ -746,14 +843,14 @@ def run_trial(
     # A mid-task rate-limit death just ends the run (no sleep-and-resume) --
     # it surfaces as a nonzero pier rc, which _run_and_submit reports as
     # `interrupted` -> the server marks it invalid and the cell reopens.
-    timeout_sec = _trial_timeout_sec(assignment)
+    timeout_sec = _trial_timeout_sec(effective_assignment)
 
     if resume_checkpoint is None:
         cmd = build_pier_command(
-            assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
+            effective_assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
     else:
         cmd = build_pier_command(
-            assignment, tasks_root, jobs_dir, job_name, work_dir,
+            effective_assignment, tasks_root, jobs_dir, job_name, work_dir,
             dev_agent, resume_checkpoint=resume_checkpoint,
         )
     env = dict(os.environ)
@@ -846,6 +943,7 @@ def run_trial(
         returncode=proc.returncode,
         duration_sec=duration,
         log_path=log_path,
+        codex_cli_version=codex_cli_version,
     )
 
 
