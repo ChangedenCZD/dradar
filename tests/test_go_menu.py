@@ -489,7 +489,8 @@ class SubmitClient(FakeClient):
         return {"submission_id": f"s-{assignment_id}", "grade_status": "pending"}
 
 
-def _fake_art(base: Path, rc: int = 0, result_data: dict | None = None) -> TrialArtifacts:
+def _fake_art(base: Path, rc: int = 0, result_data: dict | None = None,
+              codex_cli_version: str | None = "0.145.0") -> TrialArtifacts:
     trial_dir = base / "trial"
     (trial_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     patch = trial_dir / "artifacts" / "model.patch"
@@ -502,7 +503,8 @@ def _fake_art(base: Path, rc: int = 0, result_data: dict | None = None) -> Trial
     job_dir.mkdir(exist_ok=True)
     return TrialArtifacts(job_dir=job_dir, trial_dir=trial_dir, patch=patch,
                           trajectory=None, result=result, returncode=rc,
-                          duration_sec=61.0, log_path=base / "pier.log")
+                          duration_sec=61.0, log_path=base / "pier.log",
+                          codex_cli_version=codex_cli_version)
 
 
 def test_clean_run_submits_outcome_completed(monkeypatch, tmp_path: Path):
@@ -513,6 +515,7 @@ def test_clean_run_submits_outcome_completed(monkeypatch, tmp_path: Path):
     tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
     assert tag == "submitted"
     assert client.submissions[0]["outcome"] == "completed"
+    assert client.submissions[0]["meta"]["codex_cli_version"] == "0.145.0"
 
 
 def test_nonzero_pier_rc_submits_outcome_interrupted_with_meta(monkeypatch, tmp_path: Path):

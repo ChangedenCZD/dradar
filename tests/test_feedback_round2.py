@@ -18,7 +18,8 @@ def test_pier_command_injects_git_identity(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     a = {"assignment_id": "a1", "task_id": "t", "agent": "codex",
-         "model": "gpt-5.6-sol", "effort": "low"}
+         "model": "gpt-5.6-sol", "effort": "low",
+         "agent_version": "0.145.0"}
     cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", home)
     for var in ("GIT_AUTHOR_NAME=dradar-trial", "GIT_COMMITTER_NAME=dradar-trial",
                 "GIT_AUTHOR_EMAIL=trial@dradar.invalid",
@@ -115,6 +116,14 @@ def test_quota_share_tiny_pct_never_shows_zero():
 import pytest
 
 from dradar.runner import BuildFlakeError, RunnerError, run_trial
+
+
+@pytest.fixture(autouse=True)
+def _stub_latest_codex_version(monkeypatch):
+    """Unit tests must never depend on the live npm registry."""
+    monkeypatch.setattr(
+        runner_mod, "resolve_latest_codex_cli_version", lambda *a, **k: "0.145.0",
+    )
 
 
 def _flaky_pier(monkeypatch, work_dir, fail_times, log_line, make_patch=True):

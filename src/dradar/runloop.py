@@ -745,6 +745,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "dev_agent": args.dev_agent,
         "task_content_hash_match": hash_match,
         "deep_swe_commit": local_commit,
+        "codex_cli_version": art.codex_cli_version,
         **stats,
     }
 

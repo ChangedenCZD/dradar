@@ -1,14 +1,16 @@
 """Interrupted-run honesty (from the first real volunteer bug report,
-2026-07-13): the CLI must pass the server's agent-version pin to pier (busts
-stale image caches that shipped codex too old for gpt-5.6), print the actual
+2026-07-13): the CLI must pass an exact agent version to Pier (busts stale
+image caches that shipped Codex too old for gpt-5.6), print the actual
 in-container exception instead of a blanket "wait for your quota", and keep
 the failure artifacts instead of deleting the only evidence."""
 import json
 from pathlib import Path
 
+import pytest
+
 import dradar.runloop as runloop
 import dradar.runner as runner_mod
-from dradar.runner import build_pier_command, diagnose_exception
+from dradar.runner import RunnerError, build_pier_command, diagnose_exception
 
 from test_go_menu import ASSIGNMENT, SubmitClient, _args, _fake_art
 
@@ -29,7 +31,7 @@ def _codex_cmd(tmp_path, monkeypatch, assignment):
     return build_pier_command(assignment, tmp_path, tmp_path / "jobs", "j", home)
 
 
-def test_pier_command_pins_server_agent_version(tmp_path, monkeypatch):
+def test_pier_command_passes_exact_agent_version(tmp_path, monkeypatch):
     a = {"assignment_id": "a1", "task_id": "t", "agent": "codex",
          "model": "gpt-5.6-sol", "effort": "low", "agent_version": "0.144.1"}
     cmd = _codex_cmd(tmp_path, monkeypatch, a)
@@ -37,11 +39,11 @@ def test_pier_command_pins_server_agent_version(tmp_path, monkeypatch):
     assert cmd[cmd.index("version=0.144.1") - 1] == "--ak"
 
 
-def test_pier_command_without_pin_stays_legacy(tmp_path, monkeypatch):
+def test_pier_command_refuses_non_exact_version(tmp_path, monkeypatch):
     a = {"assignment_id": "a1", "task_id": "t", "agent": "codex",
          "model": "gpt-5.6-sol", "effort": "low"}
-    cmd = _codex_cmd(tmp_path, monkeypatch, a)
-    assert not any(x.startswith("version=") for x in cmd)
+    with pytest.raises(RunnerError, match="exact stable Codex CLI version"):
+        _codex_cmd(tmp_path, monkeypatch, a)
 
 
 def _result(tmp_path, message, exc_type="NonZeroAgentExitCodeError"):
