@@ -1337,8 +1337,12 @@ def cmd_go(args) -> int:
 
         telemetry.set_phase("queued")
         # Self-heal before anything else: a trial from a previous run that ran
-        # but failed to upload must not just sit on disk forever.
-        _retry_pending_uploads(client)
+        # but failed to upload must not just sit on disk forever. The worker
+        # pool parent already drains this shared ledger before spawning its
+        # children; letting every child replay the same entries creates a
+        # duplicate-upload herd precisely when the server asks us to slow down.
+        if not getattr(args, "worker_child", False):
+            _retry_pending_uploads(client)
 
         recovered, found_checkpoints = _resume_local_checkpoints(
             client, args, tasks_root, telemetry,

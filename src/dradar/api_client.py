@@ -2,10 +2,16 @@
 
 import json
 import os
+import random
+import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+_RATE_LIMIT_RETRIES = 5
+_DEFAULT_RETRY_AFTER_SEC = 1.0
+_MAX_RETRY_AFTER_SEC = 60.0
 
 
 def _env_proxies_set() -> bool:
@@ -19,7 +25,7 @@ def _env_proxies_set() -> bool:
 
 class ApiError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None,
-                 code: str | None = None):
+                 code: str | None = None, retry_after: float | None = None):
         # None means "never got a real HTTP response" (DNS/connect/timeout) —
         # callers that need to branch on a specific status (e.g. 409 vs 410)
         # must check this instead of grepping the message, which can contain
@@ -31,6 +37,7 @@ class ApiError(RuntimeError):
         # expected for transport failures and older deployments; callers must
         # retain a conservative compatibility fallback for those responses.
         self.code = code
+        self.retry_after = retry_after
 
 
 class ApiClient:
@@ -60,6 +67,10 @@ class ApiClient:
             timeout=httpx.Timeout(30.0, write=None, read=120.0),
             transport=transport,
         )
+        # Test seams also keep the retry policy deterministic without making
+        # ordinary callers care about clocks or jitter.
+        self._sleep = time.sleep
+        self._jitter = random.uniform
 
     def _get(self, path: str) -> dict[str, Any]:
         return self._check(self._request("GET", path))
@@ -68,10 +79,27 @@ class ApiClient:
         return self._check(self._request("POST", path, **kw))
 
     def _request(self, method: str, path: str, **kw) -> httpx.Response:
+        for attempt in range(_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = self._client.request(method, path, **kw)
+            except httpx.HTTPError as exc:  # transport-level: connect/timeout/etc.
+                raise ApiError(f"cannot reach {self.server}: {exc}") from exc
+            if response.status_code != 429 or attempt == _RATE_LIMIT_RETRIES:
+                return response
+            retry_after = self._retry_after(response)
+            # A small independent offset prevents a 20-worker pool from
+            # waking on the same token boundary and recreating the 429 herd.
+            jitter = self._jitter(0.0, min(1.0, retry_after * 0.1))
+            self._sleep(retry_after + jitter)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response) -> float:
         try:
-            return self._client.request(method, path, **kw)
-        except httpx.HTTPError as exc:  # transport-level: connect/timeout/etc.
-            raise ApiError(f"cannot reach {self.server}: {exc}") from exc
+            value = float(resp.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            value = _DEFAULT_RETRY_AFTER_SEC
+        return min(_MAX_RETRY_AFTER_SEC, max(_DEFAULT_RETRY_AFTER_SEC, value))
 
     def _check(self, resp: httpx.Response) -> dict[str, Any]:
         if resp.status_code >= 400:
@@ -90,6 +118,9 @@ class ApiClient:
                 f"server returned {resp.status_code}: {detail}",
                 status_code=resp.status_code,
                 code=code,
+                retry_after=(
+                    self._retry_after(resp) if resp.status_code == 429 else None
+                ),
             )
         return resp.json()
 

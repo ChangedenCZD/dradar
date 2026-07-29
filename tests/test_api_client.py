@@ -50,6 +50,75 @@ def test_transport_failure_has_no_status_code():
     assert "cannot reach" in str(ei.value)
 
 
+def test_429_honors_retry_after_with_jitter_before_retrying():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if len(calls) < 3:
+            return httpx.Response(
+                429, headers={"Retry-After": "2"},
+                json={"detail": "rate limited — slow down"},
+            )
+        return httpx.Response(200, json={"nickname": "vol"})
+
+    client = _client(handler)
+    waits = []
+    client._sleep = waits.append
+    client._jitter = lambda _low, _high: 0.25
+
+    assert client.whoami() == {"nickname": "vol"}
+    assert calls == ["/api/v1/whoami"] * 3
+    assert waits == [2.25, 2.25]
+
+
+def test_429_retry_is_bounded_and_exposes_retry_after():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429, headers={"Retry-After": "9999"},
+            json={"detail": "rate limited — slow down"},
+        )
+
+    client = _client(handler)
+    waits = []
+    client._sleep = waits.append
+    client._jitter = lambda _low, _high: 0
+
+    with pytest.raises(ApiError) as ei:
+        client.whoami()
+    assert calls == 6
+    assert waits == [60.0] * 5
+    assert ei.value.status_code == 429
+    assert ei.value.retry_after == 60.0
+
+
+def test_multipart_submission_can_retry_after_429(tmp_path):
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.read())
+        if len(bodies) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        return httpx.Response(
+            200, json={"submission_id": "s1", "grade_status": "pending"},
+        )
+
+    patch = tmp_path / "model.patch"
+    patch.write_text("diff")
+    client = _client(handler)
+    client._sleep = lambda _seconds: None
+    client._jitter = lambda _low, _high: 0
+
+    ack = client.submit("a1", "nonce", patch, None, None, {})
+    assert ack["submission_id"] == "s1"
+    assert len(bodies) == 2
+    assert all(b'name="patch"' in body for body in bodies)
+
+
 def test_suggest_passes_n_and_returns_cells():
     seen = {}
 

@@ -107,20 +107,25 @@ class _Telemetry:
 
 
 @pytest.mark.parametrize(
-    ("worker_child", "expected_rc", "expected_checkout"),
-    ((True, 0, True), (False, 1, False)),
+    ("worker_child", "expected_rc", "expected_checkout", "expected_retry"),
+    ((True, 0, True, False), (False, 1, False, True)),
 )
 def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
-        monkeypatch, capsys, worker_child, expected_rc, expected_checkout):
+        monkeypatch, capsys, worker_child, expected_rc, expected_checkout,
+        expected_retry):
     """One checkpoint owner must not leave another confirmed pool slot idle."""
     checked_out = []
+    pending_retries = []
     monkeypatch.setattr(runloop, "_load_config", lambda: {})
     monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
     monkeypatch.setattr(runloop, "tasks_root_from_config", lambda _cfg: object())
     monkeypatch.setattr(runloop, "RunnerTelemetry", _Telemetry)
     monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
     monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
-    monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)
+    monkeypatch.setattr(
+        runloop, "_retry_pending_uploads",
+        lambda _client: pending_retries.append(True),
+    )
     monkeypatch.setattr(
         runloop, "_resume_local_checkpoints",
         lambda *_a, **_k: ([], True),  # every checkpoint lock was busy
@@ -136,6 +141,7 @@ def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
 
     assert runloop.cmd_go(args) == expected_rc
     assert bool(checked_out) is expected_checkout
+    assert bool(pending_retries) is expected_retry
     output = capsys.readouterr().out
     if worker_child:
         assert "checking for a different waiting task" in output
