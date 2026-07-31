@@ -40,6 +40,7 @@ def test_platform_linux_without_proc_version(monkeypatch, tmp_path: Path):
 
 def _run_doctor(monkeypatch, capsys, plat: str) -> tuple[int, str]:
     monkeypatch.setattr(doctor, "_platform", lambda: plat)
+    monkeypatch.setattr(doctor, "deepseek_opted_in", lambda: False)
     # No tools on PATH and no config: every check FAILs, printing every hint.
     monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
     monkeypatch.setattr(doctor, "_load_config", lambda: {})

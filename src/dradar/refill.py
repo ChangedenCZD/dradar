@@ -116,6 +116,10 @@ def _estimate_pct(assignment: dict, tier: str, windows: dict | None) -> float | 
 
 
 def _reserve(plan: dict, assignment: dict) -> bool:
+    if assignment.get("billing_mode") == "api":
+        raise RefillError(
+            "paid-API assignments are one-off runs; continuous refill stopped"
+        )
     assignment_id = assignment.get("assignment_id")
     if not assignment_id or assignment_id in plan["assignments"]:
         return False

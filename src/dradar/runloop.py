@@ -25,6 +25,7 @@ from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config, tasks_root_from_config
 from .machine import acquire_run_lock, sweep_orphan_compose
+from .providers import DEEPSEEK_PROVIDER, assignment_codex_provider
 from .runner import (
     DIAG_ADVICE, BuildFlakeError, RunnerError, build_codex_trajectory_bundle,
     check_task_content_hash, codex_trajectory_bundle_usage,
@@ -66,6 +67,8 @@ def _quota_share_line(a: dict) -> str:
     carries the tier windows, convert and show all three so everyone reads
     their own column; otherwise label the denomination instead of implying
     it's universal."""
+    if a.get("billing_mode") == "api":
+        return "pay-as-you-go API billing (not ChatGPT subscription quota)"
     pct = a.get("est_quota_pct")
     if pct is None:
         return "?"
@@ -81,7 +84,11 @@ def _quota_share_line(a: dict) -> str:
 
 def _print_assignment(a: dict) -> None:
     print(f"assignment {a['assignment_id']}: {a['task_id']}")
-    print(f"  model={a['model']} effort={a['effort']} agent={a['agent']}")
+    provider = f" provider={a['provider']}" if a.get("provider") else ""
+    print(
+        f"  model={a['model']} effort={a['effort']} "
+        f"agent={a['agent']}{provider}"
+    )
     if a.get("est_minutes"):
         # Denominated in the weekly window: Codex removed the 5h rolling
         # limit (2026-07), the 7d quota is the only constraint left.
@@ -91,8 +98,15 @@ def _print_assignment(a: dict) -> None:
 
 def _print_menu(menu: list[dict]) -> None:
     for i, m in enumerate(menu, 1):
-        est = f"~{m['est_minutes']} min, ~{m.get('est_quota_pct', '?')}%" if m.get("est_minutes") else "?"
-        print(f"  {i}. {m['task_id']}  model={m['model']} effort={m['effort']}  est={est}")
+        est = (
+            f"~{m['est_minutes']} min, {_quota_share_line(m)}"
+            if m.get("est_minutes") else "?"
+        )
+        provider = f" provider={m['provider']}" if m.get("provider") else ""
+        print(
+            f"  {i}. {m['task_id']}  model={m['model']} "
+            f"effort={m['effort']}{provider}  est={est}"
+        )
 
 
 def _choose_menu_entry(menu: list[dict], yes: bool) -> dict:
@@ -870,6 +884,20 @@ def _resume_one_checkpoint(
                 return "paused"
             if item.task_id and item.task_id != assignment.get("task_id"):
                 print(f"  {assignment_id}: checkpoint task does not match the lease; discarding it")
+                if _discard_checkpoint_quietly(
+                    client, item, assignment, reason="incompatible",
+                ):
+                    return "discarded"
+                return "paused"
+            if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
+                # The public DeepSeek path deliberately uses stock Pier and
+                # does not resume provider-ambiguous Codex checkpoints. This
+                # prevents an old OpenAI checkpoint from ever being restored
+                # through a paid DeepSeek assignment.
+                print(
+                    f"  {assignment_id}: DeepSeek checkpoints are not supported; "
+                    "discarding the stale local checkpoint"
+                )
                 if _discard_checkpoint_quietly(
                     client, item, assignment, reason="incompatible",
                 ):
@@ -1786,6 +1814,13 @@ def _prompt_positive_int(prompt: str, default: int) -> int:
 def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) -> list[dict]:
     """Configure/attach one shared plan, then perform its initial bounded top-up."""
     explicit = getattr(args, "refill", False)
+    if any(item.get("billing_mode") == "api" for item in active):
+        if explicit:
+            raise refill_plan.RefillError(
+                "continuous refill is unavailable for paid-API assignments; "
+                "run the DeepSeek task as an explicit one-off"
+            )
+        return active
     if not explicit and not args.yes and free_pick and active:
         answer = input(
             f"you selected {len(active)} task(s). Keep auto-refilling as they finish? [y/N] "
