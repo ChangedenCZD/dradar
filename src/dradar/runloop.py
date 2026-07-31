@@ -211,6 +211,31 @@ def _claim_picks(client: ApiClient, specs: list[str]) -> list[dict]:
     return claimed
 
 
+def _top_up_picks(
+    client: ApiClient, active: list[dict], specs: list[str],
+) -> list[dict]:
+    """Claim exact requested cells that are not already held.
+
+    The server remains authoritative for availability and account caps. This
+    local filter only prevents a running/held cell or a duplicate CLI flag
+    from turning a valid top-up request into an avoidable 409.
+    """
+    seen = {
+        (a.get("task_id"), a.get("model"), a.get("effort"))
+        for a in active
+    }
+    missing = []
+    for spec in specs:
+        cell = _parse_pick(spec)
+        if cell in seen:
+            task_id, model, effort = cell
+            print(f"  {task_id}/{model}@{effort}: already held; skipping")
+            continue
+        seen.add(cell)
+        missing.append(spec)
+    return active + _claim_picks(client, missing)
+
+
 def _claim_auto(client: ApiClient, n: int) -> list[dict]:
     """`dradar go --auto [N]`: auto-pick + claim up to N cells via the
     server's weighted-random suggester (/api/v1/suggest — the same primitive
@@ -1936,9 +1961,11 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
     elif not allow_new_claims and not active:
         print("disk safety floor reached — not claiming a new task. Existing leases are "
               "unchanged; use `dradar cleanup --docker --dry-run` to inspect cleanup.")
-    elif active and free_pick and wants_pick:
-        print(f"already holding {len(active)} cell(s) — ignoring --pick; "
-              "finish those (or `dradar resume`) before claiming exact cells")
+    elif free_pick and wants_pick:
+        try:
+            active = _top_up_picks(client, active, wants_pick)
+        except ApiError as exc:
+            _exit_for(exc)
     elif free_pick and auto_target is not None and not wants_refill:
         # --auto is a target batch size, not "claim N more": preserve existing
         # leases and ask only for the shortfall. The server keeps the ordinary
@@ -1952,14 +1979,6 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
         else:
             print(f"already holding {len(active)} cell(s) — --auto target "
                   f"{auto_target} already met")
-    elif not active and free_pick and wants_pick:
-        # Free-pick instances normally need a prior web claim; --auto/--pick
-        # claim straight from the CLI instead (volunteer issue #1,
-        # 2026-07-15) so an Agent never has to touch the web UI at all.
-        try:
-            active = _claim_picks(client, args.pick)
-        except ApiError as exc:
-            _exit_for(exc)
     if not allow_new_claims and wants_refill:
         refill_plan.stop(HOME, "disk free below image-cache safety floor")
         args.refill = False

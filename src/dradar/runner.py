@@ -16,6 +16,7 @@ import sys
 import time
 import tomllib
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -814,6 +815,49 @@ PIER_SPEC = (
 PIER_INSTALL_COMMAND = f"uv tool install --force '{PIER_SPEC}'"
 
 
+def _pier_install_lock_path() -> Path:
+    """One per-user lock because uv's tool store is shared across DRADAR_HOME."""
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache / "dradar" / "pier-install.lock"
+
+
+@contextmanager
+def _pier_install_lock():
+    """Serialize the check/install/recheck transaction across CLI processes."""
+    path = _pier_install_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as fh:
+        lock_acquired = False
+        windows_lock = False
+        try:
+            if os.name == "nt":  # pragma: no cover - exercised on Windows runners
+                import msvcrt
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() == 0:
+                    fh.write(b"\0")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                windows_lock = True
+                lock_acquired = True
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                lock_acquired = True
+            yield
+        finally:
+            if windows_lock and lock_acquired:  # pragma: no cover - Windows runners
+                try:
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            elif os.name != "nt" and lock_acquired:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def _pier_version(pier: str) -> str | None:
     try:
         proc = subprocess.run(
@@ -855,18 +899,25 @@ def ensure_pier() -> None:
         raise RunnerError(
             f"Pier {PIER_VERSION} is required but uv is missing -- install uv first: "
             f"{uv_hint}")
-    if pier:
-        print(f"Pier {installed_version or 'unknown'} lacks persistent resume — "
-              f"installing SecurityMind build {PIER_VERSION}...")
-    else:
-        print(f"pier not found — installing SecurityMind build {PIER_VERSION}...")
-    proc = subprocess.run([uv, "tool", "install", "--force", PIER_SPEC])
-    active_pier = shutil.which("pier")
-    active_version = _pier_version(active_pier) if active_pier else None
-    if proc.returncode != 0 or not _pier_version_compatible(active_version):
-        raise RunnerError(
-            f"couldn't activate Pier {PIER_VERSION}; run `{PIER_INSTALL_COMMAND}` "
-            "yourself and make sure ~/.local/bin precedes other Pier installs on PATH")
+    with _pier_install_lock():
+        # Another process may have completed the same shared uv-tool install
+        # while this one waited. Recheck under the lock before mutating it.
+        pier = shutil.which("pier")
+        installed_version = _pier_version(pier) if pier else None
+        if _pier_version_compatible(installed_version):
+            return
+        if pier:
+            print(f"Pier {installed_version or 'unknown'} lacks persistent resume — "
+                  f"installing SecurityMind build {PIER_VERSION}...")
+        else:
+            print(f"pier not found — installing SecurityMind build {PIER_VERSION}...")
+        proc = subprocess.run([uv, "tool", "install", "--force", PIER_SPEC])
+        active_pier = shutil.which("pier")
+        active_version = _pier_version(active_pier) if active_pier else None
+        if proc.returncode != 0 or not _pier_version_compatible(active_version):
+            raise RunnerError(
+                f"couldn't activate Pier {PIER_VERSION}; run `{PIER_INSTALL_COMMAND}` "
+                "yourself and make sure ~/.local/bin precedes other Pier installs on PATH")
 
 
 def ensure_tasks_root(tasks_root: Path) -> None:
