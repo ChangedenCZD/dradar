@@ -9,9 +9,14 @@ from typing import Any
 
 import httpx
 
+from . import __version__
+from .providers import advertised_capabilities, normalize_capabilities
+
 _RATE_LIMIT_RETRIES = 5
 _DEFAULT_RETRY_AFTER_SEC = 1.0
 _MAX_RETRY_AFTER_SEC = 60.0
+CLIENT_VERSION_HEADER = "X-DRadar-Client-Version"
+CLIENT_CAPABILITIES_HEADER = "X-DRadar-Capabilities"
 
 
 def _env_proxies_set() -> bool:
@@ -42,7 +47,8 @@ class ApiError(RuntimeError):
 
 class ApiClient:
     def __init__(self, server: str, token: str,
-                 transport: httpx.BaseTransport | None = None):
+                 transport: httpx.BaseTransport | None = None,
+                 capabilities: tuple[str, ...] | list[str] | set[str] | None = None):
         self.server = server.rstrip("/")
         # write=None: large uploads over a slow tunnel must not hit a write
         # timeout; keep a bounded connect/read so a dead server fails fast.
@@ -58,7 +64,14 @@ class ApiClient:
         # so there we keep httpx's default transport (proxy correctness
         # beats a connect-retry nicety — a good chunk of the volunteer pool
         # reaches the server only through a proxy).
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {CLIENT_VERSION_HEADER: __version__}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        active_capabilities = normalize_capabilities(
+            advertised_capabilities() if capabilities is None else capabilities
+        )
+        if active_capabilities:
+            headers[CLIENT_CAPABILITIES_HEADER] = ",".join(active_capabilities)
         if transport is None and not _env_proxies_set():
             transport = httpx.HTTPTransport(retries=2)
         self._client = httpx.Client(

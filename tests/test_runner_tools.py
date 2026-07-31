@@ -56,6 +56,25 @@ def test_codex_prompt_requires_submission_artifact(tmp_path, monkeypatch):
     assert "test -s /logs/artifacts/model.patch" in text
 
 
+def test_dev_agent_codex_keeps_legacy_openai_provider_default(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = tmp_path / "abs-module-cache-flags"
+    task.mkdir()
+    monkeypatch.setenv("CODEX_AUTH_JSON_PATH", str(tmp_path / "auth.json"))
+    (tmp_path / "auth.json").write_text("{}")
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assignment = _assignment("claude-code", model="gpt-5.5")
+    cmd = build_pier_command(
+        assignment, tmp_path, tmp_path / "jobs", "j", home,
+        dev_agent="codex",
+    )
+
+    assert cmd[cmd.index("--agent") + 1] == "codex"
+    assert "--agent-import-path" not in cmd
+
+
 def test_claude_code_disallows_web_tools(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"

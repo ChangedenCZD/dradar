@@ -25,6 +25,7 @@ from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .image_cache import cmd_config_set, cmd_config_show
 from .leases import cmd_leases, cmd_release
+from .provider_config import cmd_provider_setup, cmd_provider_status
 from .runloop import (
     cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
     cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
@@ -220,6 +221,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_config_set.add_argument("value")
     p_config_set.set_defaults(func=cmd_config_set)
+
+    p_provider = sub.add_parser(
+        "provider", help="configure local credentials for an optional model provider")
+    provider_sub = p_provider.add_subparsers(
+        dest="provider_command", required=True)
+    p_provider_setup = provider_sub.add_parser(
+        "setup", help="securely enter and save a provider API key")
+    p_provider_setup.add_argument("provider", choices=("deepseek",))
+    p_provider_setup.set_defaults(func=cmd_provider_setup)
+    p_provider_status = provider_sub.add_parser(
+        "status", help="check provider readiness without displaying its key")
+    p_provider_status.add_argument("provider", choices=("deepseek",))
+    p_provider_status.set_defaults(func=cmd_provider_status)
 
     p_refill = sub.add_parser("refill", help="inspect or stop continuous auto-refill")
     refill_sub = p_refill.add_subparsers(dest="refill_command", required=True)

@@ -97,6 +97,36 @@ def test_plan_persists_only_bounded_public_metadata(tmp_path: Path):
         assert secret not in raw
 
 
+def test_paid_api_assignment_cannot_enter_continuous_refill(tmp_path: Path):
+    assignment = {
+        **_assignment("deepseek"),
+        "provider": "deepseek",
+        "billing_mode": "api",
+        "est_quota_pct": None,
+        "tier_windows_usd": None,
+    }
+    with pytest.raises(refill.RefillError, match="one-off runs"):
+        _configure(tmp_path, [assignment])
+
+
+def test_paid_api_assignment_is_not_offered_interactive_refill(
+    monkeypatch,
+):
+    assignment = {
+        **_assignment("deepseek"),
+        "provider": "deepseek",
+        "billing_mode": "api",
+    }
+    args = argparse.Namespace(refill=False, yes=False)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_args: pytest.fail("paid API must not show the refill prompt"),
+    )
+    assert runloop._setup_refill(
+        args, object(), [assignment], free_pick=True,
+    ) == [assignment]
+
+
 def test_refill_reserves_a_hard_total_and_naturally_drains(tmp_path: Path):
     client = RefillClient([_assignment("a1"), _assignment("a2")])
     _configure(tmp_path, client.active, refill_to=2, max_tasks=3)

@@ -7,12 +7,36 @@ import json
 import httpx
 import pytest
 
+from dradar import __version__
 from dradar.api_client import ApiClient, ApiError
+from dradar.providers import DEEPSEEK_CAPABILITY
 
 
 def _client(handler, token="drt_test"):
     return ApiClient("https://api.example.com", token,
                      transport=httpx.MockTransport(handler))
+
+
+def test_version_is_always_sent_and_capabilities_remain_sparse():
+    seen = []
+
+    def handler(request):
+        seen.append(dict(request.headers))
+        return httpx.Response(200, json={"ok": True})
+
+    ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler), capabilities=(),
+    ).whoami()
+    ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler),
+        capabilities=(DEEPSEEK_CAPABILITY,),
+    ).whoami()
+
+    assert seen[0]["x-dradar-client-version"] == __version__
+    assert "x-dradar-capabilities" not in seen[0]
+    assert seen[1]["x-dradar-capabilities"] == DEEPSEEK_CAPABILITY
 
 
 def test_http_error_attaches_status_code_and_detail():

@@ -1,0 +1,143 @@
+"""Provider keys stay out of argv, config.json, logs, and the server."""
+
+import json
+import os
+from types import SimpleNamespace
+
+import pytest
+
+from dradar import provider_config
+from dradar.providers import (
+    DEEPSEEK_API_KEY_ENV,
+    create_deepseek_auth_json,
+    deepseek_api_key,
+    deepseek_credential_source,
+    deepseek_secret_error,
+    deepseek_secret_path,
+    store_deepseek_api_key,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_environment(monkeypatch):
+    monkeypatch.delenv(DEEPSEEK_API_KEY_ENV, raising=False)
+
+
+def test_file_backed_key_is_atomic_private_and_environment_can_override(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    path = store_deepseek_api_key("  file-secret  ")
+
+    assert path == tmp_path / "secrets" / "deepseek_api_key"
+    assert path.read_text() == "file-secret\n"
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert deepseek_api_key() == "file-secret"
+    assert deepseek_credential_source() == "file"
+
+    monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "environment-secret")
+    assert deepseek_api_key() == "environment-secret"
+    assert deepseek_credential_source() == "environment"
+
+
+def test_runtime_auth_json_is_private_and_contains_no_secret_in_its_name(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "sentinel-runtime-secret")
+
+    path = create_deepseek_auth_json(tmp_path)
+
+    assert "sentinel-runtime-secret" not in str(path)
+    assert json.loads(path.read_text()) == {
+        "OPENAI_API_KEY": "sentinel-runtime-secret",
+    }
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_too_broad_secret_file_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    path = deepseek_secret_path()
+    path.parent.mkdir(parents=True)
+    path.write_text("unsafe-secret\n")
+    path.chmod(0o644)
+
+    assert "chmod 600" in (deepseek_secret_error(path) or "")
+    assert deepseek_api_key() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_secret_symlink_is_rejected_without_reading_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "home"))
+    target = tmp_path / "outside-secret"
+    target.write_text("must-not-be-read\n")
+    path = deepseek_secret_path()
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+
+    assert "not a symlink" in (deepseek_secret_error(path) or "")
+    assert deepseek_api_key() is None
+
+
+def test_replacing_key_leaves_no_predictable_temporary_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    path = store_deepseek_api_key("first-secret")
+    store_deepseek_api_key("second-secret")
+
+    assert path.read_text() == "second-secret\n"
+    assert list(path.parent.glob(".deepseek_api_key.*")) == []
+
+
+def test_setup_requires_a_real_interactive_terminal(monkeypatch, capsys):
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(
+        provider_config.getpass,
+        "getpass",
+        lambda _prompt: pytest.fail("must not read a secret without a TTY"),
+    )
+
+    rc = provider_config.cmd_provider_setup(SimpleNamespace(provider="deepseek"))
+
+    assert rc == 2
+    output = capsys.readouterr().out
+    assert "provider setup deepseek" in output
+    assert "paste the API key into Codex/chat" in output
+
+
+def test_setup_uses_hidden_input_and_never_echoes_key(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        provider_config.getpass,
+        "getpass",
+        lambda _prompt: "sentinel-provider-secret",
+    )
+
+    rc = provider_config.cmd_provider_setup(SimpleNamespace(provider="deepseek"))
+
+    assert rc == 0
+    assert deepseek_api_key() == "sentinel-provider-secret"
+    assert "sentinel-provider-secret" not in capsys.readouterr().out
+
+
+def test_status_reports_source_without_secret(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    store_deepseek_api_key("sentinel-provider-secret")
+
+    rc = provider_config.cmd_provider_status(SimpleNamespace(provider="deepseek"))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert str(deepseek_secret_path()) in output
+    assert "sentinel-provider-secret" not in output

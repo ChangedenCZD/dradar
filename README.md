@@ -148,13 +148,51 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 
 - Docker CLI、Docker daemon 和 Compose 插件；
 - 与 DRadar 固定版本兼容的 Pier，缺失时会尝试安装；
-- Codex CLI + `auth.json`，或 Claude CLI + OAuth Token；
+- Codex CLI + `auth.json`、Claude CLI + OAuth Token，或可选的 DeepSeek API key；
 - 当前 benchmark 的任务仓库（主站目前为 DeepSWE），缺失时会尝试克隆；
 - 可用磁盘和服务端登录。
 
 ```bash
 dradar doctor
 ```
+
+### DeepSeek V4 Flash 补充 provider
+
+DeepSeek 是 Codex 路径的可选补充，不会替换 `~/.codex/config.toml`、Codex
+`auth.json`、Claude 配置，也不会让原有任务自动切换 provider。只有在网页明确选择
+DeepSeek 格子时才会使用按量计费的 DeepSeek API。
+
+在用户自己的交互式终端中配置 key（输入不会回显）：
+
+```bash
+dradar provider setup deepseek
+dradar provider status deepseek
+dradar doctor
+dradar go --pick TASK_ID:deepseek-v4-flash:max
+```
+
+key 保存在 `~/.dradar/secrets/deepseek_api_key`，POSIX 系统权限固定为 `0600`，
+不会进入 `config.json`、命令参数、复制提示词或 DRadar 服务端。运行时 CLI 生成短期
+Codex `auth.json`，通过公开 Pier 的 `CODEX_AUTH_JSON_PATH` 文件上传机制送入容器；
+Pier 退出后立即删除。自动化环境也可临时设置 `DEEPSEEK_API_KEY`，CLI 会先写入短期
+auth 文件，再从 Pier 的继承环境中移除该变量。
+
+当前公开边界：
+
+- 模型固定为 `deepseek-v4-flash`，有效 effort 只有 `high` 和 `max`；DeepSeek 接受的
+  `low`/`medium`、`xhigh` 只是这两档的兼容别名，不建立重复实验格。
+- 使用已验证的正式版 Codex `0.146.0`、Responses API 和 1,048,576 token 上下文。
+- 使用公开 `datacurve-pier` 的标准 `codex` agent，不包含 DRadar 私有 Pier adapter，
+  也不需要额外的模型目录上传代码。
+- DeepSeek 格子只能显式领取，不进入 `/suggest`、`--auto` 或持续补题。
+- 第一版公开路径不恢复 DeepSeek checkpoint；中断后重新显式领取，避免把缺少 provider
+  身份的旧 Codex checkpoint 恢复到另一个计费 provider。
+- 未显式领取 DeepSeek 格子时，原有 OpenAI Codex 与 Claude 行为完全不变。
+
+配置依据：[DeepSeek 模型列表](https://api-docs.deepseek.com/api/list-models)、
+[思考强度参数](https://api-docs.deepseek.com/api/create-chat-completion)、
+[Responses API](https://api-docs.deepseek.com/guides/responses_api/) 和
+[Codex 自定义 provider](https://developers.openai.com/codex/config-advanced/#custom-model-providers)。
 
 体检失败不会领取任务。修复所有 `FAIL` 后重新运行即可。
 

@@ -22,6 +22,17 @@ from pathlib import Path
 import httpx
 
 from .manifest import task_content_hash
+from .providers import (
+    DEFAULT_CODEX_PROVIDER,
+    DEEPSEEK_API_KEY_ENV,
+    DEEPSEEK_CODEX_VERSION,
+    DEEPSEEK_MIN_CODEX_VERSION,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_PROVIDER,
+    DEEPSEEK_SUPPORTED_EFFORTS,
+    assignment_codex_provider,
+    create_deepseek_auth_json,
+)
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
 # codex/Claude web tools execute server-side (at OpenAI/Anthropic), riding the
@@ -41,6 +52,27 @@ ALLOWLIST_TOML = (
     'apps = false\n'
     '[__pier_allowlist]\n'
     'url = "https://chatgpt.com"\n'
+)
+
+# Public-safe DeepSeek configuration for Pier's stock Codex agent. Codex reads
+# the provider credential from its uploaded auth.json because
+# ``requires_openai_auth`` is true; no API-key value is passed through argv or
+# ``docker compose exec -e``. The explicit context size replaces the optional
+# model-catalog file and avoids any private Pier adapter.
+DEEPSEEK_TOML = (
+    'web_search = "disabled"\n'
+    'model_provider = "deepseek"\n'
+    'preferred_auth_method = "apikey"\n'
+    'forced_login_method = "api"\n'
+    'model_context_window = 1048576\n'
+    'model_auto_compact_token_limit = 900000\n'
+    '[features]\n'
+    'apps = false\n'
+    '[model_providers.deepseek]\n'
+    'name = "DeepSeek"\n'
+    'base_url = "https://api.deepseek.com/"\n'
+    'wire_api = "responses"\n'
+    'requires_openai_auth = true\n'
 )
 
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
@@ -220,6 +252,64 @@ def _ensure_codex_submission_prompt(home: Path) -> Path:
     return path
 
 
+def _ensure_deepseek_config(home: Path) -> Path:
+    path = home / "codex-deepseek-v4-flash.toml"
+    path.write_text(DEEPSEEK_TOML)
+    return path
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    return tuple(int(part) for part in value.split("."))
+
+
+def _deepseek_codex_version(assignment: dict) -> str:
+    """Return the exact stable Codex release tested with DeepSeek."""
+
+    requested = assignment.get("agent_version") or DEEPSEEK_CODEX_VERSION
+    if not isinstance(requested, str) or not _STABLE_CODEX_VERSION_RE.fullmatch(
+        requested
+    ):
+        raise RunnerError("DeepSeek requires an exact stable Codex CLI version")
+    if _version_tuple(requested) < _version_tuple(DEEPSEEK_MIN_CODEX_VERSION):
+        raise RunnerError(
+            f"DeepSeek requires Codex >= {DEEPSEEK_MIN_CODEX_VERSION}, "
+            f"but the assignment requested {requested}"
+        )
+    if requested != DEEPSEEK_CODEX_VERSION:
+        raise RunnerError(
+            f"DeepSeek runs are pinned to tested Codex {DEEPSEEK_CODEX_VERSION}; "
+            f"the server requested unverified {requested}"
+        )
+    return requested
+
+
+def _validate_deepseek_assignment(assignment: dict) -> None:
+    if assignment.get("model") != DEEPSEEK_MODEL:
+        raise RunnerError(
+            f"unsupported DeepSeek model {assignment.get('model')!r}; "
+            f"only {DEEPSEEK_MODEL!r} is enabled"
+        )
+    if assignment.get("effort") not in DEEPSEEK_SUPPORTED_EFFORTS:
+        supported = ", ".join(sorted(DEEPSEEK_SUPPORTED_EFFORTS))
+        raise RunnerError(
+            f"DeepSeek effort must be one of {supported}; "
+            f"got {assignment.get('effort')!r}"
+        )
+    _deepseek_codex_version(assignment)
+
+
+def _pier_process_env(assignment: dict) -> dict[str, str]:
+    """Keep provider secrets out of Pier's inherited environment."""
+
+    env = dict(os.environ)
+    if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
+        # The key has already been materialized in a private auth.json file.
+        # Removing the ambient variable prevents accidental fallback to the
+        # old ``docker compose exec -e KEY=value`` path.
+        env.pop(DEEPSEEK_API_KEY_ENV, None)
+    return env
+
+
 def _task_agent_timeout_sec(task_path: Path) -> float | None:
     """The task's own declared agent watchdog (task.toml's [agent].timeout_sec
     -- currently 5400.0/90min flat across the whole deep-swe set). None if the
@@ -264,18 +354,56 @@ def build_pier_command(
     home: Path,
     dev_agent: str | None = None,
     resume_checkpoint: Path | None = None,
+    provider_auth_path: Path | None = None,
 ) -> list[str]:
-    pier = shutil.which("pier")
-    if not pier:
-        raise RunnerError("pier not found on PATH (run: uv tool install datacurve-pier)")
     task_path = tasks_root / assignment["task_id"]
     if not task_path.is_dir():
         raise RunnerError(f"task not found locally: {task_path}")
 
     agent = dev_agent or assignment["agent"]
+    provider = assignment_codex_provider(assignment) if agent == "codex" else None
+    if agent == "codex" and provider is None:
+        # A developer override from another agent family predates provider
+        # support and must retain the original OpenAI behavior.
+        provider = DEFAULT_CODEX_PROVIDER
+    if provider == DEEPSEEK_PROVIDER:
+        # Keep the public provider independent of DRadar's legacy checkpoint
+        # Pier build. uvx resolves this exact public PyPI release in an
+        # isolated tool environment, so no private adapter/import path can be
+        # pulled in accidentally.
+        public_pier = "datacurve-pier==0.3.0"
+        uvx = shutil.which("uvx")
+        uv = shutil.which("uv")
+        if uvx:
+            pier_command = [
+                uvx, "--isolated", "--from", public_pier, "pier",
+            ]
+        elif uv:
+            pier_command = [
+                uv, "tool", "run", "--isolated", "--from", public_pier,
+                "pier",
+            ]
+        else:
+            raise RunnerError(
+                "uv/uvx is required for the isolated public DeepSeek runner"
+            )
+    else:
+        pier = shutil.which("pier")
+        if not pier:
+            raise RunnerError(
+                "pier not found on PATH (run: uv tool install datacurve-pier)"
+            )
+        pier_command = [pier]
+    if provider == DEEPSEEK_PROVIDER:
+        _validate_deepseek_assignment(assignment)
+        if resume_checkpoint is not None:
+            raise RunnerError(
+                "DeepSeek checkpoints are not supported by the public runner; "
+                "start a fresh explicit run"
+            )
     agent_args = ["--agent", agent]
     cmd = [
-        pier, "run",
+        *pier_command, "run",
         "-p", str(task_path),
         *agent_args,
         "--jobs-dir", str(jobs_dir),
@@ -297,7 +425,7 @@ def build_pier_command(
         cmd += ["--ae", f"{var}=dradar-trial"]
     for var in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
         cmd += ["--ae", f"{var}=trial@dradar.invalid"]
-    if agent == "codex":
+    if agent == "codex" and provider == DEFAULT_CODEX_PROVIDER:
         auth = codex_auth_path()
         if not auth.is_file():
             raise RunnerError(f"codex auth not found: {auth} (run `codex login` first)")
@@ -330,6 +458,27 @@ def build_pier_command(
                 "starting the task container"
             )
         cmd += ["--ak", f"version={version}"]
+    elif agent == "codex" and provider == DEEPSEEK_PROVIDER:
+        if provider_auth_path is None or not provider_auth_path.is_file():
+            raise RunnerError(
+                "DeepSeek runtime credential is unavailable; run "
+                "`dradar provider setup deepseek` in your own interactive Terminal"
+            )
+        config_path = _ensure_deepseek_config(home)
+        submission_prompt = _ensure_codex_submission_prompt(home)
+        cmd += [
+            "--model", assignment["model"],
+            "--ak", f"reasoning_effort={assignment['effort']}",
+            "--ak", f"config_toml_file={config_path}",
+            "--ak", f"prompt_template_path={submission_prompt}",
+            "--ae", f"CODEX_AUTH_JSON_PATH={provider_auth_path}",
+            "--ak", f"version={_deepseek_codex_version(assignment)}",
+        ]
+    elif agent == "codex":
+        raise RunnerError(
+            f"unsupported Codex provider {provider!r}; upgrade dradar if the "
+            "server intentionally enabled a new provider"
+        )
     elif agent == "claude-code":
         oauth_token = claude_oauth_token()
         if not oauth_token:
@@ -817,19 +966,28 @@ def run_trial(
 ) -> TrialArtifacts:
     effective_assignment = assignment
     codex_cli_version = None
+    codex_provider = None
     if (dev_agent or assignment["agent"]) == "codex":
-        # Resolve before creating the job, extending the lease, or starting
-        # Pier. A registry outage therefore consumes no model quota and leaves
-        # the assignment safely retryable.
-        codex_cli_version = resolve_latest_codex_cli_version(
-            assignment.get("agent_version"),
-            bool(assignment.get("agent_version_verified")),
+        codex_provider = (
+            assignment_codex_provider(assignment) or DEFAULT_CODEX_PROVIDER
         )
+        if codex_provider == DEEPSEEK_PROVIDER:
+            _validate_deepseek_assignment(assignment)
+            codex_cli_version = _deepseek_codex_version(assignment)
+            print(f"verified pinned DeepSeek Codex CLI: {codex_cli_version}")
+        else:
+            # Resolve before creating the job, extending the lease, or starting
+            # Pier. A registry outage therefore consumes no model quota and leaves
+            # the assignment safely retryable.
+            codex_cli_version = resolve_latest_codex_cli_version(
+                assignment.get("agent_version"),
+                bool(assignment.get("agent_version_verified")),
+            )
+            print(f"verified latest stable Codex CLI: {codex_cli_version}")
         effective_assignment = {
             **assignment,
             "agent_version": codex_cli_version,
         }
-        print(f"verified latest stable Codex CLI: {codex_cli_version}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = work_dir / "jobs"
@@ -845,67 +1003,93 @@ def run_trial(
     # `interrupted` -> the server marks it invalid and the cell reopens.
     timeout_sec = _trial_timeout_sec(effective_assignment)
 
-    if resume_checkpoint is None:
-        cmd = build_pier_command(
-            effective_assignment, tasks_root, jobs_dir, job_name, work_dir, dev_agent)
-    else:
-        cmd = build_pier_command(
-            effective_assignment, tasks_root, jobs_dir, job_name, work_dir,
-            dev_agent, resume_checkpoint=resume_checkpoint,
-        )
-    env = dict(os.environ)
-    if on_started is not None:
-        # Best-effort by design: this only confirms to the server that a
-        # free-pick claim's short initial lease should be extended (see
-        # app.py's assignment_started endpoint) -- a network hiccup here must
-        # never abort a real trial that's about to burn real quota.
-        try:
-            on_started()
-        except Exception:
-            pass
-    started = time.time()
-    with log_path.open("w") as log:
-        log.write("cmd=" + " ".join(cmd) + "\n")
-        log.flush()
-        # Heartbeat loop instead of a blocking run: image build + a long
-        # agent turn can be silent for many minutes, and volunteers couldn't
-        # tell "working" from "wedged" without docker-exec'ing into the
-        # container (volunteer report, 2026-07-13). Once a minute, print
-        # elapsed time plus the newest pier log line.
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                                cwd=work_dir, env=env)
-        try:
-            next_beat = started + HEARTBEAT_SEC
-            while True:
-                try:
-                    proc.wait(timeout=min(30, HEARTBEAT_SEC))
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                now = time.time()
-                if now - started > timeout_sec:
-                    log.flush()
-                    raise RunnerError(
-                        f"trial exceeded {timeout_sec // 60} min and was aborted "
-                        f"(see {log_path}); docker/agent likely wedged\n"
-                        f"last lines of the log:\n{_tail(log_path)}")
-                if now >= next_beat:
-                    next_beat = now + HEARTBEAT_SEC
-                    print(f"  … {int((now - started) / 60)} min elapsed — "
-                          f"{_last_activity(log_path)}")
-        except BaseException:
-            # Same contract subprocess.run had: no exception (timeout, Ctrl-C,
-            # anything) leaves a pier process running detached. TERM first
-            # with a grace window: a SIGKILLed pier can never `docker compose
-            # down`, and its orphaned task container keeps the agent alive —
-            # burning quota with nobody left to harvest the result.
-            proc.terminate()
+    provider_auth_path = None
+    try:
+        if codex_provider == DEEPSEEK_PROVIDER:
             try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            raise
+                provider_auth_path = create_deepseek_auth_json(work_dir)
+            except (OSError, ValueError) as exc:
+                raise RunnerError(str(exc)) from exc
+        provider_kwargs = (
+            {"provider_auth_path": provider_auth_path}
+            if codex_provider == DEEPSEEK_PROVIDER
+            else {}
+        )
+        if resume_checkpoint is None:
+            cmd = build_pier_command(
+                effective_assignment, tasks_root, jobs_dir, job_name, work_dir,
+                dev_agent, **provider_kwargs,
+            )
+        else:
+            cmd = build_pier_command(
+                effective_assignment, tasks_root, jobs_dir, job_name, work_dir,
+                dev_agent, resume_checkpoint=resume_checkpoint,
+                **provider_kwargs,
+            )
+        env = _pier_process_env(effective_assignment)
+        if on_started is not None:
+            # Best-effort by design: this only confirms to the server that a
+            # free-pick claim's short initial lease should be extended (see
+            # app.py's assignment_started endpoint) -- a network hiccup here must
+            # never abort a real trial that's about to burn real quota.
+            try:
+                on_started()
+            except Exception:
+                pass
+        started = time.time()
+        with log_path.open("w") as log:
+            log.write("cmd=" + " ".join(cmd) + "\n")
+            log.flush()
+            # Heartbeat loop instead of a blocking run: image build + a long
+            # agent turn can be silent for many minutes, and volunteers couldn't
+            # tell "working" from "wedged" without docker-exec'ing into the
+            # container (volunteer report, 2026-07-13). Once a minute, print
+            # elapsed time plus the newest pier log line.
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                    cwd=work_dir, env=env)
+            try:
+                next_beat = started + HEARTBEAT_SEC
+                while True:
+                    try:
+                        proc.wait(timeout=min(30, HEARTBEAT_SEC))
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    now = time.time()
+                    if now - started > timeout_sec:
+                        log.flush()
+                        raise RunnerError(
+                            f"trial exceeded {timeout_sec // 60} min and was aborted "
+                            f"(see {log_path}); docker/agent likely wedged\n"
+                            f"last lines of the log:\n{_tail(log_path)}")
+                    if now >= next_beat:
+                        next_beat = now + HEARTBEAT_SEC
+                        print(f"  … {int((now - started) / 60)} min elapsed — "
+                              f"{_last_activity(log_path)}")
+            except BaseException:
+                # Same contract subprocess.run had: no exception (timeout, Ctrl-C,
+                # anything) leaves a pier process running detached. TERM first
+                # with a grace window: a SIGKILLed pier can never `docker compose
+                # down`, and its orphaned task container keeps the agent alive —
+                # burning quota with nobody left to harvest the result.
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                raise
+    finally:
+        if provider_auth_path is not None:
+            try:
+                provider_auth_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RunnerError(
+                    f"could not remove temporary DeepSeek auth file "
+                    f"{provider_auth_path}: {exc}"
+                ) from exc
     duration = time.time() - started
 
     tail = _tail(log_path)
@@ -1025,8 +1209,9 @@ DIAG_ADVICE = {
         "this looks like a genuine rate/usage limit — wait for your quota "
         "window to reset, then claim again."),
     "auth": (
-        "the agent could not authenticate inside the container — run "
-        "`codex login` again and re-check `dradar doctor`."),
+        "the agent could not authenticate inside the container — for DeepSeek "
+        "run `dradar provider status deepseek` (or set it up again); for the "
+        "original OpenAI path run `codex login`, then re-check `dradar doctor`."),
     "model-capacity": (
         "the model stayed at capacity after Pier retried the original Codex "
         "session with bounded backoff. This is not a problem with your setup "

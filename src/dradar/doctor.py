@@ -11,6 +11,11 @@ from pathlib import Path
 from . import __version__, runner
 from .identity import _client
 from .local_config import _load_config, tasks_root_from_config
+from .providers import (
+    DEEPSEEK_API_KEY_ENV,
+    deepseek_api_key,
+    deepseek_opted_in,
+)
 
 
 def _check(label: str, ok: bool, hint: str = "") -> bool:
@@ -183,7 +188,18 @@ def cmd_doctor(args) -> int:
     auth = runner.codex_auth_path()
     codex_ready = bool(codex) and auth.is_file()
     claude_ready = bool(shutil.which("claude")) and bool(runner.claude_oauth_token())
-    if codex_ready:
+    deepseek_requested = deepseek_opted_in()
+    deepseek_key_ready = bool(deepseek_api_key())
+    if deepseek_requested:
+        all_ok &= _check(
+            "DeepSeek API key — local provider credential",
+            deepseek_key_ready,
+            "run `dradar provider setup deepseek` in your own interactive "
+            f"Terminal, or temporarily export {DEEPSEEK_API_KEY_ENV}",
+        )
+        if deepseek_key_ready:
+            _check("DeepSeek V4 Flash — Codex provider ready", True)
+    elif codex_ready:
         _check("codex — agent ready", True)
     elif claude_ready:
         _check("claude — agent ready", True)
@@ -195,7 +211,8 @@ def cmd_doctor(args) -> int:
         _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
                bool(runner.claude_oauth_token()),
                "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
-    all_ok &= (codex_ready or claude_ready)
+    if not deepseek_requested:
+        all_ok &= (codex_ready or claude_ready)
 
     # The task repo is auto-cloned on `dradar go`; do it here too so a missing
     # checkout reports OK instead of a FAIL whose hint doesn't actually fix it.
