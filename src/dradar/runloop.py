@@ -389,16 +389,11 @@ def _upload_trial(
     trajectory_bundle = build_codex_trajectory_bundle(Path(entry["trial_dir"]))
     usage = (codex_trajectory_bundle_usage(trajectory_bundle)
              if trajectory_bundle is not None else None)
-    multi_session = bool(usage and (
-        usage.get("subagent_session_count", 0) > 0
-        or usage.get("agent_session_count", 0) > 1
-        or usage.get("session_file_count", 0) > 1
-    ))
     upload_meta = dict(entry.get("meta") or {})
     if redacted_patch is not None:
         upload_meta["patch_redacted"] = True
         upload_meta["patch_redaction_labels"] = redacted_labels
-    if multi_session:
+    if usage is not None:
         upload_meta["cost_usd"] = None
         upload_meta["usage_aggregation"] = usage["schema"]
         upload_meta["usage_aggregation_complete"] = usage["complete"]
@@ -416,7 +411,7 @@ def _upload_trial(
             upload_patch = scrubbed / "model.patch"
             upload_patch.write_bytes(redacted_patch)
         trajectory_bundle_scrubbed = None
-        if multi_session:
+        if trajectory_bundle is not None:
             trajectory_bundle_scrubbed = scrubbed / "trajectory_bundle.json"
             serialized = json.dumps(
                 trajectory_bundle, ensure_ascii=False, separators=(",", ":"),
@@ -448,7 +443,7 @@ def _upload_trial(
         if result:
             result_scrubbed = scrubbed / "result.json"
             scrub_file(result, result_scrubbed)
-            if multi_session:
+            if usage is not None:
                 _apply_codex_usage_to_result(result_scrubbed, usage)
         # Record before submitting: from here on an unacked completed trial
         # always has a ledger entry, whatever kills the upload. The server
