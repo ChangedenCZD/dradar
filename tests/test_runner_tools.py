@@ -195,10 +195,19 @@ def test_codex_command_enables_credential_free_checkpoint_metadata(tmp_path, mon
 
 # --- self-bootstrap (ensure_pier / ensure_tasks_root) ------------------------
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from dradar.runner import RunnerError, ensure_pier, ensure_tasks_root
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pier_install_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner_mod, "_pier_install_lock_path",
+        lambda: tmp_path / "pier-install.lock",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -251,7 +260,8 @@ def test_ensure_pier_installs_via_uv_when_missing(monkeypatch):
 
 
 def test_ensure_pier_replaces_old_version(monkeypatch):
-    versions = iter(["0.3.0", runner_mod.PIER_VERSION])
+    # Initial check, under-lock recheck, then post-install verification.
+    versions = iter(["0.3.0", "0.3.0", runner_mod.PIER_VERSION])
     monkeypatch.setattr(runner_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
     monkeypatch.setattr(runner_mod, "_pier_version", lambda _: next(versions))
     called = []
@@ -265,6 +275,33 @@ def test_ensure_pier_replaces_old_version(monkeypatch):
     assert called == [[
         "/usr/bin/uv", "tool", "install", "--force", runner_mod.PIER_SPEC,
     ]]
+
+
+def test_ensure_pier_rechecks_version_after_waiting_for_install_lock(monkeypatch):
+    seen = {"pier": None}
+
+    def which(name):
+        if name == "uv":
+            return "/usr/bin/uv"
+        return seen["pier"]
+
+    @contextmanager
+    def another_process_installs_first():
+        seen["pier"] = "/root/.local/bin/pier"
+        yield
+
+    monkeypatch.setattr(runner_mod.shutil, "which", which)
+    monkeypatch.setattr(
+        runner_mod, "_pier_version",
+        lambda path: runner_mod.PIER_VERSION if path else None,
+    )
+    monkeypatch.setattr(runner_mod, "_pier_install_lock", another_process_installs_first)
+    monkeypatch.setattr(
+        runner_mod.subprocess, "run",
+        lambda *a, **k: pytest.fail("the second process must not reinstall Pier"),
+    )
+
+    ensure_pier()
 
 
 def test_ensure_pier_errors_when_no_uv(monkeypatch):

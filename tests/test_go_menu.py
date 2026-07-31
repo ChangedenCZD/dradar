@@ -246,6 +246,48 @@ def test_pick_claims_exact_cells_by_id(monkeypatch, tmp_path: Path):
     assert rc == 0
 
 
+def test_pick_tops_up_an_existing_batch(monkeypatch, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    batch = [{**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"}]
+    claims = [{"assignment": {
+        **ASSIGNMENT, "assignment_id": "a2", "task_id": "t2",
+    }}]
+    client = FakeClient(
+        {"active": batch, "free_pick": True, "menu": None}, claims=claims,
+    )
+
+    rc = runloop._go_menu(
+        _args(yes=True, pick=["t2:m:e"]), {}, client, tmp_path,
+    )
+
+    assert client.claim_calls == [("t2", "m", "e")]
+    assert ran == ["a1", "a2"]
+    assert rc == 0
+
+
+def test_pick_skips_held_and_duplicate_cells(monkeypatch, capsys, tmp_path: Path):
+    ran = []
+    _patch_run(monkeypatch, ran=ran)
+    batch = [{**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"}]
+    claims = [{"assignment": {
+        **ASSIGNMENT, "assignment_id": "a2", "task_id": "t2",
+    }}]
+    client = FakeClient(
+        {"active": batch, "free_pick": True, "menu": None}, claims=claims,
+    )
+
+    rc = runloop._go_menu(
+        _args(yes=True, pick=["t1:m:e", "t2:m:e", "t2:m:e"]),
+        {}, client, tmp_path,
+    )
+
+    assert client.claim_calls == [("t2", "m", "e")]
+    assert ran == ["a1", "a2"]
+    assert capsys.readouterr().out.count("already held; skipping") == 2
+    assert rc == 0
+
+
 def test_pick_malformed_spec_exits_clearly():
     with pytest.raises(SystemExit):
         runloop._parse_pick("not-enough-colons")
