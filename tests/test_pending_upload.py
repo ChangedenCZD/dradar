@@ -213,7 +213,7 @@ def test_upload_omits_bundle_when_redaction_breaks_its_json(
     assert "malformed optional trajectory bundle" in capsys.readouterr().out
 
 
-def test_upload_leaves_single_session_cost_and_metadata_unchanged(
+def test_upload_replaces_single_session_cost_and_sends_verified_bundle(
     tmp_path: Path, monkeypatch,
 ):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
@@ -236,8 +236,18 @@ def test_upload_leaves_single_session_cost_and_metadata_unchanged(
         def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
                    outcome="completed", resume_generation=None,
                    trajectory_bundle=None):
-            assert meta == original_meta
-            assert json.loads(result.read_text()) == original_result
+            assert meta["cost_usd"] is None
+            assert meta["n_input_tokens"] == 50
+            assert meta["n_cache_tokens"] == 20
+            assert meta["n_output_tokens"] == 5
+            assert meta["usage_aggregation_complete"] is True
+            assert meta["agent_session_count"] == 1
+            assert meta["subagent_session_count"] == 0
+            assert trajectory_bundle is not None
+            assert json.loads(trajectory_bundle.read_text())["session_file_count"] == 1
+            uploaded = json.loads(result.read_text())["agent_result"]
+            assert uploaded["cost_usd"] is None
+            assert uploaded["n_input_tokens"] == 50
             return {"submission_id": "s1", "grade_status": "pending"}
 
     outcome = runloop._upload_trial(
