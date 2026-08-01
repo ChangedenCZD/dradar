@@ -1,21 +1,28 @@
 """DeepSeek V4 Flash is an additive, public-safe Codex provider."""
 
+import hashlib
+import json
 import os
 import tomllib
 from pathlib import Path
 
 import pytest
 
+import dradar.providers as providers
 import dradar.runner as runner
 from dradar.providers import (
     DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_CAPABILITY,
+    DEEPSEEK_CATALOG_REMOTE_PATH,
+    DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_CODEX_VERSION,
     DEEPSEEK_MODEL,
     DEEPSEEK_PROVIDER,
     advertised_capabilities,
     assignment_codex_provider,
+    deepseek_catalog_error,
+    deepseek_catalog_path,
 )
 from dradar.runner import RunnerError
 
@@ -67,12 +74,45 @@ def test_capability_advertises_software_support_before_first_key_setup():
     )
 
 
+def test_bundled_catalog_has_expected_integrity_and_reasoning_levels():
+    catalog = deepseek_catalog_path()
+    payload = catalog.read_bytes()
+    parsed = json.loads(payload)
+    flash = next(item for item in parsed["models"] if item["slug"] == DEEPSEEK_MODEL)
+
+    assert hashlib.sha256(payload).hexdigest() == DEEPSEEK_CATALOG_SHA256
+    assert deepseek_catalog_error(catalog) is None
+    assert {level["effort"] for level in flash["supported_reasoning_levels"]} >= {
+        "high", "max",
+    }
+    assert flash["supports_parallel_tool_calls"] is True
+    assert flash["apply_patch_tool_type"] == "freeform"
+    assert flash["multi_agent_version"] == "v2"
+    assert flash["shell_type"] == "shell_command"
+    assert flash["context_window"] == 1_048_576
+    assert flash["effective_context_window_percent"] == 95
+    assert flash["default_reasoning_summary"] == "none"
+    assert flash["minimal_client_version"] == "0.144.0"
+
+
+def test_corrupt_catalog_withholds_paid_provider_capability(
+    tmp_path: Path,
+    monkeypatch,
+):
+    corrupt = tmp_path / "models.json"
+    corrupt.write_text('{"models": []}')
+    monkeypatch.setattr(providers, "deepseek_catalog_path", lambda: corrupt)
+
+    assert "integrity check failed" in (deepseek_catalog_error(corrupt) or "")
+    assert advertised_capabilities({}) == ()
+
+
 def test_missing_provider_preserves_original_codex_path():
     assert assignment_codex_provider({"agent": "codex"}) == DEFAULT_CODEX_PROVIDER
     assert assignment_codex_provider({"agent": "claude-code"}) is None
 
 
-def test_command_uses_stock_codex_and_auth_file_without_secret_env(
+def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -83,8 +123,10 @@ def test_command_uses_stock_codex_and_auth_file_without_secret_env(
         "/usr/bin/pier", "--isolated", "--from",
         "datacurve-pier==0.3.0", "pier",
     ]
-    assert command[command.index("--agent") + 1] == "codex"
-    assert "--agent-import-path" not in command
+    assert command[command.index("--agent-import-path") + 1] == (
+        runner.DEEPSEEK_AGENT_IMPORT_PATH
+    )
+    assert "--agent" not in command
     assert runner.PIER_SPEC not in joined
     assert f"version={DEEPSEEK_CODEX_VERSION}" in command
     assert "reasoning_effort=max" in command
@@ -92,6 +134,12 @@ def test_command_uses_stock_codex_and_auth_file_without_secret_env(
     assert "checkpoint_path=" not in joined
     assert DEEPSEEK_API_KEY_ENV not in joined
     assert "CODEX_AUTH_JSON_PATH=" in joined
+    assert (home / runner.DEEPSEEK_AGENT_MODULE_FILENAME).is_file()
+
+    catalog_arg = next(
+        item for item in command if item.startswith("model_catalog_json_file=")
+    )
+    assert Path(catalog_arg.split("=", 1)[1]) == deepseek_catalog_path()
 
     config_arg = next(
         item for item in command if item.startswith("config_toml_file=")
@@ -100,14 +148,32 @@ def test_command_uses_stock_codex_and_auth_file_without_secret_env(
     assert config_path == home / "codex-deepseek-v4-flash.toml"
     parsed = tomllib.loads(config_path.read_text())
     assert parsed["model_provider"] == DEEPSEEK_PROVIDER
-    assert parsed["model_context_window"] == 1_048_576
-    assert "model_catalog_json" not in parsed
+    assert parsed["model_catalog_json"] == DEEPSEEK_CATALOG_REMOTE_PATH
+    assert "model_context_window" not in parsed
+    assert "model_auto_compact_token_limit" not in parsed
+    assert "model_reasoning_summary" not in parsed
+    assert "experimental_use_unified_exec_tool" not in parsed
+    assert parsed["features"] == {"apps": False, "remote_plugin": False}
     assert parsed["model_providers"][DEEPSEEK_PROVIDER] == {
-        "name": "DeepSeek",
+        "name": "deepseek",
         "base_url": "https://api.deepseek.com/",
         "wire_api": "responses",
         "requires_openai_auth": True,
     }
+
+
+def test_command_fails_before_paid_run_when_catalog_is_modified(
+    tmp_path: Path,
+    monkeypatch,
+):
+    corrupt = tmp_path / "bad-models.json"
+    corrupt.write_text('{"models": []}')
+    monkeypatch.setattr(runner, "deepseek_catalog_path", lambda: corrupt)
+
+    with pytest.raises(RunnerError, match="integrity check failed"):
+        _command(tmp_path, monkeypatch)
+
+    assert not (tmp_path / "home" / runner.DEEPSEEK_AGENT_MODULE_FILENAME).exists()
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
@@ -184,16 +250,27 @@ def test_deepseek_checkpoint_resume_is_rejected(tmp_path: Path, monkeypatch):
         )
 
 
-def test_pier_process_drops_ambient_deepseek_key(monkeypatch):
+def test_pier_process_isolates_deepseek_secret_and_adapter_path(
+    tmp_path: Path,
+    monkeypatch,
+):
     monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "sentinel-deepseek-secret")
+    monkeypatch.setenv("PYTHONPATH", "/private/pier")
+    monkeypatch.setenv("PYTHONHOME", "/private/python")
 
-    deepseek_env = runner._pier_process_env(_assignment())
+    deepseek_env = runner._pier_process_env(
+        _assignment(), deepseek_module_dir=tmp_path,
+    )
     openai_env = runner._pier_process_env(
         _assignment(provider=DEFAULT_CODEX_PROVIDER, model="gpt-5.5")
     )
 
     assert DEEPSEEK_API_KEY_ENV not in deepseek_env
+    assert deepseek_env["PYTHONPATH"] == str(tmp_path)
+    assert "PYTHONHOME" not in deepseek_env
     assert openai_env[DEEPSEEK_API_KEY_ENV] == "sentinel-deepseek-secret"
+    assert openai_env["PYTHONPATH"] == "/private/pier"
+    assert openai_env["PYTHONHOME"] == "/private/python"
 
 
 def test_run_removes_temporary_auth_when_command_build_fails(

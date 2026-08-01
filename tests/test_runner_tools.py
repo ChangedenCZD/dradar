@@ -34,10 +34,11 @@ def test_codex_disables_server_side_network_tools(tmp_path, monkeypatch):
     config = tomllib.loads(allowlist)
     assert config["web_search"] == "disabled"
     assert config["features"]["apps"] is False
+    assert config["features"]["remote_plugin"] is False
     assert config["__pier_allowlist"] == {"url": "https://chatgpt.com"}
 
 
-def test_codex_prompt_requires_submission_artifact(tmp_path, monkeypatch):
+def test_codex_prompt_leaves_post_run_artifact_to_pier(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"
     task.mkdir()
@@ -52,8 +53,10 @@ def test_codex_prompt_requires_submission_artifact(tmp_path, monkeypatch):
     assert f"prompt_template_path={prompt}" in cmd
     text = prompt.read_text()
     assert "{{ instruction }}" in text
-    assert "bash /tests/pre_artifacts.sh" in text
-    assert "test -s /logs/artifacts/model.patch" in text
+    assert "complete and committed" in text
+    assert "creates the submission artifact automatically" in text
+    assert "bash /tests/pre_artifacts.sh" not in text
+    assert "test -s /logs/artifacts/model.patch" not in text
 
 
 def test_dev_agent_codex_keeps_legacy_openai_provider_default(tmp_path, monkeypatch):

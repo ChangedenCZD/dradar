@@ -14,6 +14,7 @@ from .local_config import _load_config, tasks_root_from_config
 from .providers import (
     DEEPSEEK_API_KEY_ENV,
     deepseek_api_key,
+    deepseek_catalog_error,
     deepseek_opted_in,
 )
 
@@ -191,13 +192,20 @@ def cmd_doctor(args) -> int:
     deepseek_requested = deepseek_opted_in()
     deepseek_key_ready = bool(deepseek_api_key())
     if deepseek_requested:
+        catalog_issue = deepseek_catalog_error()
+        catalog_ready = catalog_issue is None
         all_ok &= _check(
             "DeepSeek API key — local provider credential",
             deepseek_key_ready,
             "run `dradar provider setup deepseek` in your own interactive "
             f"Terminal, or temporarily export {DEEPSEEK_API_KEY_ENV}",
         )
-        if deepseek_key_ready:
+        all_ok &= _check(
+            "DeepSeek Codex models.json — official catalog",
+            catalog_ready,
+            catalog_issue or "reinstall or upgrade dradar",
+        )
+        if deepseek_key_ready and catalog_ready:
             _check("DeepSeek V4 Flash — Codex provider ready", True)
     elif codex_ready:
         _check("codex — agent ready", True)

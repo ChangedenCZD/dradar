@@ -218,3 +218,41 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
     assert "[ok ] pier" in out
     assert "[ok ] tasks_root" in out
     assert "[skip]" not in out
+
+
+def test_doctor_blocks_deepseek_when_official_catalog_is_invalid(
+    monkeypatch, capsys, tmp_path,
+):
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+    monkeypatch.setattr(doctor, "_platform", lambda: "linux")
+    monkeypatch.setattr(doctor, "_load_config", lambda: {})
+    monkeypatch.setattr(doctor, "tasks_root_from_config", lambda _cfg: tasks_root)
+    monkeypatch.setattr(doctor, "deepseek_opted_in", lambda: True)
+    monkeypatch.setattr(doctor, "deepseek_api_key", lambda: "configured")
+    monkeypatch.setattr(
+        doctor,
+        "deepseek_catalog_error",
+        lambda: "DeepSeek model catalog integrity check failed",
+    )
+    monkeypatch.setattr(
+        doctor.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"docker", "pier"} else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _cmd: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor.runner, "_pier_version", lambda _path: doctor.runner.PIER_VERSION,
+    )
+    monkeypatch.setattr(
+        doctor.runner, "_pier_version_compatible", lambda _version: True,
+    )
+
+    rc = doctor.cmd_doctor(SimpleNamespace())
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "[FAIL] DeepSeek Codex models.json — official catalog" in out
+    assert "integrity check failed" in out
+    assert "DeepSeek V4 Flash — Codex provider ready" not in out

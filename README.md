@@ -148,7 +148,8 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 
 - Docker CLI、Docker daemon 和 Compose 插件；
 - 与 DRadar 固定版本兼容的 Pier，缺失时会尝试安装；
-- Codex CLI + `auth.json`、Claude CLI + OAuth Token，或可选的 DeepSeek API key；
+- Codex CLI + `auth.json`、Claude CLI + OAuth Token，或可选的 DeepSeek API key 与
+  官方 Codex `models.json` 完整性；
 - 当前 benchmark 的任务仓库（主站目前为 DeepSWE），缺失时会尝试克隆；
 - 可用磁盘和服务端登录。
 
@@ -177,20 +178,28 @@ Codex `auth.json`，通过公开 Pier 的 `CODEX_AUTH_JSON_PATH` 文件上传机
 Pier 退出后立即删除。自动化环境也可临时设置 `DEEPSEEK_API_KEY`，CLI 会先写入短期
 auth 文件，再从 Pier 的继承环境中移除该变量。
 
+运行前 CLI 会校验随包发布的 DeepSeek 官方 Codex `models.json` 的 SHA-256，并由一个
+很窄的公开 Pier 子类把它上传到任务容器隔离的 `/tmp/codex-home/models.json`。文件缺失、
+被修改或不含 `high`/`max` 档位时，能力不会上报、`doctor` 会失败，任务也会在发出任何
+付费模型请求前终止。目录启用后，上下文、自动压缩、推理摘要、并行工具和补丁工具等
+元数据均由目录决定，不再用本地 TOML 重复覆盖。
+
 当前公开边界：
 
 - 模型固定为 `deepseek-v4-flash`，有效 effort 只有 `high` 和 `max`；DeepSeek 接受的
   `low`/`medium`、`xhigh` 只是这两档的兼容别名，不建立重复实验格。
-- 使用已验证的正式版 Codex `0.146.0`、Responses API 和 1,048,576 token 上下文。
-- 使用公开 `datacurve-pier` 的标准 `codex` agent，不包含 DRadar 私有 Pier adapter，
-  也不需要额外的模型目录上传代码。
+- 使用已验证的正式版 Codex `0.146.0`、Responses API，以及官方目录声明的
+  1,048,576 token 上下文和 95% 有效上下文比例。
+- 基于公开 `datacurve-pier==0.3.0` 的标准 `codex` agent；附加代码只负责校验并上传
+  官方模型目录，不包含 checkpoint 或任何 DRadar 私有 Pier 实现。
+- 基准配置关闭 Codex apps、remote plugin 和 web search，避免无关联网探测影响隔离性。
 - DeepSeek 格子只能显式领取，不进入 `/suggest`、`--auto` 或持续补题。
 - 第一版公开路径不恢复 DeepSeek checkpoint；中断后重新显式领取，避免把缺少 provider
   身份的旧 Codex checkpoint 恢复到另一个计费 provider。
 - 未显式领取 DeepSeek 格子时，原有 OpenAI Codex 与 Claude 行为完全不变。
 
-配置依据：[DeepSeek 模型列表](https://api-docs.deepseek.com/api/list-models)、
-[思考强度参数](https://api-docs.deepseek.com/api/create-chat-completion)、
+配置依据：[DeepSeek 官方 Codex 集成文档](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)、
+[官方安装脚本](https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.sh)、
 [Responses API](https://api-docs.deepseek.com/guides/responses_api/) 和
 [Codex 自定义 provider](https://developers.openai.com/codex/config-advanced/#custom-model-providers)。
 
