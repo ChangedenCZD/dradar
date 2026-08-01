@@ -81,6 +81,9 @@ def test_bundled_catalog_has_expected_integrity_and_reasoning_levels():
     flash = next(item for item in parsed["models"] if item["slug"] == DEEPSEEK_MODEL)
 
     assert hashlib.sha256(payload).hexdigest() == DEEPSEEK_CATALOG_SHA256
+    assert [item["slug"] for item in parsed["models"]] == [
+        "deepseek-v4-flash", "deepseek-v4-pro",
+    ]
     assert deepseek_catalog_error(catalog) is None
     assert {level["effort"] for level in flash["supported_reasoning_levels"]} >= {
         "high", "max",

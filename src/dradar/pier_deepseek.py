@@ -22,7 +22,7 @@ from pier.models.agent.context import AgentContext
 from pier.models.agent.network import NetworkAllowlist
 
 _CATALOG_SHA256 = (
-    "92382aee0e4ba19dfbac8803f97331f3089bdabe38c837cca77a4e943e0f8000"
+    "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
 )
 
 
