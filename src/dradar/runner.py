@@ -26,6 +26,7 @@ from .manifest import task_content_hash
 from .providers import (
     DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
+    DEEPSEEK_CATALOG_REMOTE_PATH,
     DEEPSEEK_CODEX_VERSION,
     DEEPSEEK_MIN_CODEX_VERSION,
     DEEPSEEK_MODEL,
@@ -33,6 +34,8 @@ from .providers import (
     DEEPSEEK_SUPPORTED_EFFORTS,
     assignment_codex_provider,
     create_deepseek_auth_json,
+    deepseek_catalog_error,
+    deepseek_catalog_path,
 )
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
@@ -51,30 +54,35 @@ ALLOWLIST_TOML = (
     'web_search = "disabled"\n'
     '[features]\n'
     'apps = false\n'
+    'remote_plugin = false\n'
     '[__pier_allowlist]\n'
     'url = "https://chatgpt.com"\n'
 )
 
-# Public-safe DeepSeek configuration for Pier's stock Codex agent. Codex reads
-# the provider credential from its uploaded auth.json because
-# ``requires_openai_auth`` is true; no API-key value is passed through argv or
-# ``docker compose exec -e``. The explicit context size replaces the optional
-# model-catalog file and avoids any private Pier adapter.
+# Public-safe DeepSeek configuration for an isolated stock Pier Codex agent.
+# The official catalog is uploaded to this container-local path before Codex
+# starts; do not add manual context/compaction/reasoning-summary overrides here,
+# because DeepSeek's official setup script explicitly removes them when the
+# catalog is active. Codex reads the provider credential from an uploaded
+# auth.json because ``requires_openai_auth`` is true; no API-key value is
+# passed through argv or ``docker compose exec -e``.
 DEEPSEEK_TOML = (
     'web_search = "disabled"\n'
     'model_provider = "deepseek"\n'
     'preferred_auth_method = "apikey"\n'
     'forced_login_method = "api"\n'
-    'model_context_window = 1048576\n'
-    'model_auto_compact_token_limit = 900000\n'
+    f'model_catalog_json = "{DEEPSEEK_CATALOG_REMOTE_PATH}"\n'
     '[features]\n'
     'apps = false\n'
+    'remote_plugin = false\n'
     '[model_providers.deepseek]\n'
-    'name = "DeepSeek"\n'
+    'name = "deepseek"\n'
     'base_url = "https://api.deepseek.com/"\n'
     'wire_api = "responses"\n'
     'requires_openai_auth = true\n'
 )
+DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
+DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
 
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
 CLAUDE_DISALLOWED_TOOLS = "WebSearch WebFetch EnterPlanMode"
@@ -87,12 +95,10 @@ _STABLE_CODEX_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 CODEX_SUBMISSION_PROMPT = """{{ instruction }}
 
-Before finishing, after the implementation is complete and committed, create
-the submission artifact required by this benchmark. Run these commands inside
-the task container and do not finish until the final check succeeds:
-
-    bash /tests/pre_artifacts.sh
-    test -s /logs/artifacts/model.patch
+Before finishing, ensure the requested implementation is complete and committed.
+DRadar/Pier creates the submission artifact automatically after your turn. Do
+not wait for or invoke `/tests/pre_artifacts.sh`, and do not create or inspect
+`/logs/artifacts/model.patch` yourself.
 """
 
 
@@ -259,6 +265,28 @@ def _ensure_deepseek_config(home: Path) -> Path:
     return path
 
 
+def _validated_deepseek_catalog() -> Path:
+    path = deepseek_catalog_path()
+    error = deepseek_catalog_error(path)
+    if error is not None:
+        raise RunnerError(error)
+    return path
+
+
+def _ensure_deepseek_agent_module(home: Path) -> Path:
+    """Expose only the narrow public adapter to Pier's isolated Python env."""
+
+    source = Path(__file__).with_name("pier_deepseek.py")
+    if not source.is_file():
+        raise RunnerError(
+            "DeepSeek Pier adapter is missing; reinstall or upgrade dradar "
+            "before running a paid task"
+        )
+    target = home / DEEPSEEK_AGENT_MODULE_FILENAME
+    shutil.copyfile(source, target)
+    return target
+
+
 def _version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))
 
@@ -299,7 +327,11 @@ def _validate_deepseek_assignment(assignment: dict) -> None:
     _deepseek_codex_version(assignment)
 
 
-def _pier_process_env(assignment: dict) -> dict[str, str]:
+def _pier_process_env(
+    assignment: dict,
+    *,
+    deepseek_module_dir: Path | None = None,
+) -> dict[str, str]:
     """Keep provider secrets out of Pier's inherited environment."""
 
     env = dict(os.environ)
@@ -308,6 +340,13 @@ def _pier_process_env(assignment: dict) -> dict[str, str]:
         # Removing the ambient variable prevents accidental fallback to the
         # old ``docker compose exec -e KEY=value`` path.
         env.pop(DEEPSEEK_API_KEY_ENV, None)
+        # uvx's public Pier environment must see only the copied, standalone
+        # adapter module. An ambient PYTHONPATH/PYTHONHOME could accidentally
+        # shadow datacurve-pier with another local Pier installation.
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        if deepseek_module_dir is not None:
+            env["PYTHONPATH"] = str(deepseek_module_dir)
     return env
 
 
@@ -368,10 +407,10 @@ def build_pier_command(
         # support and must retain the original OpenAI behavior.
         provider = DEFAULT_CODEX_PROVIDER
     if provider == DEEPSEEK_PROVIDER:
-        # Keep the public provider independent of DRadar's legacy checkpoint
-        # Pier build. uvx resolves this exact public PyPI release in an
-        # isolated tool environment, so no private adapter/import path can be
-        # pulled in accidentally.
+        # Keep the provider independent of DRadar's legacy checkpoint Pier
+        # build. uvx resolves this exact public PyPI release in an isolated
+        # tool environment; PYTHONPATH later exposes only the narrow catalog
+        # uploader copied into this run directory.
         public_pier = "datacurve-pier==0.3.0"
         uvx = shutil.which("uvx")
         uv = shutil.which("uv")
@@ -395,14 +434,19 @@ def build_pier_command(
                 "pier not found on PATH (run: uv tool install datacurve-pier)"
             )
         pier_command = [pier]
+    deepseek_catalog = None
     if provider == DEEPSEEK_PROVIDER:
         _validate_deepseek_assignment(assignment)
+        deepseek_catalog = _validated_deepseek_catalog()
+        _ensure_deepseek_agent_module(home)
         if resume_checkpoint is not None:
             raise RunnerError(
                 "DeepSeek checkpoints are not supported by the public runner; "
                 "start a fresh explicit run"
             )
-    agent_args = ["--agent", agent]
+        agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
+    else:
+        agent_args = ["--agent", agent]
     cmd = [
         *pier_command, "run",
         "-p", str(task_path),
@@ -467,10 +511,13 @@ def build_pier_command(
             )
         config_path = _ensure_deepseek_config(home)
         submission_prompt = _ensure_codex_submission_prompt(home)
+        if deepseek_catalog is None:  # defensive: validation must precede argv
+            raise RunnerError("DeepSeek model catalog was not prepared")
         cmd += [
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"config_toml_file={config_path}",
+            "--ak", f"model_catalog_json_file={deepseek_catalog}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ae", f"CODEX_AUTH_JSON_PATH={provider_auth_path}",
             "--ak", f"version={_deepseek_codex_version(assignment)}",
@@ -1079,7 +1126,12 @@ def run_trial(
                 dev_agent, resume_checkpoint=resume_checkpoint,
                 **provider_kwargs,
             )
-        env = _pier_process_env(effective_assignment)
+        env = _pier_process_env(
+            effective_assignment,
+            deepseek_module_dir=(
+                work_dir if codex_provider == DEEPSEEK_PROVIDER else None
+            ),
+        )
         if on_started is not None:
             # Best-effort by design: this only confirms to the server that a
             # free-pick claim's short initial lease should be extended (see

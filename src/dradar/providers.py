@@ -6,6 +6,7 @@ Codex assignment continues to mean the original OpenAI/ChatGPT path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -19,12 +20,69 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_ENABLE_ENV = "DRADAR_ENABLE_DEEPSEEK"
 DEEPSEEK_SECRET_RELATIVE_PATH = Path("secrets") / "deepseek_api_key"
-DEEPSEEK_CAPABILITY = "codex-deepseek-v4-flash-v1"
+DEEPSEEK_CAPABILITY = "codex-deepseek-v4-flash-v2"
 DEEPSEEK_CODEX_VERSION = "0.146.0"
 DEEPSEEK_MIN_CODEX_VERSION = "0.144.0"
 DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"high", "max"})
+DEEPSEEK_CATALOG_FILENAME = "deepseek_codex_models.json"
+DEEPSEEK_CATALOG_SHA256 = (
+    "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
+)
+DEEPSEEK_CATALOG_REMOTE_PATH = "/tmp/codex-home/models.json"
+DEEPSEEK_CATALOG_SOURCE = (
+    "https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.sh"
+)
+DEEPSEEK_CATALOG_SOURCE_VERSION = "1.0.0"
+DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v1"
+DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def deepseek_catalog_path() -> Path:
+    """Return the immutable DeepSeek Codex catalog bundled in the wheel."""
+
+    return Path(__file__).with_name(DEEPSEEK_CATALOG_FILENAME)
+
+
+def deepseek_catalog_error(path: Path | None = None) -> str | None:
+    """Return a fail-closed diagnostic for a missing or modified catalog."""
+
+    catalog = deepseek_catalog_path() if path is None else path
+    try:
+        payload = catalog.read_bytes()
+    except OSError as exc:
+        return f"DeepSeek model catalog is unreadable: {catalog}: {exc}"
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != DEEPSEEK_CATALOG_SHA256:
+        return (
+            "DeepSeek model catalog integrity check failed; reinstall or "
+            "upgrade dradar before running a paid task"
+        )
+    try:
+        parsed = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"DeepSeek model catalog is invalid JSON: {exc}"
+    models = parsed.get("models") if isinstance(parsed, dict) else None
+    if not isinstance(models, list):
+        return "DeepSeek model catalog has no models list"
+    flash = next(
+        (
+            item for item in models
+            if isinstance(item, dict) and item.get("slug") == DEEPSEEK_MODEL
+        ),
+        None,
+    )
+    if flash is None:
+        return f"DeepSeek model catalog is missing {DEEPSEEK_MODEL}"
+    efforts = {
+        item.get("effort")
+        for item in flash.get("supported_reasoning_levels", [])
+        if isinstance(item, dict)
+    }
+    if not DEEPSEEK_SUPPORTED_EFFORTS <= efforts:
+        return "DeepSeek model catalog is missing the benchmark reasoning levels"
+    return None
 
 
 def assignment_codex_provider(assignment: dict) -> str | None:
@@ -198,10 +256,10 @@ def create_deepseek_auth_json(directory: Path) -> Path:
 def advertised_capabilities(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
-    """Advertise software support before first-time credential setup."""
+    """Advertise only a complete, integrity-checked paid-provider runtime."""
 
     del environ
-    return (DEEPSEEK_CAPABILITY,)
+    return () if deepseek_catalog_error() is not None else (DEEPSEEK_CAPABILITY,)
 
 
 def normalize_capabilities(values: Iterable[str]) -> tuple[str, ...]:

@@ -28,7 +28,13 @@ from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config, tasks_root_from_config
 from .machine import acquire_run_lock, sweep_orphan_compose
-from .providers import DEEPSEEK_PROVIDER, assignment_codex_provider
+from .providers import (
+    DEEPSEEK_CATALOG_SHA256,
+    DEEPSEEK_PROVIDER,
+    DEEPSEEK_RUN_CONFIG_VERSION,
+    DEEPSEEK_RUNTIME_PROFILE,
+    assignment_codex_provider,
+)
 from .runner import (
     DIAG_ADVICE, BuildFlakeError, RunnerError, build_codex_trajectory_bundle,
     check_task_content_hash, codex_trajectory_bundle_usage,
@@ -887,6 +893,15 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "codex_cli_version": art.codex_cli_version,
         **stats,
     }
+    if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
+        # Server-side audit/gating can distinguish corrected official-catalog
+        # runs from the earlier fallback-metadata benchmark without deleting
+        # either history.
+        meta.update({
+            "model_config_version": DEEPSEEK_RUN_CONFIG_VERSION,
+            "model_catalog_sha256": DEEPSEEK_CATALOG_SHA256,
+            "model_runtime_profile": DEEPSEEK_RUNTIME_PROFILE,
+        })
 
     if item is not None and item.job_dir == art.job_dir:
         checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
