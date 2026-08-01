@@ -11,8 +11,10 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from collections.abc import Callable
@@ -247,22 +249,69 @@ def claude_oauth_token() -> str | None:
     return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 
 
+def _materialize_shared_file(path: Path, data: bytes, mode: int = 0o600) -> Path:
+    """Publish deterministic runner input without exposing partial contents.
+
+    ``HOME / work`` is shared by supervised workers.  A direct ``write_text``
+    or ``copyfile`` truncates the common destination before writing, so one
+    Pier process can observe another process's half-written adapter/config.
+    Reuse an identical regular file; otherwise write a uniquely named file in
+    the same directory and make ``os.replace`` the single publication point.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode) and path.read_bytes() == data:
+            if os.name != "nt":
+                os.chmod(path, mode)
+            return path
+    except OSError:
+        pass
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, mode)
+        handle = os.fdopen(fd, "wb")
+        fd = -1
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd = -1
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return path
+
+
 def _ensure_allowlist(home: Path) -> Path:
     path = home / "codex-chatgpt-allowlist.toml"
-    path.write_text(ALLOWLIST_TOML)
-    return path
+    return _materialize_shared_file(path, ALLOWLIST_TOML.encode())
 
 
 def _ensure_codex_submission_prompt(home: Path) -> Path:
     path = home / "codex-submission-prompt.j2"
-    path.write_text(CODEX_SUBMISSION_PROMPT)
-    return path
+    return _materialize_shared_file(path, CODEX_SUBMISSION_PROMPT.encode())
 
 
 def _ensure_deepseek_config(home: Path) -> Path:
     path = home / "codex-deepseek-v4-flash.toml"
-    path.write_text(DEEPSEEK_TOML)
-    return path
+    return _materialize_shared_file(path, DEEPSEEK_TOML.encode())
 
 
 def _validated_deepseek_catalog() -> Path:
@@ -283,8 +332,7 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
             "before running a paid task"
         )
     target = home / DEEPSEEK_AGENT_MODULE_FILENAME
-    shutil.copyfile(source, target)
-    return target
+    return _materialize_shared_file(target, source.read_bytes())
 
 
 def _version_tuple(value: str) -> tuple[int, int, int]:
