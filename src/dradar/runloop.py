@@ -34,8 +34,8 @@ from .runner import (
     summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import (
-    patch_structure_is_valid, redact_patch_secrets, scan_secrets, scrub_bytes,
-    scrub_file,
+    patch_structure_is_valid, redact_patch_secrets, scan_secrets,
+    scrub_json_bytes,
 )
 from .telemetry import RunnerTelemetry
 
@@ -494,9 +494,9 @@ def _upload_trial(
             serialized = json.dumps(
                 trajectory_bundle, ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
-            trajectory_bundle_scrubbed.write_bytes(scrub_bytes(serialized))
             try:
-                json.loads(trajectory_bundle_scrubbed.read_bytes())
+                scrubbed_bundle = scrub_json_bytes(serialized)
+                json.loads(scrubbed_bundle)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 # The bundle is optional display data.  A redaction bug must
                 # not strand an otherwise valid patch/result or make every
@@ -505,22 +505,26 @@ def _upload_trial(
                       f"trajectory bundle ({exc}); uploading the verified "
                       "result without it")
                 trajectory_bundle_scrubbed = None
+            else:
+                trajectory_bundle_scrubbed.write_bytes(scrubbed_bundle)
         traj_scrubbed = None
         if trajectory:
             traj_scrubbed = scrubbed / "trajectory.json"
-            scrub_file(trajectory, traj_scrubbed)
             try:
-                value = json.loads(traj_scrubbed.read_bytes())
+                scrubbed_trajectory = scrub_json_bytes(trajectory.read_bytes())
+                value = json.loads(scrubbed_trajectory)
                 if not isinstance(value, dict):
                     raise ValueError("top level is not an object")
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 print(f"  {task_id}: Pier produced a malformed optional trajectory "
                       f"({exc}); uploading the verified result without it")
                 traj_scrubbed = None
+            else:
+                traj_scrubbed.write_bytes(scrubbed_trajectory)
         result_scrubbed = None
         if result:
             result_scrubbed = scrubbed / "result.json"
-            scrub_file(result, result_scrubbed)
+            result_scrubbed.write_bytes(scrub_json_bytes(result.read_bytes()))
             if usage is not None:
                 _apply_codex_usage_to_result(result_scrubbed, usage)
         # Record before submitting: from here on an unacked completed trial

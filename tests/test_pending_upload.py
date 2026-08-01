@@ -191,8 +191,13 @@ def test_upload_omits_bundle_when_redaction_breaks_its_json(
                          100, 60, 10)
     _write_codex_session(sessions / "child.jsonl", "child-1", "subagent",
                          50, 20, 5, parent="root-1")
-    monkeypatch.setattr(runloop, "scrub_bytes",
-                        lambda _data: b'{"broken":"bad\\q"}')
+    real_scrub_json_bytes = runloop.scrub_json_bytes
+    monkeypatch.setattr(
+        runloop, "scrub_json_bytes",
+        lambda data: (b'{"broken":"bad\\q"}'
+                      if b'"schema_version"' in data
+                      else real_scrub_json_bytes(data)),
+    )
 
     class CaptureClient(FakeClient):
         def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
@@ -344,6 +349,34 @@ def test_upload_omits_malformed_optional_trajectory(tmp_path: Path, monkeypatch,
     outcome = runloop._upload_trial(CaptureClient(lambda _aid: None), _entry(trial_dir))
     assert outcome == "submitted"
     assert "malformed optional trajectory" in capsys.readouterr().out
+
+
+def test_upload_preserves_valid_trajectory_when_redaction_has_escaped_quote(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "agent").mkdir()
+    token = "abcdefghijklmnop"
+    payload = {"steps": [{
+        "message": "authorization:" + token + '"suffix',
+    }]}
+    (trial_dir / "agent" / "trajectory.json").write_text(json.dumps(payload))
+    (trial_dir / "result.json").write_text("{}")
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            uploaded = json.loads(trajectory.read_text())
+            message = uploaded["steps"][0]["message"]
+            assert token not in message
+            assert message.endswith('"suffix')
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(
+        CaptureClient(lambda _aid: None), _entry(trial_dir),
+    )
+    assert outcome == "submitted"
 
 
 def test_upload_success_removes_current_and_superseded_checkpoint_jobs(
