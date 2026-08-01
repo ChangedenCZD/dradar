@@ -9,8 +9,9 @@ three dradar sessions at once, 2026-07-14):
 - orphan compose sweep: pier launches each trial as a docker compose project
   named <task>__<trialid>; a killed dradar/pier never runs `compose down`, so
   the agent keeps running (and burning quota) inside a container nobody will
-  ever harvest. With the instance lock held, any such project that exists
-  BEFORE we launch our first trial belongs to a dead run — offer to clean it.
+  ever harvest. A project is eligible only when Docker proves that one of its
+  bind mounts or compose files lives below this DRADAR_HOME's work/jobs tree.
+  The per-home lock alone cannot prove ownership on a shared Docker daemon.
 """
 
 import json
@@ -26,6 +27,66 @@ from pathlib import Path
 _PIER_PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$", re.IGNORECASE)
 
 _lock_handle = None  # keeps the OS lock alive for the process lifetime
+
+
+def _path_belongs_to(path: str, root: Path) -> bool:
+    if not path:
+        return False
+    try:
+        return Path(path).resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _project_belongs_to_home(name: str, home: Path) -> bool:
+    """Return True only with positive Docker evidence of project ownership.
+
+    Compose project names are not namespaced by user or DRADAR_HOME.  On a
+    shared daemon another live runner can therefore have a perfectly valid
+    Pier-shaped name.  Pier mounts its trial directory (and generated compose
+    files) below ``HOME/work/jobs``; inspect those paths before allowing an
+    automatic teardown.  Inspection failures deliberately fail closed.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "-aq", "--filter",
+             f"label=com.docker.compose.project={name}"],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    container_ids = proc.stdout.split()
+    if not container_ids:
+        return False
+    try:
+        proc = subprocess.run(
+            ["docker", "inspect", *container_ids],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        containers = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+
+    jobs_root = home / "work" / "jobs"
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for mount in container.get("Mounts", []):
+            if (isinstance(mount, dict)
+                    and mount.get("Type") == "bind"
+                    and _path_belongs_to(str(mount.get("Source", "")), jobs_root)):
+                return True
+        labels = (container.get("Config", {}).get("Labels", {}) or {})
+        config_files = labels.get("com.docker.compose.project.config_files", "")
+        if any(_path_belongs_to(path.strip(), jobs_root)
+               for path in config_files.split(",")):
+            return True
+    return False
 
 
 def acquire_run_lock(home: Path) -> None:
@@ -68,12 +129,12 @@ def acquire_run_lock(home: Path) -> None:
     _lock_handle = fh
 
 
-def sweep_orphan_compose(assume_yes: bool) -> None:
+def sweep_orphan_compose(home: Path, assume_yes: bool) -> None:
     """Find pier-shaped compose projects that predate this run and offer to
-    take them down. Only callable while holding the run lock — that is what
-    makes 'it exists now' imply 'no live dradar on this machine owns it'.
-    Every failure path is silent: this is a courtesy sweep, never a reason
-    to block a real run."""
+    take them down. Only callable while holding this home's run lock. Project
+    names are merely a first-pass filter; Docker mounts/config paths must also
+    prove that the project belongs to this home. Every failure path is silent:
+    this is a courtesy sweep, never a reason to block a real run."""
     try:
         proc = subprocess.run(
             ["docker", "compose", "ls", "--format", "json"],
@@ -86,8 +147,10 @@ def sweep_orphan_compose(assume_yes: bool) -> None:
         listed = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError:
         return
-    orphans = [p.get("Name", "") for p in listed
-               if _PIER_PROJECT_RE.fullmatch(p.get("Name", "") or "")]
+    candidates = [p.get("Name", "") for p in listed
+                  if _PIER_PROJECT_RE.fullmatch(p.get("Name", "") or "")]
+    orphans = [name for name in candidates
+               if _project_belongs_to_home(name, home)]
     if not orphans:
         return
     print(f"found {len(orphans)} leftover task container project(s) from a "
