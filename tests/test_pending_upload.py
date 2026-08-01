@@ -21,6 +21,12 @@ def test_ledger_round_trip(tmp_path: Path):
     assert {e["assignment_id"] for e in entries} == {"a1", "a2"}
 
 
+def test_empty_ledger_read_is_side_effect_free(tmp_path: Path):
+    home = tmp_path / "not-created"
+    assert pending.load(home) == []
+    assert not home.exists()
+
+
 def test_record_replaces_same_assignment(tmp_path: Path):
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1", "attempt": 1})
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1", "attempt": 2})
@@ -48,19 +54,16 @@ def test_load_tolerates_non_list_json(tmp_path: Path):
 def test_save_is_atomic_failed_commit_does_not_corrupt_existing_ledger(tmp_path: Path, monkeypatch):
     # This is a crash-safety net; a save that can itself leave a truncated
     # file on disk would defeat the whole point. Assert the INVARIANT rather
-    # than the mechanism (temp file + os.replace today): kill the save
-    # mid-write, leaving whatever partial content it got out on disk — the
+    # than the mechanism (temp file + os.replace today): fail the atomic
+    # commit after the replacement file is written — the
     # ledger a subsequent load() sees must be the complete ORIGINAL, never a
     # truncated/corrupt version (which load() would drop wholesale).
     pending.record(tmp_path, {"assignment_id": "a1", "task_id": "t1"})
     before = pending.load(tmp_path)
 
-    real_write_text = Path.write_text
-
-    def partial_write(self, data, *a, **kw):
-        real_write_text(self, data[: len(data) // 2], *a, **kw)  # half lands on disk
+    def failed_commit(_source, _destination):
         raise OSError("simulated crash mid-write")
-    monkeypatch.setattr(Path, "write_text", partial_write)
+    monkeypatch.setattr(pending.os, "replace", failed_commit)
     with pytest.raises(OSError):
         pending.record(tmp_path, {"assignment_id": "a2", "task_id": "t2"})
     monkeypatch.undo()
@@ -474,7 +477,14 @@ def test_upload_failure_records_ledger_entry(tmp_path: Path, monkeypatch):
     assert outcome == "upload-failed"
     entries = pending.load(tmp_path)
     assert len(entries) == 1
-    assert entries[0] == attempted  # exactly what was attempted persists
+    for key, value in attempted.items():
+        assert entries[0][key] == value
+    assert entries[0]["artifact_staging_schema"] == 1
+    assert entries[0]["patch_bytes"] > 0
+    assert len(entries[0]["patch_sha256"]) == 64
+    assert Path(entries[0]["patch_source_path"]).read_bytes() == (
+        trial_dir / "artifacts" / "model.patch"
+    ).read_bytes()
     assert entries[0]["trial_dir"] == str(trial_dir)
 
 
@@ -584,13 +594,15 @@ def test_secret_in_patch_context_is_not_uploaded_and_assignment_is_stopped(
     assert client.stopped == ["a1"]
 
 
-def test_missing_patch_stops_ghost_running_assignment(tmp_path: Path, monkeypatch):
+def test_missing_patch_stays_retryable_without_stopping_assignment(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = tmp_path / "missing"
     trial_dir.mkdir()
     client = FakeClient(lambda _aid: {"submission_id": "s1"})
-    assert runloop._upload_trial(client, _entry(trial_dir)) == "artifacts-gone"
-    assert client.stopped == ["a1"]
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "artifact-staging-failed"
+    assert client.stopped == []
+    entry = pending.load(tmp_path)[0]
+    assert entry["artifact_staging_failure"]["reason"] == "source_and_staged_missing"
 
 
 def test_redacted_patch_retry_never_falls_back_to_raw_secret(tmp_path: Path, monkeypatch):
@@ -623,6 +635,89 @@ def test_redacted_patch_retry_never_falls_back_to_raw_secret(tmp_path: Path, mon
     assert pending.load(tmp_path) == []
 
 
+def test_retry_recovers_missing_staged_patch_and_uploads_verified_source(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    raw = (trial_dir / "artifacts" / "model.patch").read_bytes()
+
+    first = FakeClient(_raise(503))
+    assert runloop._upload_trial(first, _entry(trial_dir)) == "upload-failed"
+    retry_entry = pending.load(tmp_path)[0]
+    source = Path(retry_entry["patch_source_path"])
+    staged = Path(retry_entry["patch_staged_path"])
+    assert source.read_bytes() == raw
+    staged.unlink()  # pause/process teardown lost only the canonical copy
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            assert patch.read_bytes() == raw
+            assert meta["artifact_staging_recovery"]["reason"] == (
+                "source-present/staged-missing"
+            )
+            self.calls.append(assignment_id)
+            return {"submission_id": "s-recovered", "grade_status": "pending"}
+
+    client = CaptureClient(lambda _aid: None)
+    assert runloop._upload_trial(client, retry_entry) == "submitted"
+    assert client.calls == ["a1"]
+    assert staged.read_bytes() == raw
+    assert source.read_bytes() == raw
+    assert pending.load(tmp_path) == []
+    assert "recovered model.patch staging" in capsys.readouterr().out
+
+
+def test_retry_digest_mismatch_keeps_both_files_and_never_uploads(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    assert runloop._upload_trial(
+        FakeClient(_raise(503)), _entry(trial_dir),
+    ) == "upload-failed"
+    retry_entry = pending.load(tmp_path)[0]
+    source = Path(retry_entry["patch_source_path"])
+    staged = Path(retry_entry["patch_staged_path"])
+    source_before = source.read_bytes()
+    staged_mismatch = b"diff --git a/wrong b/wrong\n"
+    staged.write_bytes(staged_mismatch)
+    client = FakeClient(lambda _aid: {"submission_id": "must-not-upload"})
+
+    assert runloop._upload_trial(client, retry_entry) == "artifact-staging-failed"
+    assert client.calls == []
+    assert source.read_bytes() == source_before
+    assert staged.read_bytes() == staged_mismatch
+    retained = pending.load(tmp_path)[0]
+    assert retained["artifact_staging_failure"]["reason"] == "staged_digest_mismatch"
+
+
+def test_submit_uses_verified_snapshot_if_local_copies_disappear_mid_request(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    raw = (trial_dir / "artifacts" / "model.patch").read_bytes()
+
+    class TeardownClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            entry = pending.load(tmp_path)[0]
+            Path(entry["patch_source_path"]).unlink()
+            Path(entry["patch_staged_path"]).unlink()
+            # The multipart request owns a verified temp snapshot; teardown of
+            # the trial tree cannot truncate its in-flight payload.
+            assert patch.read_bytes() == raw
+            self.calls.append(assignment_id)
+            return {"submission_id": "s-snapshot", "grade_status": "pending"}
+
+    client = TeardownClient(lambda _aid: None)
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "submitted"
+    assert client.calls == ["a1"]
+    assert pending.load(tmp_path) == []
+
+
 def test_crash_mid_submit_leaves_a_ledger_entry(tmp_path: Path, monkeypatch):
     # The entry is recorded BEFORE the submit attempt: a process death
     # mid-POST (Ctrl-C/kill/OOM while the multipart upload is in flight)
@@ -639,7 +734,10 @@ def test_crash_mid_submit_leaves_a_ledger_entry(tmp_path: Path, monkeypatch):
         runloop._upload_trial(client, attempted)
     entries = pending.load(tmp_path)
     assert len(entries) == 1
-    assert entries[0] == attempted  # survives for the next go/retry-upload
+    for key, value in attempted.items():
+        assert entries[0][key] == value
+    assert entries[0]["artifact_staging_schema"] == 1
+    assert Path(entries[0]["patch_source_path"]).is_file()
 
 
 def test_successful_submit_leaves_no_pre_recorded_entry_behind(tmp_path: Path, monkeypatch):
@@ -690,7 +788,7 @@ def test_retry_scan_uploads_each_pending_entry(tmp_path: Path, monkeypatch, caps
     assert pending.load(tmp_path) == []
 
 
-def test_retry_scan_drops_entries_with_missing_local_artifacts(tmp_path: Path, monkeypatch, capsys):
+def test_retry_scan_keeps_entries_with_missing_local_artifacts(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     pending.record(tmp_path, {"assignment_id": "gone", "nonce": "n", "task_id": "t",
                               "trial_dir": str(tmp_path / "never-existed"), "meta": {},
@@ -698,7 +796,9 @@ def test_retry_scan_drops_entries_with_missing_local_artifacts(tmp_path: Path, m
     client = FakeClient(lambda aid: {"submission_id": "s"})
     runloop._retry_pending_uploads(client)
     assert not client.calls  # never even tried the network call
-    assert pending.load(tmp_path) == []
+    entries = pending.load(tmp_path)
+    assert len(entries) == 1
+    assert entries[0]["artifact_staging_failure"]["reason"] == "source_and_staged_missing"
 
 
 def test_retry_scan_honors_keep_flag_recorded_at_failure_time(tmp_path: Path, monkeypatch):

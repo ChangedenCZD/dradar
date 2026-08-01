@@ -20,7 +20,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import __version__, checkpoints, image_cache, pending, refill as refill_plan
+from . import (
+    __version__, artifact_staging, checkpoints, image_cache, pending,
+    refill as refill_plan,
+)
 from .api_client import ApiClient, ApiError
 from .identity import _client
 from .local_config import HOME, _load_config, tasks_root_from_config
@@ -44,7 +47,7 @@ from .telemetry import RunnerTelemetry
 # count ceiling as a last-resort guard against corrupt estimates or a logic
 # regression; normal quota-bounded plans should never reach it.
 DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
-_TERMINAL_LOCAL_OUTCOMES = {"artifacts-gone", "not-uploaded", "rejected"}
+_TERMINAL_LOCAL_OUTCOMES = {"not-uploaded", "rejected"}
 _ACCOUNT_TERMINAL_OUTCOMES = {"insufficient-balance"}
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 
@@ -394,14 +397,15 @@ def _upload_trial(
     callers (the held-batch loop, a retry scan) can carry on with the next
     item.
 
-    The entry is recorded in the local pending-upload ledger BEFORE the
-    submit attempt, so a process death mid-upload (Ctrl-C/kill/OOM during a
-    large multipart POST) can't orphan a completed, quota-burning trial.
+    The entry is recorded in the local pending-upload ledger BEFORE artifact
+    staging or the submit attempt, so a process death during either handoff
+    can't orphan a completed, quota-burning trial.
     Every exit settles it: success, 409 "already submitted", and 410 remove
     the entry; fencing conflicts and transient errors keep it for retry. The
-    raw trial_dir is never touched by scrubbing
-    (which writes to a fresh tempdir), so a later retry re-scrubs from the
-    same untouched originals."""
+    raw source patch is preserved separately until server acknowledgement;
+    scrubbing writes to a fresh tempdir, so a later retry re-scrubs from the
+    same byte-verified original."""
+    entry = dict(entry)
     assignment_id = entry["assignment_id"]
     task_id = entry.get("task_id", "?")
     outcome = entry.get("outcome", "completed")
@@ -437,14 +441,39 @@ def _upload_trial(
             except ValueError:
                 pass
 
-    patch, trajectory, result = trial_artifact_paths(trial_dir)
-    if not patch.is_file():
-        print(f"  {task_id}: local artifacts are gone, giving up on this one")
-        pending.remove(HOME, assignment_id)
-        settle_terminal_local_failure()
-        return "artifacts-gone"
+    # Persist intent before touching either artifact copy. If this process is
+    # interrupted while making the durable source or atomic staged copy, the
+    # next go/resume/retry-upload still knows exactly what must be recovered.
+    pending.record(HOME, entry)
+    try:
+        staged = artifact_staging.ensure_staged_patch(trial_dir, entry)
+    except artifact_staging.PatchStagingError as exc:
+        entry["artifact_staging_failure"] = exc.telemetry()
+        pending.record(HOME, entry)
+        print(
+            f"  {task_id}: model.patch staging blocked ({exc}); both local copies "
+            "were left untouched and the upload was kept for retry"
+        )
+        return "artifact-staging-failed"
 
-    raw_patch = patch.read_bytes()
+    entry.update(staged.ledger_fields)
+    entry.pop("artifact_staging_failure", None)
+    recovery = staged.recovery_telemetry
+    if recovery is not None:
+        entry["artifact_staging_recovery"] = recovery
+        print(
+            f"  {task_id}: recovered model.patch staging "
+            f"({recovery['reason']}, {staged.size} bytes)"
+        )
+    pending.record(HOME, entry)
+
+    patch, trajectory, result = trial_artifact_paths(trial_dir)
+    patch = staged.staged
+
+    # Use the byte snapshot verified while the staging lock was held. The
+    # multipart request below gets its own temporary file, so a concurrent
+    # pause/cleanup cannot change or remove the bytes mid-upload.
+    raw_patch = staged.data
     leaked = scan_secrets(raw_patch)
     redacted_patch: bytes | None = None
     redacted_labels: list[str] = []
@@ -468,6 +497,8 @@ def _upload_trial(
     usage = (codex_trajectory_bundle_usage(trajectory_bundle)
              if trajectory_bundle is not None else None)
     upload_meta = dict(entry.get("meta") or {})
+    if entry.get("artifact_staging_recovery"):
+        upload_meta["artifact_staging_recovery"] = entry["artifact_staging_recovery"]
     if redacted_patch is not None:
         upload_meta["patch_redacted"] = True
         upload_meta["patch_redaction_labels"] = redacted_labels
@@ -484,10 +515,10 @@ def _upload_trial(
 
     with tempfile.TemporaryDirectory() as td:
         scrubbed = Path(td)
-        upload_patch = patch
-        if redacted_patch is not None:
-            upload_patch = scrubbed / "model.patch"
-            upload_patch.write_bytes(redacted_patch)
+        upload_patch = scrubbed / "model.patch"
+        upload_patch.write_bytes(
+            redacted_patch if redacted_patch is not None else raw_patch
+        )
         trajectory_bundle_scrubbed = None
         if trajectory_bundle is not None:
             trajectory_bundle_scrubbed = scrubbed / "trajectory_bundle.json"
@@ -527,8 +558,8 @@ def _upload_trial(
             result_scrubbed.write_bytes(scrub_json_bytes(result.read_bytes()))
             if usage is not None:
                 _apply_codex_usage_to_result(result_scrubbed, usage)
-        # Record before submitting: from here on an unacked completed trial
-        # always has a ledger entry, whatever kills the upload. The server
+        # Refresh before submitting: from here on an unacked completed trial
+        # has the canonical paths + digest in its ledger entry. The server
         # dedupes replays (409 "already submitted"), so duplicates are safe.
         pending.record(HOME, entry)
         try:
@@ -674,6 +705,16 @@ def _pause_checkpoint_quietly(
     item = checkpoints.find_latest(HOME, assignment["assignment_id"])
     if item is None:
         return None
+    if item.phase == "agent_completed":
+        # Ctrl-C can arrive after Pier harvested a valid patch but before
+        # _run_and_submit regains control. Preserve the authoritative copy as
+        # part of pausing, so resume can rebuild a lost canonical artifact.
+        try:
+            artifact_staging.ensure_staged_patch(item.trial_dir)
+        except artifact_staging.PatchStagingError as exc:
+            print(
+                f"  completed checkpoint artifact staging will retry on resume ({exc})"
+            )
     if not item.valid or not item.checkpoint_id:
         _discard_checkpoint_quietly(
             client, item, assignment, reason="invalid",
@@ -774,6 +815,17 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         except (KeyboardInterrupt, EOFError):
             _pause_checkpoint_quietly(client, assignment)
             raise
+
+    # Make the authoritative source copy immediately after Pier returns,
+    # before result parsing, image bookkeeping, pause handling, or upload can
+    # be interrupted. _upload_trial repeats this idempotently and persists the
+    # same paths/digest in the pending ledger.
+    try:
+        artifact_staging.ensure_staged_patch(art.trial_dir)
+    except artifact_staging.PatchStagingError:
+        # _upload_trial below records the exact structured failure and keeps it
+        # retryable. Do not turn an artifact handoff fault into a model failure.
+        pass
 
     # Pier normally removes compose images on a clean stop, but Docker/Pier
     # failures in the wild leave the task image tagged. Record only exact
@@ -990,13 +1042,6 @@ def _resume_one_checkpoint(
                 args.allow_task_drift,
             )
             if item.phase == "agent_completed":
-                patch, _traj, _result = trial_artifact_paths(item.trial_dir)
-                if not patch.is_file():
-                    print(f"  {assignment_id}: completed checkpoint has no patch; discarding it")
-                    _discard_checkpoint_quietly(
-                        client, item, assignment, reason="invalid",
-                    )
-                    return "discarded"
                 print(f"found completed checkpoint {item.checkpoint_id}; uploading without rerunning")
                 checkpoints.prune_superseded(HOME, assignment_id, item)
                 return _upload_trial(
