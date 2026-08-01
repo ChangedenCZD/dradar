@@ -58,6 +58,30 @@ _ACCOUNT_TERMINAL_OUTCOMES = {"insufficient-balance"}
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 
 
+def _is_trajectory_bundle_rejection(exc: ApiError) -> bool:
+    """Whether a 422 only rejects the optional trajectory bundle.
+
+    Newer servers may provide a stable application code. Older deployments
+    only expose the safe detail string, so keep a deliberately narrow text
+    fallback for compatibility.
+    """
+    if exc.status_code != 422:
+        return False
+    if exc.code and exc.code.startswith("trajectory_bundle_"):
+        return True
+    detail = str(exc).lower()
+    return "trajectory_bundle" in detail or "trajectory bundle" in detail
+
+
+def _is_patch_secret_rejection(exc: ApiError) -> bool:
+    """A server-side secret rejection must never be bypassed automatically."""
+    if exc.status_code != 422:
+        return False
+    if exc.code in {"patch_secret_detected", "patch_contains_secret"}:
+        return True
+    return "patch appears to contain secrets" in str(exc).lower()
+
+
 def _pool_abort_path() -> Path | None:
     raw = os.environ.get(_POOL_ABORT_ENV)
     return Path(raw) if raw else None
@@ -568,49 +592,70 @@ def _upload_trial(
         # has the canonical paths + digest in its ledger entry. The server
         # dedupes replays (409 "already submitted"), so duplicates are safe.
         pending.record(HOME, entry)
-        try:
+        submit_bundle = (
+            None if entry.get("omit_trajectory_bundle")
+            else trajectory_bundle_scrubbed
+        )
+        while True:
             submit_kwargs = {
                 "outcome": outcome,
                 "resume_generation": entry.get("resume_generation"),
             }
-            if trajectory_bundle_scrubbed is not None:
-                submit_kwargs["trajectory_bundle"] = trajectory_bundle_scrubbed
-            ack = client.submit(
-                assignment_id, entry["nonce"], upload_patch, traj_scrubbed,
-                result_scrubbed, upload_meta, **submit_kwargs,
-            )
-        except ApiError as exc:
-            if exc.status_code == 409 and "already submitted" in str(exc).lower():
-                # Some earlier attempt actually landed server-side even
-                # though THIS process never saw the response — good news.
-                print(f"  {task_id}: already submitted (an earlier attempt landed) — clearing it")
-                pending.remove(HOME, assignment_id)
-                cleanup_settled()
-                return "submitted"
-            if exc.status_code == 410:
-                print(f"  {task_id}: lease expired, unsalvageable — the cell reopened "
-                      "for someone else, dropping it")
-                pending.remove(HOME, assignment_id)
-                cleanup_settled()
-                return "expired"
-            if exc.status_code in (404, 413, 422):
-                # Definitively rejected: the exact same bytes can never
-                # succeed (payload too large / unprocessable / assignment
-                # unknown), so an entry here would just fail identically on
-                # every future retry. 403 deliberately NOT in this list — it
-                # covers both a permanent nonce mismatch and a suspension
-                # that may be lifted, and dropping a suspended volunteer's
-                # completed trial would destroy recoverable work.
-                print(f"  {task_id}: the server rejected this upload for good ({exc}) — "
-                      "retrying can't fix it, dropping it from the retry queue "
-                      f"(local artifact path: {patch.parent.parent})")
-                pending.remove(HOME, assignment_id)
-                settle_terminal_local_failure()
-                print(f"  rejected artifacts kept for diagnosis: {patch.parent.parent}")
-                return "rejected"
-            print(f"  {task_id}: upload failed ({exc}) — kept for retry "
-                  "(`dradar retry-upload`)")
-            return "upload-failed"
+            if submit_bundle is not None:
+                submit_kwargs["trajectory_bundle"] = submit_bundle
+            try:
+                ack = client.submit(
+                    assignment_id, entry["nonce"], upload_patch, traj_scrubbed,
+                    result_scrubbed, upload_meta, **submit_kwargs,
+                )
+                break
+            except ApiError as exc:
+                if (submit_bundle is not None
+                        and _is_trajectory_bundle_rejection(exc)):
+                    # The bundle is optional. Persist the downgrade before the
+                    # second request so a crash/transport failure cannot make
+                    # the next retry rebuild and resend the rejected artifact.
+                    entry["omit_trajectory_bundle"] = True
+                    pending.record(HOME, entry)
+                    submit_bundle = None
+                    print(
+                        f"  {task_id}: server rejected the optional trajectory "
+                        "bundle; retrying the completed result without it"
+                    )
+                    continue
+
+                if exc.status_code == 409 and "already submitted" in str(exc).lower():
+                    # Some earlier attempt actually landed server-side even
+                    # though THIS process never saw the response — good news.
+                    print(f"  {task_id}: already submitted (an earlier attempt landed) — clearing it")
+                    pending.remove(HOME, assignment_id)
+                    cleanup_settled()
+                    return "submitted"
+                if exc.status_code == 410:
+                    print(f"  {task_id}: lease expired, unsalvageable — the cell reopened "
+                          "for someone else, dropping it")
+                    pending.remove(HOME, assignment_id)
+                    cleanup_settled()
+                    return "expired"
+                if (exc.status_code in (404, 413)
+                        or _is_patch_secret_rejection(exc)):
+                    # These are genuinely terminal for the current payload:
+                    # assignment unknown, request too large, or a patch the
+                    # server still considers unsafe. Never bypass the secret
+                    # gate by retrying a reduced optional-artifact set.
+                    print(f"  {task_id}: the server rejected this upload for good ({exc}) — "
+                          "retrying can't fix it, dropping it from the retry queue "
+                          f"(local artifact path: {patch.parent.parent})")
+                    pending.remove(HOME, assignment_id)
+                    settle_terminal_local_failure()
+                    print(f"  rejected artifacts kept for diagnosis: {patch.parent.parent}")
+                    return "rejected"
+                # Unknown 422 responses are not proof that the completed work
+                # is unrecoverable. Keep the ledger instead of silently losing
+                # a paid run; future CLI/server versions may understand it.
+                print(f"  {task_id}: upload failed ({exc}) — kept for retry "
+                      "(`dradar retry-upload`)")
+                return "upload-failed"
 
     pending.remove(HOME, assignment_id)
     cleanup_settled()
