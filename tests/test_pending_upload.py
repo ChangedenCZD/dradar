@@ -887,8 +887,7 @@ def _raise(status):
 
 
 def test_definitively_rejected_upload_drops_ledger_entry(tmp_path: Path, monkeypatch, capsys):
-    """413/422/404 can never succeed with the same bytes — keeping the entry
-    would just re-fail identically on every future `dradar go`."""
+    """A 413 cannot succeed with the same bytes on a later retry."""
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     trial_dir = _make_trial_dir(tmp_path)
     client = FakeClient(_raise(413))
@@ -915,7 +914,7 @@ def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypat
     }))
     (trial / "artifacts").mkdir()
     (trial / "artifacts" / "model.patch").write_text("diff --git a b\n")
-    client = FakeClient(_raise(422))
+    client = FakeClient(_raise(413))
     outcome = runloop._upload_trial(
         client,
         _entry(trial, assignment_id=aid, job_dir=str(job), keep=False),
@@ -926,6 +925,91 @@ def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypat
     assert (job / checkpoints.TERMINAL_MARKER).is_file()
     assert checkpoints.find_latest(tmp_path, aid) is None
     assert client.stopped == [aid]
+
+
+def test_bundle_422_retries_completed_result_without_optional_bundle(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100)
+    _write_codex_session(
+        sessions / "child.jsonl", "child-1", "subagent", 50,
+        parent="root-1",
+    )
+
+    class BundleFallbackClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.calls.append(trajectory_bundle is not None)
+            if trajectory_bundle is not None:
+                raise ApiError(
+                    "server returned 422: trajectory_bundle.json is not valid JSON",
+                    status_code=422,
+                )
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    client = BundleFallbackClient(lambda _aid: None)
+    outcome = runloop._upload_trial(client, _entry(trial_dir))
+    assert outcome == "submitted"
+    assert client.calls == [True, False]
+    assert pending.load(tmp_path) == []
+    assert client.stopped == []
+
+
+def test_bundle_422_persists_downgrade_when_fallback_transport_fails(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100)
+    _write_codex_session(
+        sessions / "child.jsonl", "child-1", "subagent", 50,
+        parent="root-1",
+    )
+
+    class FailingFallbackClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.calls.append(trajectory_bundle is not None)
+            if trajectory_bundle is not None:
+                raise ApiError(
+                    "server returned 422: trajectory_bundle.json is not valid JSON",
+                    status_code=422,
+                )
+            raise ApiError("server returned 503: retry", status_code=503)
+
+    first = FailingFallbackClient(lambda _aid: None)
+    assert runloop._upload_trial(first, _entry(trial_dir)) == "upload-failed"
+    assert first.calls == [True, False]
+    retry_entry = pending.load(tmp_path)[0]
+    assert retry_entry["omit_trajectory_bundle"] is True
+
+    class RecoveryClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.calls.append(trajectory_bundle is not None)
+            assert trajectory_bundle is None
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    second = RecoveryClient(lambda _aid: None)
+    assert runloop._upload_trial(second, retry_entry) == "submitted"
+    assert second.calls == [False]
+    assert pending.load(tmp_path) == []
+
+
+def test_unknown_422_keeps_completed_work_for_retry(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    client = FakeClient(_raise(422))
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "upload-failed"
+    assert [e["assignment_id"] for e in pending.load(tmp_path)] == ["a1"]
+    assert client.stopped == []
 
 
 def test_transient_5xx_keeps_ledger_entry(tmp_path: Path, monkeypatch):
