@@ -618,3 +618,23 @@ def test_mixed_batch_one_failure_yields_rc_1(monkeypatch, tmp_path: Path):
     rc = runloop._go_menu(_args(yes=True, dev_agent=None), {}, client, tmp_path)
     assert [s["assignment_id"] for s in client.submissions] == ["a2"]  # a2 still landed
     assert rc == 1  # but the batch as a whole reports failure
+
+
+def test_serial_batch_stops_before_second_cell_on_insufficient_balance(
+        monkeypatch, capsys, tmp_path: Path):
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        return "insufficient-balance"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    batch = [{**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"},
+             {**ASSIGNMENT, "assignment_id": "a2", "task_id": "t2"}]
+
+    rc = runloop._run_batch(_args(), SubmitClient({}), tmp_path, batch)
+
+    assert rc == 1
+    assert attempts == ["a1"]
+    assert "stopping this batch before the next task" in capsys.readouterr().out

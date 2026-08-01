@@ -144,6 +144,52 @@ def test_checkout_loop_fuses_after_interrupted_trial(monkeypatch, capsys, tmp_pa
     assert "stopping this batch runner" in capsys.readouterr().out
 
 
+def test_checkout_loop_always_fuses_after_insufficient_balance(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        runloop._signal_pool_abort("paid API balance exhausted")
+        return "insufficient-balance"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    abort_file = tmp_path / "pool-abort"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    client = CheckoutClient(
+        {"active": [_cell("out-of-money")], "free_pick": True},
+        [{"assignment": _cell("out-of-money"), "held": 2, "unstarted": 1},
+         {"assignment": _cell("must-not-run"), "held": 2, "unstarted": 0}],
+    )
+
+    rc = runloop._go_menu(_args(), {}, client, tmp_path)
+
+    assert rc == 1
+    assert attempts == ["out-of-money"]
+    assert len(client._checkouts) == 1
+    assert abort_file.read_text() == "paid API balance exhausted"
+    assert "stopping this batch before the next task" in capsys.readouterr().out
+
+
+def test_checkout_worker_obeys_existing_pool_balance_fuse(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    abort_file = tmp_path / "pool-abort"
+    abort_file.write_text("paid API balance exhausted")
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    client = CheckoutClient(
+        {"active": [_cell("must-not-run")], "free_pick": True},
+        [{"assignment": _cell("must-not-run"), "held": 1, "unstarted": 0}],
+    )
+
+    rc = runloop._go_menu(_args(), {}, client, tmp_path)
+
+    assert rc == 0
+    assert client.checkout_exclusions == []
+    assert "stopped before another checkout" in capsys.readouterr().out
+
+
 def test_old_server_redispatching_failed_cell_is_unstamped_before_exit(
         monkeypatch, capsys, tmp_path):
     # Regression for case 019f656c-cf16-70e2-ae4c-d1d51146acb2: an old

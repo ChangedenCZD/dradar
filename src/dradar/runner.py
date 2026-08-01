@@ -1209,7 +1209,8 @@ def summarize_result(result_path: Path | None) -> dict:
 def diagnose_exception(result_path: Path | None) -> dict:
     """Classify a trial's recorded exception for honest console reporting:
     {} when there is none, else {type, tail, kind} where kind is one of
-    stale-agent | rate-limit | auth | None (unrecognized). The message tail
+    stale-agent | insufficient-balance | rate-limit | auth | None
+    (unrecognized). The message tail
     matters most: pier's exception_message embeds the agent's actual output,
     which for codex includes the API error JSON naming the real cause."""
     if not result_path or not result_path.is_file():
@@ -1226,6 +1227,8 @@ def diagnose_exception(result_path: Path | None) -> dict:
     kind = None
     if "requires a newer version of codex" in low:
         kind = "stale-agent"
+    elif is_insufficient_balance_message(msg):
+        kind = "insufficient-balance"
     elif any(s in low for s in ("rate limit", "rate_limit", "usage_limit",
                                 "too many requests", "429")):
         kind = "rate-limit"
@@ -1245,6 +1248,17 @@ def diagnose_exception(result_path: Path | None) -> dict:
     return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
 
 
+def is_insufficient_balance_message(message: str) -> bool:
+    """Recognize only explicit paid-API account exhaustion signals."""
+    low = message.lower()
+    return any(s in low for s in (
+        "insufficient balance",
+        "insufficient_balance",
+        "balance is insufficient",
+        "余额不足",
+    )) or ("402" in low and "payment required" in low)
+
+
 # Targeted advice per diagnose_exception kind. Only the rate-limit case may
 # mention quota — an unrecognized failure gets the artifact paths, not a
 # guess (a volunteer bug report proved "wait for your quota to reset" was
@@ -1259,6 +1273,9 @@ DIAG_ADVICE = {
     "rate-limit": (
         "this looks like a genuine rate/usage limit — wait for your quota "
         "window to reset, then claim again."),
+    "insufficient-balance": (
+        "the paid API account has insufficient balance. This batch stops now "
+        "before starting another task; recharge it, then run `dradar resume`."),
     "auth": (
         "the agent could not authenticate inside the container — for DeepSeek "
         "run `dradar provider status deepseek` (or set it up again); for the "
