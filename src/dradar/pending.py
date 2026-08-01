@@ -18,16 +18,62 @@ Anything else keeps it for the next retry.
 
 import json
 import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 _FILENAME = "pending_uploads.json"
+_LOCK_FILENAME = "pending_uploads.lock"
+_PROCESS_LOCK = threading.Lock()
 
 
 def _path(home: Path) -> Path:
     return home / _FILENAME
 
 
-def load(home: Path) -> list[dict]:
+@contextmanager
+def _locked(home: Path) -> Iterator[None]:
+    """Serialize the ledger's read-modify-write cycle across all workers."""
+    home.mkdir(parents=True, exist_ok=True)
+    with _PROCESS_LOCK:
+        fd = os.open(home / _LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o600)
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        windows_lock = False
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except ImportError:  # pragma: no cover - Windows CI exercises callers
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                windows_lock = True
+            yield
+        finally:
+            if windows_lock:  # pragma: no cover
+                try:
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                try:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+            os.close(fd)
+
+
+def _load_unlocked(home: Path) -> list[dict]:
     path = _path(home)
     if not path.is_file():
         return []
@@ -38,7 +84,15 @@ def load(home: Path) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def _save(home: Path, entries: list[dict]) -> None:
+def load(home: Path) -> list[dict]:
+    # _save_unlocked commits with os.replace, so an unlocked reader still
+    # sees either the complete old file or the complete new one. Keeping this
+    # read-only also lets status/inspection work when DRADAR_HOME is mounted
+    # read-only and avoids creating a lock file merely to report no entries.
+    return _load_unlocked(home)
+
+
+def _save_unlocked(home: Path, entries: list[dict]) -> None:
     # A safety-net ledger that isn't itself crash-safe defeats the point: a
     # plain write_text() truncates the file before writing, so a kill/OOM/
     # power-loss mid-write leaves truncated JSON and load() would then drop
@@ -47,18 +101,48 @@ def _save(home: Path, entries: list[dict]) -> None:
     # new complete version, never a partial one.
     home.mkdir(parents=True, exist_ok=True)
     path = _path(home)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(entries, indent=2) + "\n")
-    os.replace(tmp, path)
+    fd, raw_tmp = tempfile.mkstemp(
+        dir=home, prefix=f".{_FILENAME}.", suffix=".tmp",
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(entries, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(home, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def record(home: Path, entry: dict) -> None:
     """Add or replace (by assignment_id) a pending-upload entry."""
-    entries = [e for e in load(home) if e.get("assignment_id") != entry.get("assignment_id")]
-    entries.append(entry)
-    _save(home, entries)
+    with _locked(home):
+        entries = [
+            e for e in _load_unlocked(home)
+            if e.get("assignment_id") != entry.get("assignment_id")
+        ]
+        entries.append(entry)
+        _save_unlocked(home, entries)
 
 
 def remove(home: Path, assignment_id: str) -> None:
-    entries = [e for e in load(home) if e.get("assignment_id") != assignment_id]
-    _save(home, entries)
+    with _locked(home):
+        entries = [
+            e for e in _load_unlocked(home)
+            if e.get("assignment_id") != assignment_id
+        ]
+        _save_unlocked(home, entries)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from dradar import checkpoints, runloop
+from dradar import artifact_staging, checkpoints, pending, runloop
 
 
 def _make_checkpoint(
@@ -144,7 +144,12 @@ class _RecoveryClient:
     def __init__(self, assignment):
         self.assignment = assignment
         self.resumes = []
+        self.pauses = []
         self.discards = []
+
+    def checkpoint_pause(self, assignment_id, checkpoint_id, generation):
+        self.pauses.append((assignment_id, checkpoint_id, generation))
+        return {"ok": True}
 
     def checkpoint_resume(self, assignment_id, checkpoint_id, generation, session_id=None):
         self.resumes.append((assignment_id, checkpoint_id, generation, session_id))
@@ -183,6 +188,55 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     assert client.resumes[0][2] == 2
     assert seen["assignment"]["resume_generation"] == 3
     assert seen["checkpoint"].checkpoint_id == item.checkpoint_id
+
+
+def test_completed_checkpoint_resume_recovers_missing_staged_patch_without_rerun(
+    tmp_path: Path, monkeypatch,
+):
+    aid = "e" * 32
+    item = _make_checkpoint(tmp_path, aid, phase="agent_completed")
+    assignment = _assignment(aid)
+    patch = item.trial_dir / "artifacts" / "model.patch"
+    patch.parent.mkdir(parents=True)
+    patch_bytes = b"diff --git a/app.py b/app.py\n-old\n+new\n"
+    patch.write_bytes(patch_bytes)
+    client = _RecoveryClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    # This is the narrow incident window: the model/Pier finished and wrote
+    # the patch, then the runner paused before _upload_trial started.
+    assert runloop._pause_checkpoint_quietly(client, assignment) is not None
+    prepared = artifact_staging.ensure_staged_patch(item.trial_dir)
+    assert client.pauses == [(aid, item.checkpoint_id, 0)]
+    prepared.staged.unlink()  # paused/closed after completion, before upload
+
+    class CompletedClient(_RecoveryClient):
+        def __init__(self, assignment_):
+            super().__init__(assignment_)
+            self.submissions = []
+
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            self.submissions.append({
+                "assignment_id": assignment_id,
+                "patch": patch.read_bytes(),
+                "meta": meta,
+            })
+            return {"submission_id": "s-recovered", "grade_status": "pending"}
+
+    client = CompletedClient(assignment)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(yes=True), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "submitted"
+    assert client.resumes == []  # completed work uploads; the model never reruns
+    assert client.submissions[0]["patch"] == patch_bytes
+    assert client.submissions[0]["meta"]["artifact_staging_recovery"]["reason"] == (
+        "source-present/staged-missing"
+    )
+    assert pending.load(tmp_path) == []
 
 
 def test_healthy_local_run_holds_assignment_lock_before_checkpoint_resume(

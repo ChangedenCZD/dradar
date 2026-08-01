@@ -561,6 +561,11 @@ dradar config show
 | `~/.dradar/pending_uploads.json` | 待补传结果账本，不保存订阅凭据 |
 | `~/.dradar/refill-plan.json` | 当前持续补题计划或最近一次安全停止诊断；不会阻塞明确的新计划 |
 
+trial 完成后，CLI 会在对应任务目录内保存一份独立的 `model.patch` 权威副本和 SHA-256
+清单，并把源路径、待上传路径、字节数和摘要写入待补传账本。`go`、`resume` 与
+`retry-upload` 共用同一套校验：若待上传副本丢失但权威副本仍完整，会通过临时文件和原子
+rename 自动重建；若两份文件摘要冲突，则保留两份现场并拒绝上传，不会猜测或覆盖。
+
 提交成功或服务端确认已经提交后，CLI 会清理不再需要的副本；恢复产生新副本时删除旧副本；
 无效、过期或无租约的 checkpoint 会回收。需要保留现场时使用 `--keep`，之后可用
 `cleanup --include-kept` 清理。
