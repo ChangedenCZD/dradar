@@ -11,6 +11,11 @@ import pytest
 
 from dradar import runloop
 from dradar.api_client import ApiError
+from dradar.providers import (
+    DEEPSEEK_CATALOG_SHA256,
+    DEEPSEEK_RUN_CONFIG_VERSION,
+    DEEPSEEK_RUNTIME_PROFILE,
+)
 from dradar.runner import RunnerError, TrialArtifacts
 
 ASSIGNMENT = {
@@ -558,6 +563,32 @@ def test_clean_run_submits_outcome_completed(monkeypatch, tmp_path: Path):
     assert tag == "submitted"
     assert client.submissions[0]["outcome"] == "completed"
     assert client.submissions[0]["meta"]["codex_cli_version"] == "0.145.0"
+
+
+def test_deepseek_submission_attests_catalog_and_runtime_profile(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    art = _fake_art(tmp_path, rc=0, codex_cli_version="0.146.0")
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+    assignment = {
+        **ASSIGNMENT,
+        "agent": "codex",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "effort": "high",
+    }
+
+    tag = runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "submitted"
+    meta = client.submissions[0]["meta"]
+    assert meta["model_config_version"] == DEEPSEEK_RUN_CONFIG_VERSION
+    assert meta["model_catalog_sha256"] == DEEPSEEK_CATALOG_SHA256
+    assert meta["model_runtime_profile"] == DEEPSEEK_RUNTIME_PROFILE
 
 
 def test_nonzero_pier_rc_submits_outcome_interrupted_with_meta(monkeypatch, tmp_path: Path):

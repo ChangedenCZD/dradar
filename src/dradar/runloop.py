@@ -32,6 +32,7 @@ from .providers import (
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_PROVIDER,
     DEEPSEEK_RUN_CONFIG_VERSION,
+    DEEPSEEK_RUNTIME_PROFILE,
     assignment_codex_provider,
 )
 from .runner import (
@@ -899,6 +900,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         meta.update({
             "model_config_version": DEEPSEEK_RUN_CONFIG_VERSION,
             "model_catalog_sha256": DEEPSEEK_CATALOG_SHA256,
+            "model_runtime_profile": DEEPSEEK_RUNTIME_PROFILE,
         })
 
     if item is not None and item.job_dir == art.job_dir:

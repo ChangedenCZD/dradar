@@ -34,6 +34,7 @@ DEEPSEEK_CATALOG_SOURCE = (
 )
 DEEPSEEK_CATALOG_SOURCE_VERSION = "1.0.0"
 DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v1"
+DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
