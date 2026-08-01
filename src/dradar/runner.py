@@ -989,6 +989,7 @@ def _tail(log_path: Path, n: int = 15) -> str:
 
 
 HEARTBEAT_SEC = 60
+TRIAL_TIMEOUT_RETURNCODE = 124
 
 
 def _last_activity(log_path: Path) -> str:
@@ -1053,6 +1054,7 @@ def run_trial(
     # it surfaces as a nonzero pier rc, which _run_and_submit reports as
     # `interrupted` -> the server marks it invalid and the cell reopens.
     timeout_sec = _trial_timeout_sec(effective_assignment)
+    terminal_error: RunnerError | None = None
 
     provider_auth_path = None
     try:
@@ -1117,7 +1119,7 @@ def run_trial(
                         next_beat = now + HEARTBEAT_SEC
                         print(f"  … {int((now - started) / 60)} min elapsed — "
                               f"{_last_activity(log_path)}")
-            except BaseException:
+            except BaseException as exc:
                 # Same contract subprocess.run had: no exception (timeout, Ctrl-C,
                 # anything) leaves a pier process running detached. TERM first
                 # with a grace window: a SIGKILLed pier can never `docker compose
@@ -1129,7 +1131,16 @@ def run_trial(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-                raise
+                if isinstance(exc, RunnerError):
+                    # A watchdog timeout is terminal for this process, but Pier
+                    # may already have harvested a patch, trajectory and token
+                    # totals while handling TERM. Keep walking the artifact path
+                    # so that work can be uploaded as ``interrupted`` and real
+                    # API spend is recorded. Missing artifacts still re-raise
+                    # this original, actionable timeout below.
+                    terminal_error = exc
+                else:
+                    raise
     finally:
         if provider_auth_path is not None:
             try:
@@ -1147,6 +1158,8 @@ def run_trial(
     try:
         job_dir, trial_dir = locate_artifacts(jobs_dir, job_name)
     except RunnerError:
+        if terminal_error is not None:
+            raise terminal_error
         if _looks_like_build_flake(tail):
             raise BuildFlakeError(
                 f"the task environment failed to BUILD (mirror/network flake) — "
@@ -1155,6 +1168,8 @@ def run_trial(
         raise
     patch, trajectory, result = trial_artifact_paths(trial_dir)
     if not patch.is_file():
+        if terminal_error is not None:
+            raise terminal_error
         # No patch at all means the agent never produced anything — usually
         # the environment died under it. Say which, instead of blaming the
         # agent for a mirror hiccup.
@@ -1169,13 +1184,19 @@ def run_trial(
             f"model.patch missing (agent likely failed; see {log_path} and {trial_dir})\n"
             f"last lines of the log:\n{tail}"
         )
+    returncode = proc.returncode
+    if terminal_error is not None and returncode in (None, 0):
+        # A TERM-aware Pier may exit cleanly after a DRadar watchdog fired.
+        # Preserve the semantic failure so runloop uploads it as interrupted
+        # instead of accidentally sending a partial patch for grading.
+        returncode = TRIAL_TIMEOUT_RETURNCODE
     return TrialArtifacts(
         job_dir=job_dir,
         trial_dir=trial_dir,
         patch=patch,
         trajectory=trajectory,
         result=result,
-        returncode=proc.returncode,
+        returncode=returncode,
         duration_sec=duration,
         log_path=log_path,
         codex_cli_version=codex_cli_version,
