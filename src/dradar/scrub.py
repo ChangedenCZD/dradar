@@ -10,7 +10,10 @@ Two artifact classes, two mechanisms (design doc):
   is never rewritten.
 
 - **Display** (trajectory.json, result.json): shown in the public viewer, so
-  redact destructively (`scrub_bytes`). Over-redaction is acceptable here.
+  redact destructively. JSON artifacts are parsed and scrubbed structurally;
+  applying regexes to their serialized bytes can consume JSON escape
+  backslashes and corrupt otherwise valid data. Over-redaction is acceptable
+  here.
 
 Both run client-side before upload AND server-side before storage. Neither
 path ever bypasses on non-UTF-8 input: bytes are decoded with
@@ -18,6 +21,7 @@ path ever bypasses on non-UTF-8 input: bytes are decoded with
 are still caught.
 """
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -68,6 +72,17 @@ _SCRUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 # Home-dir paths reveal local usernames; container paths (/app, /logs) are fine.
 _HOME_RE = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+")
+
+# The text scrubber recognizes values written next to these field names. When
+# JSON is parsed first, key and value are separate strings, so retain that
+# protection explicitly instead of relying on serialized punctuation.
+_SENSITIVE_JSON_KEY_RE = re.compile(
+    r"(?i)(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"client[_-]?secret|secret)$"
+)
+_AUTH_JSON_KEY_RE = re.compile(r"(?i)authorization$")
+_OPAQUE_AUTH_VALUE_RE = re.compile(r"[^\s\"']{12,}")
+_OPAQUE_SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/-]{16,}=*")
 
 
 def _decode(data: bytes) -> str:
@@ -136,6 +151,54 @@ def scrub_bytes(data: bytes) -> bytes:
     """Destructively redact a display artifact. Never bypasses: arbitrary
     bytes round-trip via surrogateescape while ASCII secrets are redacted."""
     return scrub_text(_decode(data)).encode("utf-8", errors="surrogateescape")
+
+
+def _scrub_json_value(value: object) -> object:
+    if isinstance(value, str):
+        return scrub_text(value)
+    if isinstance(value, list):
+        return [_scrub_json_value(item) for item in value]
+    if isinstance(value, dict):
+        scrubbed: dict[str, object] = {}
+        for key, item in value.items():
+            # json.loads always produces string object keys.
+            clean_key = scrub_text(key)
+            is_auth = bool(_AUTH_JSON_KEY_RE.search(key))
+            is_sensitive = bool(_SENSITIVE_JSON_KEY_RE.search(key))
+            should_redact = isinstance(item, str) and (
+                (is_auth and _OPAQUE_AUTH_VALUE_RE.match(item) is not None)
+                or (is_sensitive and not is_auth
+                    and _OPAQUE_SECRET_VALUE_RE.match(item) is not None)
+            )
+            if should_redact:
+                scrubbed[clean_key] = ("[REDACTED-AUTH]"
+                                       if is_auth else "[REDACTED]")
+            else:
+                scrubbed[clean_key] = _scrub_json_value(item)
+        return scrubbed
+    return value
+
+
+def scrub_json_bytes(data: bytes) -> bytes:
+    """Redact a JSON artifact without editing its serialized syntax.
+
+    Parsing before redaction keeps escape backslashes out of the regex input;
+    re-serialization therefore guarantees that valid input remains valid JSON.
+    Invalid JSON raises instead of being uploaded or bypassing redaction.
+    """
+    value = json.loads(data)
+    scrubbed = _scrub_json_value(value)
+    serialized = json.dumps(
+        scrubbed, ensure_ascii=False, separators=(",", ":"),
+    )
+    try:
+        return serialized.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON may legally contain an escaped unpaired surrogate. Keep the
+        # output valid and portable without rejecting the whole artifact.
+        return json.dumps(
+            scrubbed, ensure_ascii=True, separators=(",", ":"),
+        ).encode("ascii")
 
 
 def scrub_file(source: Path, target: Path) -> None:
