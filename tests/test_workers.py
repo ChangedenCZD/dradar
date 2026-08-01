@@ -186,7 +186,7 @@ def _patch_pool_setup(monkeypatch, active_count=5):
     monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
     monkeypatch.setattr(runloop, "tasks_root_from_config", lambda _cfg: object())
     monkeypatch.setattr(runloop, "acquire_run_lock", lambda _home: None)
-    monkeypatch.setattr(runloop, "sweep_orphan_compose", lambda _yes: None)
+    monkeypatch.setattr(runloop, "sweep_orphan_compose", lambda _home, _yes: None)
     monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
     monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
     monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)

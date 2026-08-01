@@ -1530,7 +1530,7 @@ def cmd_go(args) -> int:
                   "share this machine's CPU/RAM — expect slower individual runs.")
         else:
             acquire_run_lock(HOME)
-            sweep_orphan_compose(args.yes)
+            sweep_orphan_compose(HOME, args.yes)
             args.allow_new_claims = _maintain_image_cache(
                 client, cfg, phase="before run",
             )
@@ -1691,7 +1691,7 @@ def _run_worker_pool(args) -> int:
         client = _client(cfg, auto_register=True)
     tasks_root = tasks_root_from_config(cfg)
     acquire_run_lock(HOME)
-    sweep_orphan_compose(True)
+    sweep_orphan_compose(HOME, True)
     args.allow_new_claims = _maintain_image_cache(
         client, cfg, phase="before worker pool",
     )
