@@ -438,6 +438,50 @@ def test_run_trial_timeout_raises_naming_log(tmp_path, monkeypatch):
     assert "docker: no space left on device" in str(exc.value)
 
 
+def test_run_trial_timeout_salvages_patch_as_interrupted(tmp_path, monkeypatch):
+    """A paid run that reached artifacts must report cost, never vanish."""
+    captured = {}
+
+    def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):
+        captured["job_name"] = job_name
+        return ["pier"]
+
+    class TimedOutWithArtifacts:
+        def __init__(self, cmd, **kw):
+            trial = tmp_path / "jobs" / captured["job_name"] / "task__t0"
+            (trial / "artifacts").mkdir(parents=True)
+            (trial / "artifacts" / "model.patch").write_text("diff")
+            (trial / "agent").mkdir()
+            (trial / "agent" / "trajectory.json").write_text("[]")
+            (trial / "result.json").write_text(json.dumps({
+                "agent_result": {"cost_usd": 0.124942, "n_input_tokens": 10},
+            }))
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("pier", timeout)
+            return self.returncode
+
+        def terminate(self):
+            # Simulate Pier harvesting artifacts and exiting cleanly on TERM.
+            self.returncode = 0
+
+        def kill(self):
+            raise AssertionError("clean TERM should not escalate to KILL")
+
+    monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
+    monkeypatch.setattr(runner_mod, "_trial_timeout_sec", lambda a: -1)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", TimedOutWithArtifacts)
+
+    art = run_trial(_assignment("codex"), tmp_path, tmp_path)
+
+    assert art.patch.is_file()
+    assert art.trajectory is not None and art.trajectory.is_file()
+    assert art.returncode == runner_mod.TRIAL_TIMEOUT_RETURNCODE
+    assert summarize_result(art.result)["cost_usd"] == pytest.approx(0.124942)
+
+
 def test_run_trial_missing_patch_raises(tmp_path, monkeypatch):
     _fake_pier(monkeypatch, tmp_path, patch=False)
     with pytest.raises(RunnerError, match="model.patch missing"):
