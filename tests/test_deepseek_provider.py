@@ -3,7 +3,10 @@
 import hashlib
 import json
 import os
+import stat
+import threading
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -163,6 +166,108 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
         "wire_api": "responses",
         "requires_openai_auth": True,
     }
+
+
+def test_deepseek_shared_inputs_are_reused_and_owner_only(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, home = _command(tmp_path, monkeypatch)
+    runner._ensure_allowlist(home)
+    expected = {
+        home / runner.DEEPSEEK_AGENT_MODULE_FILENAME: (
+            Path(runner.__file__).with_name("pier_deepseek.py").read_bytes()
+        ),
+        home / "codex-deepseek-v4-flash.toml": runner.DEEPSEEK_TOML.encode(),
+        home / "codex-submission-prompt.j2": (
+            runner.CODEX_SUBMISSION_PROMPT.encode()
+        ),
+        home / "codex-chatgpt-allowlist.toml": runner.ALLOWLIST_TOML.encode(),
+    }
+    inodes = {path: path.stat().st_ino for path in expected}
+    if os.name != "nt":
+        # Reusing matching content must also repair an overly broad legacy
+        # mode without replacing the file.
+        for path in expected:
+            path.chmod(0o644)
+
+    monkeypatch.setattr(
+        runner.os,
+        "replace",
+        lambda *_args: pytest.fail("matching shared inputs must be reused"),
+    )
+    assert runner._ensure_deepseek_agent_module(home) in expected
+    assert runner._ensure_deepseek_config(home) in expected
+    assert runner._ensure_codex_submission_prompt(home) in expected
+    assert runner._ensure_allowlist(home) in expected
+
+    for path, payload in expected.items():
+        assert path.read_bytes() == payload
+        assert path.stat().st_ino == inodes[path]
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_shared_input_publication_is_atomic_under_concurrency(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "codex-deepseek-v4-flash.toml"
+    old = b"complete-old-config\n"
+    payload = (b"complete-new-config\n" * 65536)
+    path.write_bytes(old)
+    participants = 8
+    ready_to_publish = threading.Barrier(participants)
+    replace_lock = threading.Lock()
+    real_replace = os.replace
+    temp_paths: list[Path] = []
+
+    def synchronized_replace(src, dst):
+        source = Path(src)
+        assert Path(dst) == path
+        assert source.parent == path.parent
+        assert source.read_bytes() == payload
+        if os.name != "nt":
+            assert stat.S_IMODE(source.stat().st_mode) == 0o600
+        temp_paths.append(source)
+        # No publisher may expose a truncated target while the other workers
+        # are still writing their own unique temporary files.
+        assert path.read_bytes() == old
+        ready_to_publish.wait(timeout=10)
+        with replace_lock:
+            real_replace(source, dst)
+
+    monkeypatch.setattr(runner.os, "replace", synchronized_replace)
+    with ThreadPoolExecutor(max_workers=participants) as pool:
+        results = list(pool.map(
+            lambda _index: runner._materialize_shared_file(path, payload),
+            range(participants),
+        ))
+
+    assert results == [path] * participants
+    assert len(temp_paths) == participants
+    assert len(set(temp_paths)) == participants
+    assert path.read_bytes() == payload
+    assert not list(tmp_path.glob(f".{path.name}.*"))
+
+
+def test_failed_shared_input_publication_keeps_previous_complete_file(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "codex-submission-prompt.j2"
+    path.write_bytes(b"previous complete prompt")
+    monkeypatch.setattr(
+        runner.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        runner._materialize_shared_file(path, b"replacement prompt")
+
+    assert path.read_bytes() == b"previous complete prompt"
+    assert not list(tmp_path.glob(f".{path.name}.*"))
 
 
 def test_command_fails_before_paid_run_when_catalog_is_modified(
