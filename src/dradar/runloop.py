@@ -29,8 +29,9 @@ from .providers import DEEPSEEK_PROVIDER, assignment_codex_provider
 from .runner import (
     DIAG_ADVICE, BuildFlakeError, RunnerError, build_codex_trajectory_bundle,
     check_task_content_hash, codex_trajectory_bundle_usage,
-    diagnose_exception, ensure_pier, ensure_tasks_root, local_deep_swe_commit,
-    run_trial, summarize_result, sync_deep_swe_commit, trial_artifact_paths,
+    diagnose_exception, ensure_pier, ensure_tasks_root,
+    is_insufficient_balance_message, local_deep_swe_commit, run_trial,
+    summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import (
     patch_structure_is_valid, redact_patch_secrets, scan_secrets, scrub_bytes,
@@ -44,6 +45,44 @@ from .telemetry import RunnerTelemetry
 # regression; normal quota-bounded plans should never reach it.
 DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
 _TERMINAL_LOCAL_OUTCOMES = {"artifacts-gone", "not-uploaded", "rejected"}
+_ACCOUNT_TERMINAL_OUTCOMES = {"insufficient-balance"}
+_POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
+
+
+def _pool_abort_path() -> Path | None:
+    raw = os.environ.get(_POOL_ABORT_ENV)
+    return Path(raw) if raw else None
+
+
+def _signal_pool_abort(reason: str) -> None:
+    """Tell sibling workers in this one supervised pool to stop checking out."""
+    path = _pool_abort_path()
+    if path is None:
+        return
+    try:
+        path.write_text(reason)
+    except OSError:
+        # The worker that observed the terminal condition still stops locally.
+        # Never turn a best-effort sibling signal into another task failure.
+        pass
+
+
+def _pool_abort_reason() -> str | None:
+    path = _pool_abort_path()
+    if path is None or not path.is_file():
+        return None
+    try:
+        return path.read_text().strip() or "another worker stopped the pool"
+    except OSError:
+        return "another worker stopped the pool"
+
+
+def _announce_account_stop() -> None:
+    print(
+        "paid API balance is exhausted — stopping this batch before the next "
+        "task. Unstarted leases remain untouched; recharge, then run "
+        "`dradar resume`."
+    )
 
 
 def _fmt_pct(pct: float) -> str:
@@ -714,17 +753,20 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 _mark_stopped_quietly(client, assignment)
             return "failed"
         except RunnerError as exc:
+            insufficient_balance = is_insufficient_balance_message(str(exc))
+            if insufficient_balance:
+                _signal_pool_abort("paid API balance exhausted")
             item = _pause_checkpoint_quietly(client, assignment)
             if item is not None:
                 print(f"trial interrupted: {exc}\n"
                       f"checkpoint {item.checkpoint_id} was kept; `dradar resume` "
                       "continues the same workspace/session")
-                return "paused"
+                return "insufficient-balance" if insufficient_balance else "paused"
             print(f"trial failed: {exc}\n"
                   "use `dradar resume` to retry later, or `dradar release` to "
                   "give the cell back")
             _mark_stopped_quietly(client, assignment)
-            return "failed"
+            return "insufficient-balance" if insufficient_balance else "failed"
         except (KeyboardInterrupt, EOFError):
             _pause_checkpoint_quietly(client, assignment)
             raise
@@ -744,13 +786,21 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
     # model failure: report it so the server marks it invalid, not graded 0.
     interrupted = art.returncode != 0 or stats.get("exception_info")
+    diag = diagnose_exception(art.result) if interrupted else {}
+    failure_kind = diag.get("kind")
+    if failure_kind == "insufficient-balance":
+        _signal_pool_abort("paid API balance exhausted")
     item = checkpoints.find_latest(HOME, assignment["assignment_id"])
     if interrupted and item is not None and item.phase != "agent_completed":
         saved = _pause_checkpoint_quietly(client, assignment)
         if saved is not None:
             print(f"trial interrupted; checkpoint {saved.checkpoint_id} was kept — "
                   "the next `dradar resume` continues instead of submitting a partial run")
-            return "paused"
+            return (
+                "insufficient-balance"
+                if failure_kind == "insufficient-balance"
+                else "paused"
+            )
     outcome = "interrupted" if interrupted else "completed"
     if telemetry:
         telemetry.set_phase("uploading", assignment["assignment_id"])
@@ -761,7 +811,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         # the recorded exception carries the in-container agent's real error
         # (exit code, API rejection) — hiding it sent a volunteer chasing a
         # quota problem that was a version problem.
-        diag = diagnose_exception(art.result)
         if diag:
             print(f"the agent failed inside the container: {diag.get('type') or 'unknown error'}")
             for ln in diag.get("tail", []):
@@ -786,7 +835,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     if item is not None and item.job_dir == art.job_dir:
         checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
 
-    return _upload_trial(client, {
+    upload_outcome = _upload_trial(client, {
         "assignment_id": assignment["assignment_id"], "nonce": assignment["nonce"],
         "task_id": assignment["task_id"], "trial_dir": str(art.trial_dir),
         "meta": meta, "outcome": outcome,
@@ -798,6 +847,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         and not getattr(args, "yes", False)
         and not getattr(args, "parallel", False)
     ))
+    if failure_kind == "insufficient-balance":
+        return "insufficient-balance"
+    return upload_outcome
 
 
 def _retry_pending_uploads(client: ApiClient) -> None:
@@ -1549,6 +1601,10 @@ def _run_worker_pool(args) -> int:
         print(f"only {len(active)} task(s) are currently held; starting {count} worker(s)")
     print(f"starting {count} worker(s); server-side checkout assigns each task exactly once")
     command = _worker_command(args)
+    pool_abort_file = (
+        Path(tempfile.gettempdir())
+        / f"dradar-pool-abort-{os.getpid()}-{time.time_ns()}"
+    )
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -1558,6 +1614,7 @@ def _run_worker_pool(args) -> int:
             env = os.environ.copy()
             env["DRADAR_WORKER_INDEX"] = str(index)
             env["DRADAR_POOL_SIZE"] = str(count)
+            env[_POOL_ABORT_ENV] = str(pool_abort_file)
             process = subprocess.Popen(command, env=env, **popen_kwargs)
             processes.append(process)
             print(f"  worker {index}/{count}: pid {process.pid}")
@@ -1566,6 +1623,7 @@ def _run_worker_pool(args) -> int:
         print("\nstopping workers safely; active tasks remain resumable...")
         _signal_workers(processes)
         _maintain_image_cache(client, cfg, phase="after interrupted worker pool")
+        pool_abort_file.unlink(missing_ok=True)
         raise
     except OSError as exc:
         # A later spawn can fail after earlier children are already live
@@ -1575,7 +1633,9 @@ def _run_worker_pool(args) -> int:
         print(f"couldn't start every worker ({exc}); stopping those already started")
         _signal_workers(processes)
         _maintain_image_cache(client, cfg, phase="after failed worker pool")
+        pool_abort_file.unlink(missing_ok=True)
         return 1
+    pool_abort_file.unlink(missing_ok=True)
     failed = [(i, rc) for i, rc in enumerate(returncodes, 1) if rc != 0]
     _maintain_image_cache(client, cfg, phase="after worker pool")
     if failed:
@@ -1678,10 +1738,14 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
             # subprocess can start or fail. assignment/started then stamps
             # started_at + this same session id in one server transaction.
             telemetry.flush()
-        results.append(_run_and_submit(
-            client, assignment, tasks_root, args, local_commit, telemetry=telemetry))
+        outcome = _run_and_submit(
+            client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
+        results.append(outcome)
         if telemetry:
             telemetry.set_phase("queued")
+        if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
+            _announce_account_stop()
+            break
     ok = all(o in ("submitted", "interrupted") for o in results)
     return 0 if ok else 1
 
@@ -1699,6 +1763,10 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                                       args.allow_task_drift)
     results, failed_ids = [], set()
     while True:
+        pool_abort_reason = _pool_abort_reason()
+        if pool_abort_reason:
+            print(f"worker pool stopped before another checkout: {pool_abort_reason}")
+            break
         if getattr(args, "refill", False) and not refill_plan.is_running(HOME):
             print("continuous refill is stopped; leaving already held tasks for a later resume")
             break
@@ -1770,6 +1838,12 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
         if telemetry:
             telemetry.set_phase("queued")
+        if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
+            if getattr(args, "refill", False):
+                refill_plan.stop(HOME, "paid API balance exhausted")
+            _announce_account_stop()
+            results.append(outcome)
+            break
         fail_fast = os.environ.get("DRADAR_BATCH_FAIL_FAST", "").lower() in {
             "1", "true", "yes", "on",
         }

@@ -273,6 +273,9 @@ def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
     assert len(calls) == 3
     assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "3"]
     assert [p.env["DRADAR_POOL_SIZE"] for p in calls] == ["3", "3", "3"]
+    abort_files = {p.env["DRADAR_POOL_ABORT_FILE"] for p in calls}
+    assert len(abort_files) == 1
+    assert not runloop.Path(abort_files.pop()).exists()
     assert all("resume" in p.command and "--auto" not in p.command for p in calls)
 
 
