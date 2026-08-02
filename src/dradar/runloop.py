@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
@@ -56,6 +57,9 @@ DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
 _TERMINAL_LOCAL_OUTCOMES = {"not-uploaded", "rejected"}
 _ACCOUNT_TERMINAL_OUTCOMES = {"insufficient-balance"}
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
+_POOL_SUPERVISOR_POLL_SECONDS = 0.2
+_POOL_BACKFILL_REFRESH_SECONDS = 2.0
+_POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
 
 
 def _is_trajectory_bundle_rejection(exc: ApiError) -> bool:
@@ -1652,6 +1656,54 @@ def _signal_workers(processes: list[subprocess.Popen]) -> None:
             process.kill()
 
 
+def _assignment_is_ready_for_checkout(
+    assignment: dict, *, now: datetime | None = None,
+) -> bool:
+    """Whether a held cell is genuinely waiting for a worker right now.
+
+    Paused/checkpointed work deliberately stays out of automatic pool
+    backfill: repeatedly reviving a broken checkpoint can burn quota and hide
+    an incident. Fresh controller claims have no ``started_at`` value and are
+    safe for the server's atomic checkout endpoint to assign.
+    """
+    if (assignment.get("started_at")
+            or assignment.get("execution_state") == "paused"
+            or assignment.get("checkpoint_id")):
+        return False
+    retry_after = assignment.get("retry_after")
+    if not retry_after:
+        return True
+    try:
+        ready_at = datetime.fromisoformat(str(retry_after).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if ready_at.tzinfo is None:
+        ready_at = ready_at.replace(tzinfo=timezone.utc)
+    return ready_at <= (now or datetime.now(timezone.utc))
+
+
+def _pool_ready_waiting_count(client: ApiClient) -> int | None:
+    """Read the authoritative held queue without claiming anything.
+
+    ``None`` means the safety check itself failed. The supervisor then keeps
+    current workers but fails closed instead of guessing and overspawning.
+    """
+    try:
+        data = client.get_assignment()
+    except ApiError as exc:
+        print(f"worker backfill check failed ({exc}); keeping current workers only")
+        return None
+    active = data.get("active")
+    if active is None:
+        one = data.get("assignment")
+        active = [one] if one else []
+    return sum(
+        _assignment_is_ready_for_checkout(assignment)
+        for assignment in active
+        if assignment
+    )
+
+
 def _run_worker_pool(args) -> int:
     """Prepare one batch, then supervise several ordinary resume processes."""
     cfg = client = None
@@ -1718,16 +1770,74 @@ def _run_worker_pool(args) -> int:
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     processes: list[subprocess.Popen] = []
+    active_processes: dict[int, subprocess.Popen] = {}
+    returncodes: list[tuple[int, int]] = []
+    backfill_error: str | None = None
+    backfill_disabled = False
+
+    def spawn_worker(slot: int) -> None:
+        env = os.environ.copy()
+        env["DRADAR_WORKER_INDEX"] = str(slot)
+        env["DRADAR_POOL_SIZE"] = str(count)
+        env[_POOL_ABORT_ENV] = str(pool_abort_file)
+        process = subprocess.Popen(command, env=env, **popen_kwargs)
+        processes.append(process)
+        active_processes[slot] = process
+        print(f"  worker {slot}/{count}: pid {process.pid}")
+
     try:
         for index in range(1, count + 1):
-            env = os.environ.copy()
-            env["DRADAR_WORKER_INDEX"] = str(index)
-            env["DRADAR_POOL_SIZE"] = str(count)
-            env[_POOL_ABORT_ENV] = str(pool_abort_file)
-            process = subprocess.Popen(command, env=env, **popen_kwargs)
-            processes.append(process)
-            print(f"  worker {index}/{count}: pid {process.pid}")
-        returncodes = [process.wait() for process in processes]
+            spawn_worker(index)
+
+        next_backfill_check = 0.0
+        while active_processes:
+            for slot, process in list(active_processes.items()):
+                returncode = process.poll()
+                if returncode is None:
+                    continue
+                returncodes.append((slot, returncode))
+                del active_processes[slot]
+
+            if not active_processes:
+                break
+            if pool_abort_file.is_file():
+                time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
+                continue
+
+            current_time = time.monotonic()
+            if (not backfill_disabled
+                    and len(active_processes) < count
+                    and current_time >= next_backfill_check):
+                ready = _pool_ready_waiting_count(client)
+                next_backfill_check = (
+                    current_time + (
+                        _POOL_BACKFILL_ERROR_RETRY_SECONDS
+                        if ready is None else _POOL_BACKFILL_REFRESH_SECONDS
+                    )
+                )
+                if ready:
+                    vacant_slots = sorted(
+                        set(range(1, count + 1)) - set(active_processes)
+                    )
+                    for slot in vacant_slots[:ready]:
+                        print(
+                            f"held work is waiting; restoring worker slot "
+                            f"{slot}/{count}"
+                        )
+                        try:
+                            spawn_worker(slot)
+                        except OSError as exc:
+                            # Existing children remain observed by this
+                            # parent. A replacement failure must not interrupt
+                            # paid work merely to restore target throughput.
+                            backfill_error = str(exc)
+                            backfill_disabled = True
+                            print(
+                                f"couldn't restore worker slot {slot}/{count} "
+                                f"({exc}); current workers will finish safely"
+                            )
+                            break
+            time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
     except (KeyboardInterrupt, EOFError):
         print("\nstopping workers safely; active tasks remain resumable...")
         _signal_workers(processes)
@@ -1745,8 +1855,12 @@ def _run_worker_pool(args) -> int:
         pool_abort_file.unlink(missing_ok=True)
         return 1
     pool_abort_file.unlink(missing_ok=True)
-    failed = [(i, rc) for i, rc in enumerate(returncodes, 1) if rc != 0]
+    failed = [(slot, rc) for slot, rc in returncodes if rc != 0]
     _maintain_image_cache(client, cfg, phase="after worker pool")
+    if backfill_error:
+        print("worker pool finished after a backfill spawn error; completed uploads "
+              "are preserved and the next resume can restore the full pool")
+        return 1
     if failed:
         detail = ", ".join(f"worker {i}=exit {rc}" for i, rc in failed)
         print(f"worker pool finished with errors: {detail}")

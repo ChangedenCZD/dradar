@@ -1,6 +1,7 @@
 """One-command worker pool: selection happens once; children only resume."""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -181,6 +182,25 @@ class _LiveProcess(_Process):
         self.returncode = -9
 
 
+class _ScriptedProcess(_Process):
+    def __init__(self, command, env, polls, on_poll=None, **kwargs):
+        super().__init__(command, env, **kwargs)
+        self.returncode = None
+        self.polls = list(polls)
+        self.on_poll = on_poll
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        if self.on_poll:
+            self.on_poll()
+            self.on_poll = None
+        value = self.polls.pop(0)
+        if value is not None:
+            self.returncode = value
+        return value
+
+
 def _patch_pool_setup(monkeypatch, active_count=5):
     monkeypatch.setattr(runloop, "_load_config", lambda: {})
     monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
@@ -190,6 +210,10 @@ def _patch_pool_setup(monkeypatch, active_count=5):
     monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
     monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
     monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)
+    monkeypatch.setattr(
+        runloop, "_maintain_image_cache",
+        lambda _client, _cfg, *, phase: True,
+    )
     monkeypatch.setattr(
         runloop, "_prepare_batch",
         lambda _args, _client: ([{"assignment_id": str(i)} for i in range(active_count)], True),
@@ -302,6 +326,158 @@ def test_pool_reports_child_failure_without_hiding_other_results(monkeypatch, ca
     out = capsys.readouterr().out
     assert "worker 2=exit 1" in out
     assert "completed uploads are preserved" in out
+
+
+def test_pool_restores_vacant_slot_when_fresh_held_work_is_waiting(
+        monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=2)
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def get_assignment(self):
+            self.calls += 1
+            return {"active": [{"assignment_id": "new", "started_at": None}]}
+
+    client = Client()
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        polls = [None, 0] if len(calls) == 0 else [0]
+        process = _ScriptedProcess(command, env, polls, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 0
+    assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "2"]
+    assert client.calls == 1
+    assert "restoring worker slot 2/2" in capsys.readouterr().out
+
+
+def test_pool_does_not_restore_slot_for_future_retry(monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    retry_after = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [{
+                "assignment_id": "cooling-down",
+                "started_at": None,
+                "retry_after": retry_after.isoformat(),
+            }]}
+
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: Client())
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        polls = [None, 0] if not calls else [0]
+        process = _ScriptedProcess(command, env, polls, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 0
+    assert len(calls) == 2
+
+
+def test_pool_abort_never_restores_a_worker(monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_waiting_count",
+        lambda _client: pytest.fail("aborted pool must not inspect or backfill"),
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        on_poll = None
+        polls = [None, 0]
+        if len(calls) == 1:
+            polls = [0]
+            on_poll = lambda: runloop.Path(
+                env["DRADAR_POOL_ABORT_FILE"]
+            ).write_text("account stop")
+        process = _ScriptedProcess(
+            command, env, polls, on_poll=on_poll, **kwargs,
+        )
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 0
+    assert len(calls) == 2
+
+
+def test_backfill_spawn_failure_keeps_existing_worker_running(monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=2)
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [{"assignment_id": "new", "started_at": None}]}
+
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: Client())
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    calls = []
+    attempts = 0
+
+    def popen(command, env, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 3:
+            raise OSError("process limit")
+        polls = [None, 0] if not calls else [0]
+        process = _ScriptedProcess(command, env, polls, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 1
+    assert attempts == 3
+    assert len(calls) == 2
+    assert calls[0].returncode == 0
+    out = capsys.readouterr().out
+    assert "current workers will finish safely" in out
+    assert "backfill spawn error" in out
+
+
+def test_ready_assignment_filter_excludes_running_paused_and_bad_retry_time():
+    now = datetime.now(timezone.utc)
+    assert runloop._assignment_is_ready_for_checkout(
+        {"started_at": None, "retry_after": None}, now=now,
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": now.isoformat(), "execution_state": "running"}, now=now,
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": now.isoformat(), "execution_state": "paused"}, now=now,
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": None, "execution_state": "paused"}, now=now,
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": None, "checkpoint_id": "checkpoint"}, now=now,
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": None, "retry_after": "not-a-time"}, now=now,
+    )
+
+
+def test_backfill_queue_read_fails_closed(monkeypatch, capsys):
+    class Client:
+        def get_assignment(self):
+            raise runloop.ApiError("network unavailable")
+
+    assert runloop._pool_ready_waiting_count(Client()) is None
+    assert "keeping current workers only" in capsys.readouterr().out
 
 
 def test_declining_pool_claims_nothing(monkeypatch):
