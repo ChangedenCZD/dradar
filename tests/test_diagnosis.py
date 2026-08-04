@@ -61,8 +61,25 @@ def test_diagnose_classifies_stale_agent(tmp_path):
 
 
 def test_diagnose_classifies_rate_limit(tmp_path):
-    d = diagnose_exception(_result(tmp_path, "codex: usage_limit_reached, retry later"))
+    d = diagnose_exception(_result(tmp_path, "429 Too Many Requests: burst rate limit"))
     assert d["kind"] == "rate-limit"
+
+
+def test_diagnose_classifies_quota_limit_before_generic_429(tmp_path):
+    d = diagnose_exception(_result(
+        tmp_path, "429 Too Many Requests: usage_limit_reached, retry after reset"))
+    assert d["kind"] == "quota-limit"
+
+
+def test_diagnose_classifies_403_as_auth_terminal(tmp_path):
+    d = diagnose_exception(_result(tmp_path, "403 Forbidden: account suspended"))
+    assert d["kind"] == "auth"
+
+
+def test_diagnose_does_not_treat_bare_task_numbers_as_http_errors(tmp_path):
+    d = diagnose_exception(_result(
+        tmp_path, "tests processed: 401; next case: 429; assertion failed"))
+    assert d["kind"] is None
 
 
 def test_diagnose_classifies_insufficient_balance_before_generic_http_errors(tmp_path):
@@ -106,7 +123,7 @@ def test_interrupted_prints_cause_keeps_artifacts_no_quota_claim(
     monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
     client = InvalidAckClient({})
     tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
-    assert tag == "interrupted"
+    assert tag == "runtime-incompatible"
     assert client.submissions[0]["meta"]["exception_type"] == "NonZeroAgentExitCodeError"
     out = capsys.readouterr().out
     assert "NonZeroAgentExitCodeError" in out
@@ -126,7 +143,30 @@ def test_interrupted_rate_limit_advice_mentions_quota(monkeypatch, capsys, tmp_p
     client = InvalidAckClient({})
     runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
     out = capsys.readouterr().out
-    assert "rate/usage limit" in out
+    assert "bounded exponential backoff" in out
+
+
+def test_interrupted_quota_limit_opens_pool_circuit(
+        monkeypatch, capsys, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "ACCOUNT_STOP"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    art = _fake_art(tmp_path, rc=0, result_data={
+        "exception_info": {
+            "exception_type": "AgentError",
+            "exception_message": "429: usage_limit_reached for weekly quota",
+        },
+        "agent_result": {},
+    })
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = InvalidAckClient({})
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123")
+
+    assert outcome == "quota-exhausted"
+    assert abort_file.read_text() == "account quota exhausted"
+    assert "quota window is exhausted" in capsys.readouterr().out
 
 
 def test_interrupted_insufficient_balance_returns_batch_terminal_outcome(

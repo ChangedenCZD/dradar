@@ -416,6 +416,22 @@ def test_pool_abort_never_restores_a_worker(monkeypatch):
     assert len(calls) == 2
 
 
+def test_external_pool_circuit_is_persistent_and_prevents_worker_start(
+        tmp_path, monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    abort_file = tmp_path / "ACCOUNT_STOP"
+    abort_file.write_text("account quota exhausted")
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda *_a, **_k: pytest.fail("open circuit must not start workers"),
+    )
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 0
+    assert abort_file.read_text() == "account quota exhausted"
+    assert "circuit-broken" in capsys.readouterr().out
+
+
 def test_backfill_spawn_failure_keeps_existing_worker_running(monkeypatch, capsys):
     _patch_pool_setup(monkeypatch, active_count=2)
 

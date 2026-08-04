@@ -174,6 +174,7 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     seen = {}
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
 
     def fake_run(client_, resumed, tasks_root, args, local_commit, **kwargs):
         seen["assignment"] = resumed
@@ -188,6 +189,40 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     assert client.resumes[0][2] == 2
     assert seen["assignment"]["resume_generation"] == 3
     assert seen["checkpoint"].checkpoint_id == item.checkpoint_id
+
+
+def test_checkpoint_recovery_uses_exponential_backoff(tmp_path: Path):
+    aid = "7" * 32
+    now = datetime.now(timezone.utc)
+    item = _make_checkpoint(
+        tmp_path, aid, generation=3, updated_at=now.isoformat(),
+    )
+
+    assert runloop._checkpoint_backoff_seconds(item, now=now) == 120
+
+
+def test_checkpoint_recovery_limit_opens_circuit_without_resuming(
+        tmp_path: Path, monkeypatch, capsys):
+    aid = "8" * 32
+    item = _make_checkpoint(
+        tmp_path, aid, generation=runloop.MAX_CHECKPOINT_RESUMES,
+    )
+    assignment = _assignment(aid, generation=runloop.MAX_CHECKPOINT_RESUMES)
+    client = _RecoveryClient(assignment)
+    abort_file = tmp_path / "ACCOUNT_STOP"
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "recovery-exhausted"
+    assert client.resumes == []
+    assert checkpoints.is_terminal(tmp_path, item)
+    assert abort_file.read_text() == "checkpoint recovery safety limit reached"
+    assert "5-resume safety limit" in capsys.readouterr().out
 
 
 def test_completed_checkpoint_resume_recovers_missing_staged_patch_without_rerun(
