@@ -1327,10 +1327,56 @@ def summarize_result(result_path: Path | None) -> dict:
     }
 
 
+def classify_exception_message(message: str) -> str | None:
+    """Classify an agent failure by the recovery action it permits.
+
+    Account/runtime terminal failures must stop a supervised pool, while a
+    plain burst-rate 429 may be retried later with bounded backoff. Keep the
+    explicit quota signals ahead of the generic 429 fallback: Codex commonly
+    includes both in the same error payload.
+    """
+    low = message.lower()
+
+    def has_http_status(status: int) -> bool:
+        code = str(status)
+        return bool(re.search(
+            rf"(?:\bhttp(?:\s+status)?\s*|[\"']?(?:status|status_code|code)"
+            rf"[\"']?\s*[:=]\s*){code}\b|"
+            rf"\b{code}\s+(?:unauthorized|forbidden|payment required|"
+            rf"too many requests|rate limit)",
+            low,
+        ))
+
+    if "requires a newer version of codex" in low:
+        return "stale-agent"
+    if is_insufficient_balance_message(message):
+        return "insufficient-balance"
+    if any(s in low for s in (
+        "usage_limit", "usage limit", "quota exhausted", "quota_exhausted",
+        "quota exceeded", "weekly limit", "weekly quota",
+        "usage limit reached", "quota limit reached",
+        "you've hit your usage limit", "you have hit your usage limit",
+    )):
+        return "quota-limit"
+    if has_http_status(401) or has_http_status(403) or any(s in low for s in (
+        "unauthorized", "forbidden", "authentication failed",
+        "invalid api key", "token expired", "account suspended",
+    )):
+        return "auth"
+    if has_http_status(429) or any(s in low for s in (
+        "rate limit", "rate_limit", "too many requests",
+    )):
+        return "rate-limit"
+    if "at capacity" in low:
+        return "model-capacity"
+    return None
+
+
 def diagnose_exception(result_path: Path | None) -> dict:
     """Classify a trial's recorded exception for honest console reporting:
     {} when there is none, else {type, tail, kind} where kind is one of
-    stale-agent | insufficient-balance | rate-limit | auth | None
+    stale-agent | insufficient-balance | quota-limit | rate-limit | auth |
+    model-capacity | None
     (unrecognized). The message tail
     matters most: pier's exception_message embeds the agent's actual output,
     which for codex includes the API error JSON naming the real cause."""
@@ -1344,27 +1390,7 @@ def diagnose_exception(result_path: Path | None) -> dict:
     if not info:
         return {}
     msg = info.get("exception_message") or ""
-    low = msg.lower()
-    kind = None
-    if "requires a newer version of codex" in low:
-        kind = "stale-agent"
-    elif is_insufficient_balance_message(msg):
-        kind = "insufficient-balance"
-    elif any(s in low for s in ("rate limit", "rate_limit", "usage_limit",
-                                "too many requests", "429")):
-        kind = "rate-limit"
-    elif any(s in low for s in ("401", "unauthorized", "authentication failed",
-                                "invalid api key", "token expired")):
-        kind = "auth"
-    elif "at capacity" in low:
-        # codex treats a momentary "Selected model is at capacity" as a fatal
-        # turn.failed, which pier reports as a plain nonzero exit -- this is
-        # not a real failure of the agent's work (volunteer report #3,
-        # 2026-07-15: caught mid-run after 1,327 passing tests). The pinned
-        # SecurityMind Pier build resumes the root session with bounded
-        # retries; reaching this diagnostic means those retries were
-        # exhausted. Keep the distinct classification for honest reporting.
-        kind = "model-capacity"
+    kind = classify_exception_message(msg)
     tail = [ln.strip() for ln in msg.splitlines() if ln.strip()][-6:]
     return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
 
@@ -1392,8 +1418,11 @@ DIAG_ADVICE = {
         "image automatically. If this repeats on the latest dradar, tell the "
         "radar operators — the server-side pin may need a bump."),
     "rate-limit": (
-        "this looks like a genuine rate/usage limit — wait for your quota "
-        "window to reset, then claim again."),
+        "the provider is rate-limiting requests — checkpoint recovery uses "
+        "bounded exponential backoff and will stop after its retry budget."),
+    "quota-limit": (
+        "the account quota window is exhausted. This batch stops now; after "
+        "the quota resets, start it again to resume the preserved checkpoints."),
     "insufficient-balance": (
         "the paid API account has insufficient balance. This batch stops now "
         "before starting another task; recharge it, then run `dradar resume`."),
