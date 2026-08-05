@@ -64,6 +64,7 @@ _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
 _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
+_POOL_IMAGE_CACHE_MAINTENANCE_SECONDS = 15 * 60
 MAX_CHECKPOINT_RESUMES = 5
 _CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
 _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
@@ -1490,11 +1491,13 @@ def cmd_cleanup(args) -> int:
 
 
 def _maintain_image_cache(client: ApiClient, cfg: dict, *, phase: str) -> bool:
-    """Run bounded, ledger-only GC while no local worker is active.
+    """Run bounded, ledger-only GC with fail-closed ownership checks.
 
     A server read failure makes cleanup a no-op: without the active lease set
     we cannot prove an image is disposable.  The return value controls only
-    NEW claims; existing leases/checkpoints are still allowed to run.
+    NEW claims; existing leases/checkpoints are still allowed to run. During
+    a worker pool, active assignments and Docker container references remain
+    protected and every removal revalidates the exact image ID and labels.
     """
     try:
         active_ids = set(_active_by_id(client))
@@ -2174,7 +2177,18 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 results.append(outcome)
                 break
             replenished = None
-            if not _disk_allows_refill(_load_config()):
+            runtime_cfg = _load_config()
+            maintenance_allows_refill = True
+            if (getattr(args, "worker_child", False)
+                    and image_cache.claim_periodic_maintenance(
+                        HOME,
+                        interval_seconds=_POOL_IMAGE_CACHE_MAINTENANCE_SECONDS,
+                    )):
+                maintenance_allows_refill = _maintain_image_cache(
+                    client, runtime_cfg, phase="during worker pool",
+                )
+            if (not maintenance_allows_refill
+                    or not _disk_allows_refill(runtime_cfg)):
                 refill_plan.stop(HOME, "disk free below image-cache safety floor")
                 print("continuous refill stopped before claiming another task: disk free "
                       "is below the 25 GiB safety floor. Existing work stays held; run "

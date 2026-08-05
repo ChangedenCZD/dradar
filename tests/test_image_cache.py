@@ -74,6 +74,18 @@ def test_record_trial_images_persists_only_valid_current_refs(tmp_path: Path, mo
     assert records[MAIN_REF]["task_id"] == "some-task"
 
 
+def test_periodic_maintenance_claim_is_shared_and_throttled(tmp_path: Path):
+    assert image_cache.claim_periodic_maintenance(
+        tmp_path, interval_seconds=900, now=1_000,
+    )
+    assert not image_cache.claim_periodic_maintenance(
+        tmp_path, interval_seconds=900, now=1_899,
+    )
+    assert image_cache.claim_periodic_maintenance(
+        tmp_path, interval_seconds=900, now=1_900,
+    )
+
+
 def test_invalid_trial_name_never_queries_docker(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         image_cache, "_run_docker",
