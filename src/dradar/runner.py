@@ -1421,11 +1421,14 @@ DIAG_ADVICE = {
         "the provider is rate-limiting requests — checkpoint recovery uses "
         "bounded exponential backoff and will stop after its retry budget."),
     "quota-limit": (
-        "the account quota window is exhausted. This batch stops now; after "
-        "the quota resets, start it again to resume the preserved checkpoints."),
+        "the account quota window is exhausted. This worker stops and the pool "
+        "will not start new work, while already-running siblings are allowed to "
+        "finish. After the quota resets, start it again to resume the preserved "
+        "checkpoints."),
     "insufficient-balance": (
-        "the paid API account has insufficient balance. This batch stops now "
-        "before starting another task; recharge it, then run `dradar resume`."),
+        "the paid API account has insufficient balance. This worker stops and "
+        "the pool will not start another task, while already-running siblings "
+        "are allowed to finish; recharge it, then run `dradar resume`."),
     "auth": (
         "the agent could not authenticate inside the container — for DeepSeek "
         "run `dradar provider status deepseek` (or set it up again); for the "

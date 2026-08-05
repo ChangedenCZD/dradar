@@ -668,4 +668,6 @@ def test_serial_batch_stops_before_second_cell_on_insufficient_balance(
 
     assert rc == 1
     assert attempts == ["a1"]
-    assert "stopping this batch before the next task" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "stopping this worker before the next task" in out
+    assert "siblings with model runs already in flight are allowed to finish" in out

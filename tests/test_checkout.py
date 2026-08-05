@@ -151,7 +151,9 @@ def test_checkout_loop_always_fuses_after_insufficient_balance(
 
     def run(client, assignment, *a, **kw):
         attempts.append(assignment["assignment_id"])
-        runloop._signal_pool_abort("paid API balance exhausted")
+        runloop._signal_pool_abort(
+            "paid API balance exhausted", interrupt_siblings=False,
+        )
         return "insufficient-balance"
 
     monkeypatch.setattr(runloop, "_run_and_submit", run)
@@ -168,15 +170,17 @@ def test_checkout_loop_always_fuses_after_insufficient_balance(
     assert rc == 1
     assert attempts == ["out-of-money"]
     assert len(client._checkouts) == 1
-    assert abort_file.read_text() == "paid API balance exhausted"
-    assert "stopping this batch before the next task" in capsys.readouterr().out
+    assert abort_file.read_text() == "drain:paid API balance exhausted"
+    out = capsys.readouterr().out
+    assert "stopping this worker before the next task" in out
+    assert "siblings with model runs already in flight are allowed to finish" in out
 
 
 def test_checkout_worker_obeys_existing_pool_balance_fuse(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
     abort_file = tmp_path / "pool-abort"
-    abort_file.write_text("paid API balance exhausted")
+    abort_file.write_text("drain:paid API balance exhausted")
     monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
     client = CheckoutClient(
         {"active": [_cell("must-not-run")], "free_pick": True},
