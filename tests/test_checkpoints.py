@@ -221,7 +221,7 @@ def test_checkpoint_recovery_limit_opens_circuit_without_resuming(
     assert outcome == "recovery-exhausted"
     assert client.resumes == []
     assert checkpoints.is_terminal(tmp_path, item)
-    assert abort_file.read_text() == "checkpoint recovery safety limit reached"
+    assert abort_file.read_text() == "drain:checkpoint recovery safety limit reached"
     assert "5-resume safety limit" in capsys.readouterr().out
 
 

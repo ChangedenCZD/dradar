@@ -61,6 +61,7 @@ _ACCOUNT_TERMINAL_OUTCOMES = {
     "recovery-exhausted", "runtime-incompatible",
 }
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
+_POOL_DRAIN_PREFIX = "drain:"
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
 _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
@@ -110,27 +111,44 @@ def _pool_abort_path() -> Path | None:
     return Path(raw) if raw else None
 
 
-def _signal_pool_abort(reason: str) -> None:
-    """Tell sibling workers in this one supervised pool to stop checking out."""
+def _signal_pool_abort(reason: str, *, interrupt_siblings: bool = True) -> None:
+    """Stop this supervised pool, optionally without interrupting paid work.
+
+    The historical marker contained only a reason and meant "interrupt every
+    child now".  Keep that interpretation for explicit/legacy stop files, but
+    let account-wide terminal conditions request a graceful drain: no worker
+    may check out another task and the supervisor may not backfill a vacant
+    slot, while siblings that already own a model run are left alone to finish.
+    """
     path = _pool_abort_path()
     if path is None:
         return
     try:
-        path.write_text(reason)
+        payload = reason if interrupt_siblings else f"{_POOL_DRAIN_PREFIX}{reason}"
+        path.write_text(payload)
     except OSError:
         # The worker that observed the terminal condition still stops locally.
         # Never turn a best-effort sibling signal into another task failure.
         pass
 
 
-def _pool_abort_reason() -> str | None:
-    path = _pool_abort_path()
+def _pool_stop_directive(path: Path | None = None) -> tuple[bool, str] | None:
+    """Return ``(interrupt_siblings, reason)`` for the shared stop marker."""
+    path = path or _pool_abort_path()
     if path is None or not path.is_file():
         return None
     try:
-        return path.read_text().strip() or "another worker stopped the pool"
+        value = path.read_text().strip()
     except OSError:
-        return "another worker stopped the pool"
+        return True, "another worker stopped the pool"
+    if value.startswith(_POOL_DRAIN_PREFIX):
+        return False, value.removeprefix(_POOL_DRAIN_PREFIX).strip() or "account stop"
+    return True, value or "another worker stopped the pool"
+
+
+def _pool_abort_reason() -> str | None:
+    directive = _pool_stop_directive()
+    return directive[1] if directive is not None else None
 
 
 def _announce_account_stop(outcome: str) -> None:
@@ -143,7 +161,9 @@ def _announce_account_stop(outcome: str) -> None:
     }
     reason = messages.get(outcome, "an account-wide stop condition was detected")
     print(
-        f"{reason} — stopping this batch before the next task or model run. "
+        f"{reason} — stopping this worker before the next task or model run. "
+        "The supervised pool will not check out or backfill new work, but "
+        "siblings with model runs already in flight are allowed to finish. "
         "Unstarted leases and checkpoints remain untouched; fix or wait for "
         "the condition, then explicitly start `dradar resume` again."
     )
@@ -154,7 +174,7 @@ def _terminal_failure_outcome(kind: str | None) -> str | None:
     if policy is None:
         return None
     outcome, abort_reason = policy
-    _signal_pool_abort(abort_reason)
+    _signal_pool_abort(abort_reason, interrupt_siblings=False)
     return outcome
 
 
@@ -393,16 +413,25 @@ def _exit_for(exc: ApiError) -> None:
     else (e.g. 403 account suspended) carries the server's own explanation
     verbatim."""
     if exc.status_code == 401:
-        _signal_pool_abort("DRadar account authentication failed")
+        _signal_pool_abort(
+            "DRadar account authentication failed", interrupt_siblings=False,
+        )
         sys.exit(f"{exc}\nyour token was rejected — `dradar login --github` recovers a "
                  "linked identity, otherwise grab a fresh token on the radar page")
     if exc.status_code in (402, 403):
-        _signal_pool_abort(f"DRadar account stopped with HTTP {exc.status_code}")
+        _signal_pool_abort(
+            f"DRadar account stopped with HTTP {exc.status_code}",
+            interrupt_siblings=False,
+        )
         sys.exit(str(exc))
     if exc.status_code == 429:
-        _signal_pool_abort("DRadar service rate limit persisted after bounded retries")
+        _signal_pool_abort(
+            "DRadar service rate limit persisted after bounded retries",
+            interrupt_siblings=False,
+        )
         sys.exit(f"{exc}\nthe server rate limit persisted after bounded retries; "
-                 "the supervised pool has stopped instead of retrying in a loop")
+                 "the supervised pool will stop new checkout/backfill while "
+                 "already-running siblings finish")
     if exc.status_code is None:
         sys.exit(f"{exc}\ncheck your connection — held leases stay active, and "
                  "`dradar resume` continues where you left off")
@@ -1177,7 +1206,10 @@ def _resume_one_checkpoint(
             )
             if generation >= MAX_CHECKPOINT_RESUMES:
                 checkpoints.mark_terminal(HOME, item)
-                _signal_pool_abort("checkpoint recovery safety limit reached")
+                _signal_pool_abort(
+                    "checkpoint recovery safety limit reached",
+                    interrupt_siblings=False,
+                )
                 print(
                     f"  {assignment_id}: checkpoint reached the "
                     f"{MAX_CHECKPOINT_RESUMES}-resume safety limit; automatic "
@@ -1859,6 +1891,7 @@ def _run_worker_pool(args) -> int:
     backfill_error: str | None = None
     backfill_disabled = False
     abort_reason: str | None = None
+    abort_interrupts_siblings = False
 
     def cleanup_abort_file() -> None:
         if owns_abort_file:
@@ -1891,14 +1924,25 @@ def _run_worker_pool(args) -> int:
                 break
             if pool_abort_file.is_file():
                 if abort_reason is None:
-                    try:
-                        abort_reason = pool_abort_file.read_text().strip() or "account stop"
-                    except OSError:
-                        abort_reason = "account stop"
-                    print(f"worker pool circuit opened: {abort_reason}; stopping sibling workers")
-                    _signal_workers(list(active_processes.values()))
-                time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
-                continue
+                    directive = _pool_stop_directive(pool_abort_file)
+                    abort_interrupts_siblings, abort_reason = (
+                        directive or (True, "account stop")
+                    )
+                    backfill_disabled = True
+                    if abort_interrupts_siblings:
+                        print(
+                            f"worker pool circuit opened: {abort_reason}; "
+                            "stopping sibling workers"
+                        )
+                        _signal_workers(list(active_processes.values()))
+                    else:
+                        print(
+                            f"worker pool drain opened: {abort_reason}; no new "
+                            "checkout or backfill will start, active workers will finish"
+                        )
+                if abort_interrupts_siblings:
+                    time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
+                    continue
 
             current_time = time.monotonic()
             if (not backfill_disabled
@@ -1954,7 +1998,10 @@ def _run_worker_pool(args) -> int:
     failed = [(slot, rc) for slot, rc in returncodes if rc != 0]
     _maintain_image_cache(client, cfg, phase="after worker pool")
     if abort_reason is not None:
-        print(f"worker pool stopped cleanly by circuit breaker: {abort_reason}")
+        if abort_interrupts_siblings:
+            print(f"worker pool stopped cleanly by circuit breaker: {abort_reason}")
+        else:
+            print(f"worker pool drained cleanly after account stop: {abort_reason}")
         return 0
     if backfill_error:
         print("worker pool finished after a backfill spawn error; completed uploads "

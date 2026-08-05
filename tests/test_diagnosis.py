@@ -165,7 +165,7 @@ def test_interrupted_quota_limit_opens_pool_circuit(
         client, ASSIGNMENT, tmp_path, _args(), "abc123")
 
     assert outcome == "quota-exhausted"
-    assert abort_file.read_text() == "account quota exhausted"
+    assert abort_file.read_text() == "drain:account quota exhausted"
     assert "quota window is exhausted" in capsys.readouterr().out
 
 
