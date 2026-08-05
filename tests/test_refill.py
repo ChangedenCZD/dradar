@@ -373,6 +373,42 @@ def test_checkout_loop_refills_until_hard_cap_then_drains(
     assert refill.load(tmp_path) is None
 
 
+def test_long_running_worker_periodically_maintains_image_cache(
+    tmp_path: Path, monkeypatch,
+):
+    from test_go_menu import _args
+
+    first = _assignment("a1")
+    first.update(agent="codex", expires_at="2099-01-01T00:00:00Z",
+                 deep_swe_commit=None)
+    client = LoopClient([first])
+    _configure(tmp_path, [first], refill_to=1, max_tasks=1)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(runloop, "_load_config", lambda: {"image_cache_mode": "balanced"})
+    monkeypatch.setattr(runloop, "_disk_allows_refill", lambda _cfg: True)
+    monkeypatch.setattr(
+        runloop.image_cache, "claim_periodic_maintenance", lambda *_a, **_k: True,
+    )
+    maintenance = []
+    monkeypatch.setattr(
+        runloop, "_maintain_image_cache",
+        lambda _client, cfg, *, phase: maintenance.append((cfg, phase)) or True,
+    )
+
+    def run(_client, assignment, *_a, **_kw):
+        client.submit_locally(assignment["assignment_id"])
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    args = _args()
+    args.refill = True
+    args.worker_child = True
+
+    assert runloop._run_checkout_loop(args, client, tmp_path, [first]) == 0
+    assert maintenance == [({"image_cache_mode": "balanced"}, "during worker pool")]
+
+
 def test_two_workers_keep_draining_after_total_claim_cap(
     tmp_path: Path, monkeypatch,
 ):

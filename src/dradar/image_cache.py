@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from typing import Iterator
 SCHEMA_VERSION = 1
 LEDGER_NAME = "image-cache.json"
 LOCK_NAME = "image-cache.lock"
+MAINTENANCE_STAMP_NAME = "image-cache-maintenance.stamp"
 GIB = 1024 ** 3
 DEFAULT_MIN_FREE_GIB = 25.0
 _PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$")
@@ -334,6 +336,42 @@ def _load_unlocked(home: Path) -> dict[str, dict]:
 def load(home: Path) -> dict[str, dict]:
     with _ledger_lock(home):
         return _load_unlocked(home)
+
+
+def claim_periodic_maintenance(
+    home: Path, *, interval_seconds: float, now: float | None = None,
+) -> bool:
+    """Let at most one local worker start periodic cache maintenance.
+
+    Long-running refill pools can stay alive for days, so their normal
+    before/after-pool maintenance boundary may not arrive soon enough. The
+    shared stamp is advanced before the Docker scan: concurrent workers then
+    skip the same interval instead of creating an expensive inspection herd.
+    A failed pass is retried at the next interval and never weakens the normal
+    image ownership/protection checks.
+    """
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be greater than zero")
+    current = time.time() if now is None else float(now)
+    stamp = home / MAINTENANCE_STAMP_NAME
+    with _ledger_lock(home):
+        try:
+            previous = stamp.stat().st_mtime
+        except FileNotFoundError:
+            previous = None
+        except OSError:
+            return False
+        if previous is not None and current - previous < interval_seconds:
+            return False
+        try:
+            home.mkdir(parents=True, exist_ok=True)
+            fd = os.open(stamp, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(fd)
+            os.utime(stamp, (current, current))
+            os.chmod(stamp, 0o600)
+        except OSError:
+            return False
+    return True
 
 
 def _save_unlocked(home: Path, records: dict[str, dict]) -> None:
@@ -712,6 +750,7 @@ def cmd_config_set(args) -> int:
 __all__ = [
     "CachePolicy", "CleanupPlan", "DockerImage", "DockerUnavailable",
     "MaintenanceResult", "automatic_maintenance", "discover_pier_images",
-    "effective_policy", "load", "plan_cleanup", "proxy_detected",
+    "claim_periodic_maintenance", "effective_policy", "load", "plan_cleanup",
+    "proxy_detected",
     "record_trial_images", "remove_images", "cmd_config_set", "cmd_config_show",
 ]
