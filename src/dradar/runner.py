@@ -121,6 +121,10 @@ class RunnerError(RuntimeError):
     pass
 
 
+class LiveAccountTerminalError(RunnerError):
+    """A running agent reported an account-wide terminal provider failure."""
+
+
 def resolve_latest_codex_cli_version(
     server_version: str | None = None,
     server_version_verified: bool = False,
@@ -1085,6 +1089,10 @@ def _tail(log_path: Path, n: int = 15) -> str:
 
 HEARTBEAT_SEC = 60
 TRIAL_TIMEOUT_RETURNCODE = 124
+LIVE_ACCOUNT_ERROR_CONFIRMATIONS = 3
+_LIVE_ACCOUNT_TERMINAL_KINDS = {
+    "auth", "insufficient-balance", "quota-limit",
+}
 
 
 def _last_activity(log_path: Path) -> str:
@@ -1094,6 +1102,80 @@ def _last_activity(log_path: Path) -> str:
     raw = _tail(log_path, 1)
     chunks = [c.strip() for c in raw.replace("\r", "\n").splitlines() if c.strip()]
     return (chunks[-1][:120] if chunks else "still running (no new log output)")
+
+
+def _scan_live_account_errors(
+    jobs_dir: Path,
+    job_name: str,
+    offsets: dict[Path, int],
+    counts: dict[str, int],
+) -> str | None:
+    """Inspect only structured Codex error events from the current job.
+
+    Pier normally reports the agent's exception after ``pier run`` exits.  A
+    Codex process can instead keep retrying a terminal account error forever,
+    which prevents that post-process classification from ever running.  Read
+    new JSONL records incrementally and return a confirmed account-wide kind.
+    Prompt, reasoning, tool calls and trajectory content are ignored.
+    """
+    root = jobs_dir / job_name
+    try:
+        paths = sorted(root.glob("*/agent/codex.txt"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            size = path.stat().st_size
+            offset = offsets.get(path, 0)
+            if offset > size:
+                offset = 0
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                while True:
+                    line_start = stream.tell()
+                    raw = stream.readline()
+                    if not raw:
+                        offsets[path] = stream.tell()
+                        break
+                    if not raw.endswith(b"\n"):
+                        # Do not consume a record while Codex is still writing it.
+                        offsets[path] = line_start
+                        break
+                    offsets[path] = stream.tell()
+                    try:
+                        event = json.loads(raw)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "turn.completed":
+                        counts.clear()
+                        continue
+                    if event.get("type") != "error":
+                        continue
+                    message = event.get("message")
+                    if not isinstance(message, str):
+                        continue
+                    kind = classify_exception_message(message)
+                    if kind not in _LIVE_ACCOUNT_TERMINAL_KINDS:
+                        continue
+                    counts[kind] = counts.get(kind, 0) + 1
+                    if counts[kind] >= LIVE_ACCOUNT_ERROR_CONFIRMATIONS:
+                        return kind
+        except OSError:
+            continue
+    return None
+
+
+def _live_account_error_message(kind: str) -> str:
+    messages = {
+        "auth": "live agent repeatedly reported authentication failed",
+        "insufficient-balance": (
+            "live agent repeatedly reported insufficient balance"
+        ),
+        "quota-limit": "live agent repeatedly reported quota exhausted",
+    }
+    return messages[kind] + "; aborting this trial safely"
 
 
 def _trial_timeout_sec(assignment: dict) -> int:
@@ -1150,6 +1232,11 @@ def run_trial(
     # `interrupted` -> the server marks it invalid and the cell reopens.
     timeout_sec = _trial_timeout_sec(effective_assignment)
     terminal_error: RunnerError | None = None
+    live_error_offsets: dict[Path, int] = {}
+    live_error_counts: dict[str, int] = {}
+    watch_live_account_errors = (
+        (dev_agent or effective_assignment["agent"]) == "codex"
+    )
 
     provider_auth_path = None
     try:
@@ -1209,6 +1296,15 @@ def run_trial(
                     except subprocess.TimeoutExpired:
                         pass
                     now = time.time()
+                    if watch_live_account_errors:
+                        live_failure = _scan_live_account_errors(
+                            jobs_dir, job_name,
+                            live_error_offsets, live_error_counts,
+                        )
+                        if live_failure is not None:
+                            raise LiveAccountTerminalError(
+                                _live_account_error_message(live_failure)
+                            )
                     if now - started > timeout_sec:
                         log.flush()
                         raise RunnerError(
@@ -1253,6 +1349,11 @@ def run_trial(
                     f"{provider_auth_path}: {exc}"
                 ) from exc
     duration = time.time() - started
+    if isinstance(terminal_error, LiveAccountTerminalError):
+        # Let the existing runloop checkpoint/pause path classify this
+        # normalized failure and open the supervised pool's graceful drain.
+        # Do not upload a partial patch from a terminal account failure.
+        raise terminal_error
 
     tail = _tail(log_path)
     try:

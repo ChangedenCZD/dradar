@@ -441,6 +441,76 @@ def test_run_trial_timeout_raises_naming_log(tmp_path, monkeypatch):
     assert "docker: no space left on device" in str(exc.value)
 
 
+def test_run_trial_stops_live_codex_quota_error_loop(tmp_path, monkeypatch):
+    captured = {}
+    terminated = []
+
+    def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):
+        captured["job_name"] = job_name
+        return ["pier"]
+
+    class QuotaLoopPopen:
+        def __init__(self, cmd, **kwargs):
+            agent_dir = (
+                tmp_path / "jobs" / captured["job_name"]
+                / "task__t0" / "agent"
+            )
+            agent_dir.mkdir(parents=True)
+            records = [
+                {"type": "thread.started"},
+                *(
+                    {"type": "error", "message": "usage limit reached"}
+                    for _ in range(
+                        runner_mod.LIVE_ACCOUNT_ERROR_CONFIRMATIONS
+                    )
+                ),
+            ]
+            (agent_dir / "codex.txt").write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("pier", timeout)
+            return self.returncode
+
+        def terminate(self):
+            terminated.append(True)
+            self.returncode = 1
+
+        def kill(self):
+            raise AssertionError("clean TERM should not escalate to KILL")
+
+    monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", QuotaLoopPopen)
+
+    with pytest.raises(RunnerError, match="quota exhausted") as exc:
+        run_trial(_assignment("codex"), tmp_path, tmp_path)
+
+    assert terminated == [True]
+    assert runner_mod.classify_exception_message(str(exc.value)) == "quota-limit"
+
+
+def test_live_error_watchdog_ignores_prompt_and_transient_errors(tmp_path):
+    path = tmp_path / "jobs" / "a1" / "task__t0" / "agent" / "codex.txt"
+    path.parent.mkdir(parents=True)
+    path.write_text("".join((
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "quota exhausted in user prompt",
+        }}) + "\n",
+        json.dumps({"type": "error", "message": "temporary network error"}) + "\n",
+        json.dumps({"type": "error", "message": "rate limit"}) + "\n",
+    )))
+    offsets = {}
+    counts = {}
+
+    assert runner_mod._scan_live_account_errors(
+        tmp_path / "jobs", "a1", offsets, counts,
+    ) is None
+    assert counts == {}
+
+
 def test_run_trial_timeout_salvages_patch_as_interrupted(tmp_path, monkeypatch):
     """A paid run that reached artifacts must report cost, never vanish."""
     captured = {}
