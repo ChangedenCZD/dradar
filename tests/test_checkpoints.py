@@ -274,6 +274,43 @@ def test_completed_checkpoint_resume_recovers_missing_staged_patch_without_rerun
     assert pending.load(tmp_path) == []
 
 
+def test_completed_checkpoint_resume_recovers_workspace_patch_without_rerun(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    aid = "f" * 32
+    item = _make_checkpoint(tmp_path, aid, phase="agent_completed")
+    assignment = _assignment(aid)
+    metadata = json.loads(item.manifest_path.read_text())
+    metadata["workspace_patch"] = "workspace.patch"
+    item.manifest_path.write_text(json.dumps(metadata))
+    patch_bytes = b"diff --git a/model_answer.json b/model_answer.json\n-old\n+new\n"
+    (item.checkpoint_dir / "workspace.patch").write_bytes(patch_bytes)
+    client = _RecoveryClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+
+    class CompletedClient(_RecoveryClient):
+        def __init__(self, assignment_):
+            super().__init__(assignment_)
+            self.submissions = []
+
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None):
+            self.submissions.append(patch.read_bytes())
+            return {"submission_id": "s-workspace", "grade_status": "pending"}
+
+    client = CompletedClient(assignment)
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(yes=True), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "submitted"
+    assert client.resumes == []
+    assert client.submissions == [patch_bytes]
+    assert "uploading without rerunning" in capsys.readouterr().out
+    assert pending.load(tmp_path) == []
+
+
 def test_healthy_local_run_holds_assignment_lock_before_checkpoint_resume(
     tmp_path: Path, monkeypatch,
 ):

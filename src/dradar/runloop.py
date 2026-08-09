@@ -40,6 +40,7 @@ from .providers import (
 )
 from .runner import (
     DIAG_ADVICE, BuildFlakeError, RunnerError, build_codex_trajectory_bundle,
+    _recover_completed_checkpoint_patch,
     check_task_content_hash, classify_exception_message,
     codex_trajectory_bundle_usage,
     diagnose_exception, ensure_pier, ensure_tasks_root,
@@ -1118,6 +1119,16 @@ def _active_by_id(client: ApiClient) -> dict[str, dict]:
 def _checkpoint_upload_entry(
     item: checkpoints.Checkpoint, assignment: dict, args, local_commit: str | None,
 ) -> dict:
+    recovered, checkpoint_error = _recover_completed_checkpoint_patch(
+        item.trial_dir, assignment,
+    )
+    if recovered:
+        print(
+            "  recovered model.patch from the completed, identity-matched "
+            "checkpoint; uploading without rerunning"
+        )
+    elif checkpoint_error is not None:
+        print(f"  completed checkpoint patch recovery blocked: {checkpoint_error}")
     _patch, _trajectory, result = trial_artifact_paths(item.trial_dir)
     stats = summarize_result(result)
     return {
