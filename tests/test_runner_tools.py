@@ -925,3 +925,17 @@ def test_run_trial_registry_failure_starts_nothing(tmp_path, monkeypatch):
     assert started == []
     assert marked_started == []
     assert not (tmp_path / "jobs").exists()
+
+
+def test_no_network_task_requires_enforceable_environment_switch(
+        tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = tmp_path / "abs-module-cache-flags"
+    task.mkdir()
+    (task / "task.toml").write_text(
+        '[agent]\nnetwork_mode = "no-network"\n[environment]\n'
+    )
+    with pytest.raises(RunnerError, match="allow_internet=false"):
+        build_pier_command(
+            _assignment("codex"), tmp_path, tmp_path / "jobs", "j",
+            tmp_path / "home")
