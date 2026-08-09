@@ -58,6 +58,45 @@ def test_task_pack_install_is_atomic_verified_and_idempotent(tmp_path):
     assert client.downloads == 1
 
 
+def test_task_pack_checksum_upgrade_atomically_replaces_managed_pack(tmp_path):
+    old = FakeClient(_archive({"task/old.txt": b"old"}))
+    root = tmp_path / "tasks"
+    assert ensure_benchmark_task_pack(old, "pompeii-adjacency", root) is True
+
+    new = FakeClient(_archive({"task/new.txt": b"new"}))
+    assert ensure_benchmark_task_pack(new, "pompeii-adjacency", root) is True
+
+    assert not (root / "task" / "old.txt").exists()
+    assert (root / "task" / "new.txt").read_bytes() == b"new"
+    assert new.downloads == 1
+
+
+def test_task_pack_upgrade_checksum_failure_preserves_installed_pack(tmp_path):
+    old = FakeClient(_archive({"task/old.txt": b"old"}))
+    root = tmp_path / "tasks"
+    assert ensure_benchmark_task_pack(old, "pompeii-adjacency", root) is True
+
+    bad = FakeClient(_archive({"task/new.txt": b"new"}), digest="0" * 64)
+    with pytest.raises(TaskPackError, match="checksum mismatch"):
+        ensure_benchmark_task_pack(bad, "pompeii-adjacency", root)
+
+    assert (root / "task" / "old.txt").read_bytes() == b"old"
+    assert not (root / "task" / "new.txt").exists()
+
+
+def test_task_pack_never_replaces_unmanaged_existing_directory(tmp_path):
+    root = tmp_path / "tasks"
+    root.mkdir()
+    (root / "user-file").write_text("keep")
+    client = FakeClient(_archive({"task/new.txt": b"new"}))
+
+    with pytest.raises(TaskPackError, match="already exists"):
+        ensure_benchmark_task_pack(client, "pompeii-adjacency", root)
+
+    assert (root / "user-file").read_text() == "keep"
+    assert client.downloads == 0
+
+
 def test_task_pack_checksum_mismatch_leaves_no_partial_install(tmp_path):
     payload = _archive({"task/task.toml": b"x"})
     client = FakeClient(payload, digest="0" * 64)
