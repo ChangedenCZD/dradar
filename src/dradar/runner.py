@@ -452,6 +452,24 @@ def build_pier_command(
     if not task_path.is_dir():
         raise RunnerError(f"task not found locally: {task_path}")
 
+    # Pier's enforceable egress switch lives under [environment]. Merely
+    # declaring [agent].network_mode="no-network" is descriptive and can
+    # otherwise leave the Docker container on its ordinary network.
+    task_toml_path = task_path / "task.toml"
+    try:
+        with task_toml_path.open("rb") as stream:
+            task_config = tomllib.load(stream)
+    except FileNotFoundError:
+        task_config = {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RunnerError(f"task.toml is unreadable: {exc}") from exc
+    if task_config.get("agent", {}).get("network_mode") == "no-network":
+        if task_config.get("environment", {}).get("allow_internet") is not False:
+            raise RunnerError(
+                "task requests no-network but does not set "
+                "[environment].allow_internet=false; refusing an unsafe run"
+            )
+
     agent = dev_agent or assignment["agent"]
     provider = assignment_codex_provider(assignment) if agent == "codex" else None
     if agent == "codex" and provider is None:
