@@ -65,3 +65,16 @@ def test_fresh_on_corrupt_returns_empty_and_warns(tmp_path, monkeypatch, capsys)
     cfg = local_config._load_config(fresh_on_corrupt=True)
     assert cfg == {}
     assert "starting fresh" in capsys.readouterr().out
+
+
+def test_benchmark_task_roots_are_isolated_from_legacy_deep_swe(home):
+    cfg = {
+        "tasks_root": "/legacy/deep/tasks",
+        "tasks_roots": {"pompeii-adjacency": "/visual/pompeii/tasks"},
+    }
+    assert local_config.tasks_root_from_config(cfg) == local_config.Path(
+        "/legacy/deep/tasks")
+    assert local_config.tasks_root_from_config(
+        cfg, "pompeii-adjacency") == local_config.Path("/visual/pompeii/tasks")
+    assert local_config.default_tasks_root(
+        "pompeii-adjacency") == home / "benchmarks" / "pompeii-adjacency" / "tasks"

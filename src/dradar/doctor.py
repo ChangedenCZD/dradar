@@ -17,6 +17,7 @@ from .providers import (
     deepseek_catalog_error,
     deepseek_opted_in,
 )
+from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
 
 def _check(label: str, ok: bool, hint: str = "") -> bool:
@@ -224,7 +225,10 @@ def cmd_doctor(args) -> int:
 
     # The task repo is auto-cloned on `dradar go`; do it here too so a missing
     # checkout reports OK instead of a FAIL whose hint doesn't actually fix it.
-    tasks_root = tasks_root_from_config(cfg)
+    benchmark = cfg.get("benchmark") or "deep-swe"
+    tasks_root = (tasks_root_from_config(cfg)
+                  if benchmark == "deep-swe"
+                  else tasks_root_from_config(cfg, benchmark))
     if not tasks_root.is_dir():
         if windows_bootstrap_blocked:
             _skip(
@@ -233,14 +237,20 @@ def cmd_doctor(args) -> int:
             )
         else:
             try:
-                runner.ensure_tasks_root(tasks_root)
-            except runner.RunnerError:
+                if benchmark == "deep-swe":
+                    runner.ensure_tasks_root(tasks_root)
+                elif cfg.get("server") and cfg.get("token"):
+                    ensure_benchmark_task_pack(
+                        _client(cfg), benchmark, tasks_root)
+                else:
+                    runner.ensure_tasks_root(tasks_root, benchmark)
+            except (runner.RunnerError, TaskPackError):
                 pass
     if tasks_root.is_dir() or not windows_bootstrap_blocked:
         all_ok &= _check(
             "tasks_root",
             tasks_root.is_dir(),
-            "run `dradar go` once — it auto-clones the task repo at "
+            "run `dradar go` once — it installs the selected task pack at "
             f"{tasks_root}",
         )
 

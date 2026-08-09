@@ -167,6 +167,64 @@ def test_table_fetches_public_full_board():
     assert got["cells"]["t1|m|low"]["st"] == "open"
 
 
+def test_benchmark_catalog_and_authenticated_stream_download(tmp_path):
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, request.headers.get("authorization")))
+        if request.url.path == "/api/v1/benchmarks":
+            return httpx.Response(200, json={"benchmarks": []})
+        return httpx.Response(
+            200, content=b"bundle", headers={"X-Content-SHA256": "abc"})
+
+    client = _client(handler)
+    assert client.benchmarks() == {"benchmarks": []}
+    destination = tmp_path / "tasks.tar.gz"
+    assert client.download("/api/v1/benchmark-bundles/pompeii", destination) == "abc"
+    assert destination.read_bytes() == b"bundle"
+    assert seen == [
+        ("/api/v1/benchmarks", "Bearer drt_test"),
+        ("/api/v1/benchmark-bundles/pompeii", "Bearer drt_test"),
+    ]
+
+
+def test_download_rejects_cross_origin_urls_before_sending(tmp_path):
+    client = _client(lambda _request: pytest.fail("request must not be sent"))
+    with pytest.raises(ApiError, match="unsafe download URL"):
+        client.download("https://evil.example/tasks.tar.gz", tmp_path / "x")
+
+
+def test_selected_benchmark_is_sent_on_reads_claims_and_checkout():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, str(request.url), request.read()))
+        if request.url.path.endswith("/assignment"):
+            return httpx.Response(200, json={"active": []})
+        if request.url.path.endswith("/suggest"):
+            return httpx.Response(200, json={"cells": []})
+        if request.url.path.endswith("/table"):
+            return httpx.Response(200, json={"cells": {}})
+        if request.url.path.endswith("/claim"):
+            return httpx.Response(200, json={"assignment": {}})
+        return httpx.Response(200, json={"assignment": None})
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler),
+        benchmark_id="pompeii-adjacency",
+    )
+    client.get_assignment()
+    client.suggest(2)
+    client.table()
+    client.claim_assignment("p1", "gpt-5.6-sol", "xhigh")
+    client.checkout()
+
+    assert all("benchmark=pompeii-adjacency" in url for _, url, _ in seen[:3])
+    assert b"benchmark_id=pompeii-adjacency" in seen[3][2]
+    assert b"benchmark_id=pompeii-adjacency" in seen[4][2]
+
+
 def test_checkout_sends_failed_cell_exclusions():
     seen = {}
 

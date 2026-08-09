@@ -100,3 +100,32 @@ def test_login_whoami_failure_exits(home, monkeypatch):
     with pytest.raises(SystemExit) as ei:
         identity.cmd_login(_args(server="https://api.example.com", token="drt_bad"))
     assert "login failed" in str(ei.value)
+
+
+def test_nondefault_login_uses_separate_root_and_installs_advertised_pack(
+    home, monkeypatch,
+):
+    installed = []
+
+    class FakeClient:
+        def __init__(self, server, token):
+            self.server, self.token = server, token
+        def whoami(self):
+            return {"nickname": "mosaic"}
+
+    monkeypatch.setattr(identity, "ApiClient", FakeClient)
+    monkeypatch.setattr(
+        identity, "ensure_benchmark_task_pack",
+        lambda client, benchmark, root: installed.append((benchmark, root)),
+    )
+    rc = identity.cmd_login(_args(
+        server="https://api.example.com", token="drt_ok",
+        benchmark="pompeii-adjacency",
+    ))
+    assert rc == 0
+    saved = json.loads((home / "config.json").read_text())
+    expected = home / "benchmarks" / "pompeii-adjacency" / "tasks"
+    assert saved["benchmark"] == "pompeii-adjacency"
+    assert saved["tasks_roots"]["pompeii-adjacency"] == str(expected)
+    assert "tasks_root" not in saved
+    assert installed == [("pompeii-adjacency", expected)]

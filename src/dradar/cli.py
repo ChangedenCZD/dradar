@@ -81,7 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     p_login.add_argument("--nickname", help="register a new account instead of using a token")
     p_login.add_argument(
         "--tasks-root",
-        help="path to deep-swe/tasks checkout (default: ~/.dradar/deep-swe/tasks)",
+        help="path to this benchmark's local task directory",
+    )
+    p_login.add_argument(
+        "--benchmark", default=None,
+        help="benchmark channel (default: deep-swe)",
     )
     p_login.add_argument("--github", action="store_true",
                          help="recover your identity via GitHub (device flow)")
@@ -99,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     p_cells.add_argument(
         "--model", action="append", metavar="MODEL",
         help="only this model; repeat or comma-separate for several")
+    p_cells.add_argument(
+        "--benchmark", default=None,
+        help="benchmark channel (default: saved channel)",
+    )
     p_cells.add_argument(
         "--effort", action="append", metavar="EFFORT",
         help="only this reasoning effort; repeat or comma-separate for several")
@@ -259,6 +267,10 @@ def main(argv: list[str] | None = None) -> int:
     ):
         p = sub.add_parser(name, help=help_)
         p.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+        p.add_argument(
+            "--benchmark", default=None,
+            help="benchmark channel (default: saved channel)",
+        )
         p.add_argument("--keep", action="store_true", help="keep local job dir after upload")
         p.add_argument(
             "--allow-task-drift", action="store_true",

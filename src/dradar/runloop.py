@@ -27,7 +27,9 @@ from . import (
 )
 from .api_client import ApiClient, ApiError
 from .identity import _client
-from .local_config import HOME, _load_config, tasks_root_from_config
+from .local_config import (
+    DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
+)
 from .machine import acquire_run_lock, sweep_orphan_compose
 from .providers import (
     DEEPSEEK_CATALOG_SHA256,
@@ -49,6 +51,7 @@ from .scrub import (
     scrub_json_bytes,
 )
 from .telemetry import RunnerTelemetry
+from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
 
 # Quota is the user-facing campaign limit. Keep a deliberately high internal
@@ -80,6 +83,22 @@ _TERMINAL_FAILURE_OUTCOMES = {
         "runtime-incompatible", "agent runtime is incompatible",
     ),
 }
+
+
+def _ensure_selected_tasks_root(tasks_root: Path, benchmark_id: str) -> None:
+    # Keep the legacy one-argument seam for DeepSWE tests and third-party
+    # wrappers while giving non-default task packs an explicit error path.
+    if benchmark_id == DEFAULT_BENCHMARK:
+        ensure_tasks_root(tasks_root)
+    else:
+        ensure_tasks_root(tasks_root, benchmark_id)
+
+
+def _selected_tasks_root(cfg: dict) -> Path:
+    benchmark = cfg.get("benchmark") or DEFAULT_BENCHMARK
+    if benchmark == DEFAULT_BENCHMARK:
+        return tasks_root_from_config(cfg)
+    return tasks_root_from_config(cfg, benchmark)
 
 
 def _is_trajectory_bundle_rejection(exc: ApiError) -> bool:
@@ -1286,6 +1305,14 @@ def _resume_local_checkpoints(
         active = _active_by_id(client)
     except ApiError as exc:
         _exit_for(exc)
+    if getattr(client, "benchmark_id", None):
+        # A checkpoint from another benchmark may still have a perfectly
+        # valid lease, but this channel's filtered assignment view cannot see
+        # it. Preserve it for the matching channel instead of misclassifying
+        # it as stale and deleting its only recovery state.
+        candidates = [c for c in candidates if c.assignment_id in active]
+        if not candidates:
+            return [], False
     print(f"found {len(candidates)} unfinished checkpoint(s); recovering before new work...")
     results = []
     for item in candidates:
@@ -1616,11 +1643,16 @@ def cmd_go(args) -> int:
     if (auto_workers or workers > 1) and not getattr(args, "worker_child", False):
         return _run_worker_pool(args)
     cfg = _load_config()
+    cfg["benchmark"] = (
+        getattr(args, "benchmark", None)
+        or cfg.get("benchmark")
+        or DEFAULT_BENCHMARK
+    )
     client = _client(cfg, auto_register=True)
     # Pre-default configs may not carry tasks_root at all.  They now get the
     # same hidden checkout as a fresh login, while any explicit legacy path
     # remains authoritative.
-    tasks_root = tasks_root_from_config(cfg)
+    tasks_root = _selected_tasks_root(cfg)
     try:
         target_workers = int(os.environ.get("DRADAR_POOL_SIZE", "1"))
     except ValueError:
@@ -1651,7 +1683,13 @@ def cmd_go(args) -> int:
         # can take minutes on a fresh machine. The heartbeat lets operators
         # distinguish that from an abandoned claim without inspecting the host.
         try:
-            ensure_tasks_root(tasks_root)
+            if cfg["benchmark"] != DEFAULT_BENCHMARK and not tasks_root.is_dir():
+                try:
+                    ensure_benchmark_task_pack(
+                        client, cfg["benchmark"], tasks_root)
+                except TaskPackError as exc:
+                    raise RunnerError(str(exc)) from exc
+            _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
             ensure_pier()
         except RunnerError as exc:
             sys.exit(str(exc))
@@ -1726,6 +1764,8 @@ def _worker_command(args) -> list[str]:
         command.append("--allow-task-drift")
     if args.dev_agent:
         command.extend(("--dev-agent", args.dev_agent))
+    if getattr(args, "benchmark", None):
+        command.extend(("--benchmark", args.benchmark))
     if getattr(args, "refill", False):
         command.extend(("--refill", "--max-tasks", str(args.max_tasks)))
         if args.refill_to is not None:
@@ -1826,6 +1866,11 @@ def _run_worker_pool(args) -> int:
         from .capacity import AUTO_WORKER_CAP, inspect_capacity, print_report
 
         cfg = _load_config()
+        cfg["benchmark"] = (
+            getattr(args, "benchmark", None)
+            or cfg.get("benchmark")
+            or DEFAULT_BENCHMARK
+        )
         client = _client(cfg, auto_register=True)
         requested_options = [
             value for value in (
@@ -1855,15 +1900,25 @@ def _run_worker_pool(args) -> int:
 
     if cfg is None or client is None:
         cfg = _load_config()
+        cfg["benchmark"] = (
+            getattr(args, "benchmark", None)
+            or cfg.get("benchmark")
+            or DEFAULT_BENCHMARK
+        )
         client = _client(cfg, auto_register=True)
-    tasks_root = tasks_root_from_config(cfg)
+    tasks_root = _selected_tasks_root(cfg)
     acquire_run_lock(HOME)
     sweep_orphan_compose(HOME, True)
     args.allow_new_claims = _maintain_image_cache(
         client, cfg, phase="before worker pool",
     )
     try:
-        ensure_tasks_root(tasks_root)
+        if cfg["benchmark"] != DEFAULT_BENCHMARK and not tasks_root.is_dir():
+            try:
+                ensure_benchmark_task_pack(client, cfg["benchmark"], tasks_root)
+            except TaskPackError as exc:
+                raise RunnerError(str(exc)) from exc
+        _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
         ensure_pier()
     except RunnerError as exc:
         sys.exit(str(exc))

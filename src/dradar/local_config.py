@@ -13,20 +13,30 @@ HOME = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
 CONFIG_PATH = HOME / "config.json"
 
 
-def default_tasks_root() -> Path:
+DEFAULT_BENCHMARK = "deep-swe"
+
+
+def default_tasks_root(benchmark_id: str = DEFAULT_BENCHMARK) -> Path:
     """Hidden default checkout used when the volunteer did not choose one.
 
     Derive it at call time rather than import time so DRADAR_HOME overrides
     and tests that isolate HOME continue to affect every caller consistently.
     """
-    return HOME / "deep-swe" / "tasks"
+    if benchmark_id == DEFAULT_BENCHMARK:
+        return HOME / "deep-swe" / "tasks"
+    return HOME / "benchmarks" / benchmark_id / "tasks"
 
 
-def tasks_root_from_config(cfg: dict) -> Path:
+def tasks_root_from_config(
+    cfg: dict, benchmark_id: str | None = None,
+) -> Path:
     """Preserve an explicit/legacy checkout, otherwise use the hidden one."""
-    configured = cfg.get("tasks_root")
+    selected = benchmark_id or cfg.get("benchmark") or DEFAULT_BENCHMARK
+    configured = (cfg.get("tasks_roots") or {}).get(selected)
+    if configured is None and selected == DEFAULT_BENCHMARK:
+        configured = cfg.get("tasks_root")
     return (Path(configured).expanduser() if configured
-            else default_tasks_root())
+            else default_tasks_root(selected))
 
 
 def _load_config(fresh_on_corrupt: bool = False) -> dict:

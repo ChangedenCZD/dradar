@@ -1019,7 +1019,7 @@ def ensure_pier() -> None:
                 "yourself and make sure ~/.local/bin precedes other Pier installs on PATH")
 
 
-def ensure_tasks_root(tasks_root: Path) -> None:
+def ensure_tasks_root(tasks_root: Path, benchmark_id: str = "deep-swe") -> None:
     """Auto-clone the public deep-swe task repo if the configured tasks_root
     doesn't exist yet (magic-command convention: tasks_root is <repo>/tasks), so
     a fresh volunteer doesn't have to clone it by hand. No-op if it's already
@@ -1027,6 +1027,12 @@ def ensure_tasks_root(tasks_root: Path) -> None:
     the user rather than clobber something)."""
     if tasks_root.is_dir():
         return
+    if benchmark_id != "deep-swe":
+        raise RunnerError(
+            f"task pack for benchmark {benchmark_id!r} is not installed at "
+            f"{tasks_root}; run `dradar login --benchmark {benchmark_id} "
+            "--tasks-root <downloaded-task-directory>` first"
+        )
     if tasks_root.name != "tasks":
         raise RunnerError(
             f"tasks_root {tasks_root} doesn't exist and doesn't look like a "
@@ -1068,8 +1074,8 @@ def check_task_content_hash(assignment: dict, tasks_root: Path) -> bool | None:
     match = actual == expected
     if not match:
         print(
-            "warning: your local deep-swe checkout does not match the server "
-            "copy for this task, pull the latest deep-swe repo"
+            "warning: your local benchmark task does not match the server "
+            "copy; refresh the selected benchmark task pack"
         )
     return match
 
