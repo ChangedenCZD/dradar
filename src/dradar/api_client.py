@@ -4,6 +4,7 @@ import json
 import os
 import random
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +49,10 @@ class ApiError(RuntimeError):
 class ApiClient:
     def __init__(self, server: str, token: str,
                  transport: httpx.BaseTransport | None = None,
-                 capabilities: tuple[str, ...] | list[str] | set[str] | None = None):
+                 capabilities: tuple[str, ...] | list[str] | set[str] | None = None,
+                 benchmark_id: str | None = None):
         self.server = server.rstrip("/")
+        self.benchmark_id = benchmark_id
         # write=None: large uploads over a slow tunnel must not hit a write
         # timeout; keep a bounded connect/read so a dead server fails fast.
         # No header at all when tokenless (pre-registration): an empty
@@ -90,6 +93,13 @@ class ApiClient:
 
     def _post(self, path: str, **kw) -> dict[str, Any]:
         return self._check(self._request("POST", path, **kw))
+
+    def _benchmark_path(self, path: str) -> str:
+        if not self.benchmark_id:
+            return path
+        separator = "&" if "?" in path else "?"
+        return (path + separator + "benchmark="
+                + urllib.parse.quote(self.benchmark_id, safe=""))
 
     def _request(self, method: str, path: str, **kw) -> httpx.Response:
         for attempt in range(_RATE_LIMIT_RETRIES + 1):
@@ -162,19 +172,45 @@ class ApiClient:
     def whoami(self) -> dict[str, Any]:
         return self._get("/api/v1/whoami")
 
+    def benchmarks(self) -> dict[str, Any]:
+        """Public benchmark catalog, including optional task-pack metadata."""
+        return self._get("/api/v1/benchmarks")
+
+    def download(self, path: str, destination: Path) -> str | None:
+        """Stream one authenticated immutable artifact to ``destination``.
+
+        The caller verifies the advertised digest before using the file.  A
+        same-origin relative URL is required so a compromised catalog cannot
+        redirect the bearer token to another host.
+        """
+        parsed = urllib.parse.urlparse(path)
+        if parsed.scheme or parsed.netloc or not path.startswith("/"):
+            raise ApiError("server advertised an unsafe download URL")
+        try:
+            with self._client.stream("GET", path) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    self._check(response)
+                with destination.open("xb") as output:
+                    for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                        output.write(chunk)
+                return response.headers.get("X-Content-SHA256")
+        except httpx.HTTPError as exc:
+            raise ApiError(f"cannot download from {self.server}: {exc}") from exc
+
     def get_assignment(self) -> dict[str, Any]:
         """Returns {active: [dict, ...], free_pick: bool, menu: list|None, ...}
         — `active` is the whole held batch to run, in claim order. Also carries
         legacy `assignment`/`resumed` (first active lease) for older clients."""
-        return self._get("/api/v1/assignment")
+        return self._get(self._benchmark_path("/api/v1/assignment"))
 
     def claim_assignment(self, task_id: str, model: str, effort: str) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
         the cell went stale or the volunteer is already at the concurrent cap."""
-        return self._post(
-            "/api/v1/assignment/claim",
-            data={"task_id": task_id, "model": model, "effort": effort},
-        )
+        data = {"task_id": task_id, "model": model, "effort": effort}
+        if self.benchmark_id:
+            data["benchmark_id"] = self.benchmark_id
+        return self._post("/api/v1/assignment/claim", data=data)
 
     def suggest(self, n: int) -> dict[str, Any]:
         """Weighted-random candidate cells (server-side balanced_random_cells,
@@ -183,7 +219,7 @@ class ApiClient:
         need a prior web claim. Returns {cells: [menu-entry dict, ...]};
         candidates only, not yet claimed. The server applies ordinary/super
         account-specific recommendation limits."""
-        return self._get(f"/api/v1/suggest?n={n}")
+        return self._get(self._benchmark_path(f"/api/v1/suggest?n={n}"))
 
     def table(self) -> dict[str, Any]:
         """Public full-board snapshot.
@@ -192,7 +228,7 @@ class ApiClient:
         coverage metadata for every cell.  Unlike suggest() this is not
         personalized and never claims or reserves work.
         """
-        return self._get("/api/v1/table")
+        return self._get(self._benchmark_path("/api/v1/table"))
 
     def mark_started(
         self, assignment_id: str, session_id: str | None = None,
@@ -222,10 +258,13 @@ class ApiClient:
         404 on servers that predate the endpoint (caller falls back to the
         legacy whole-batch flow)."""
         excluded = sorted(set(exclude_assignment_ids or ()))
+        data = {"exclude_assignment_ids": ",".join(excluded),
+                "session_id": session_id or ""}
+        if self.benchmark_id:
+            data["benchmark_id"] = self.benchmark_id
         return self._post(
             "/api/v1/assignment/checkout",
-            data={"exclude_assignment_ids": ",".join(excluded),
-                  "session_id": session_id or ""},
+            data=data,
         )
 
     def release_assignments(

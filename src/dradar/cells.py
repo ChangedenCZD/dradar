@@ -41,12 +41,14 @@ def _selected(values: Iterable[str] | None) -> set[str] | None:
 
 def _rows(table: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
+    benchmark_id = table.get("benchmark_id")
     for key, value in (table.get("cells") or {}).items():
         try:
             task_id, model, effort = key.split("|", 2)
         except ValueError:
             continue
-        row = {"task_id": task_id, "model": model, "effort": effort}
+        row = {"task_id": task_id, "model": model, "effort": effort,
+               "benchmark_id": benchmark_id}
         if isinstance(value, dict):
             row.update(value)
         rows.append(row)
@@ -195,7 +197,10 @@ def _print_pick_rows(rows: list[dict[str, Any]]) -> None:
     """Emit command-only output with complete, shell-safe cell identifiers."""
     for row in rows:
         spec = f"{row['task_id']}:{row['model']}:{row['effort']}"
-        print(f"dradar go --pick {shlex.quote(spec)}")
+        benchmark = row.get("benchmark_id")
+        benchmark_arg = (
+            f" --benchmark {shlex.quote(str(benchmark))}" if benchmark else "")
+        print(f"dradar go{benchmark_arg} --pick {shlex.quote(spec)}")
 
 
 def cmd_cells(args) -> int:
@@ -203,7 +208,10 @@ def cmd_cells(args) -> int:
     cfg = _load_config()
     if not cfg.get("server"):
         sys.exit("not configured — run: dradar login --server <url>")
+    benchmark = getattr(args, "benchmark", None) or cfg.get("benchmark")
     client = ApiClient(cfg["server"], cfg.get("token", ""))
+    if benchmark:
+        client.benchmark_id = benchmark
     try:
         table = client.table()
     except ApiError as exc:

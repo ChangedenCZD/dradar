@@ -12,7 +12,11 @@ from pathlib import Path
 
 from . import pending
 from .api_client import ApiClient, ApiError
-from .local_config import HOME, _load_config, _save_config, default_tasks_root
+from .local_config import (
+    DEFAULT_BENCHMARK, HOME, _load_config, _save_config, default_tasks_root,
+    tasks_root_from_config,
+)
+from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
 
 def _auto_register(cfg: dict) -> None:
@@ -43,7 +47,10 @@ def _client(cfg: dict, auto_register: bool = False) -> ApiClient:
             _auto_register(cfg)
         else:
             sys.exit("not logged in — run: dradar login --server <url> --token <token>")
-    return ApiClient(cfg["server"], cfg["token"])
+    client = ApiClient(cfg["server"], cfg["token"])
+    if cfg.get("benchmark"):
+        client.benchmark_id = cfg["benchmark"]
+    return client
 
 
 def cmd_login(args) -> int:
@@ -52,6 +59,9 @@ def cmd_login(args) -> int:
     cfg = _load_config(fresh_on_corrupt=True)
     cfg["server"] = args.server or cfg.get("server")
     cfg["token"] = args.token or cfg.get("token")
+    benchmark = getattr(args, "benchmark", None) or cfg.get(
+        "benchmark", DEFAULT_BENCHMARK)
+    cfg["benchmark"] = benchmark
     if not cfg.get("token") and getattr(args, "nickname", None):
         # tokenless first contact: self-serve registration
         if not cfg.get("server"):
@@ -63,12 +73,21 @@ def cmd_login(args) -> int:
         cfg["token"] = ack["token"]
         print(f"registered as {ack['nickname']}")
     if args.tasks_root:
-        cfg["tasks_root"] = str(Path(args.tasks_root).expanduser().resolve())
-    elif not cfg.get("tasks_root"):
+        resolved_root = str(Path(args.tasks_root).expanduser().resolve())
+        cfg.setdefault("tasks_roots", {})[benchmark] = resolved_root
+        if benchmark == DEFAULT_BENCHMARK:
+            cfg["tasks_root"] = resolved_root
+    elif benchmark == DEFAULT_BENCHMARK and not cfg.get("tasks_root"):
         # New installs stay out of ~/deep-swe.  An existing explicit path is
         # deliberately preserved: upgrading must not clone a duplicate repo
         # or silently abandon a volunteer's current checkout.
         cfg["tasks_root"] = str(default_tasks_root())
+        cfg.setdefault("tasks_roots", {})[benchmark] = cfg["tasks_root"]
+    elif benchmark != DEFAULT_BENCHMARK and not (
+        cfg.get("tasks_roots") or {}).get(benchmark
+    ):
+        cfg.setdefault("tasks_roots", {})[benchmark] = str(
+            default_tasks_root(benchmark))
     if not cfg.get("server"):
         sys.exit("need --server")
     if getattr(args, "github", False) and not cfg.get("token"):
@@ -90,12 +109,21 @@ def cmd_login(args) -> int:
               "on your first `dradar go`)")
         return 0
     client = ApiClient(cfg["server"], cfg["token"])
+    client.benchmark_id = benchmark
     try:
         me = client.whoami()
     except (ApiError, Exception) as exc:  # noqa: BLE001 - surface anything to the user
         sys.exit(f"login failed: {exc}")
+    if benchmark != DEFAULT_BENCHMARK:
+        tasks_root = tasks_root_from_config(cfg, benchmark)
+        if not tasks_root.is_dir():
+            try:
+                ensure_benchmark_task_pack(client, benchmark, tasks_root)
+            except TaskPackError as exc:
+                sys.exit(f"login succeeded, but task-pack setup failed: {exc}")
     _save_config(cfg)
-    print(f"logged in as {me['nickname']} @ {cfg['server']}")
+    print(f"logged in as {me['nickname']} @ {cfg['server']} "
+          f"(benchmark: {benchmark})")
     return 0
 
 
