@@ -1694,7 +1694,7 @@ def cmd_go(args) -> int:
         # can take minutes on a fresh machine. The heartbeat lets operators
         # distinguish that from an abandoned claim without inspecting the host.
         try:
-            if cfg["benchmark"] != DEFAULT_BENCHMARK and not tasks_root.is_dir():
+            if cfg["benchmark"] != DEFAULT_BENCHMARK:
                 try:
                     ensure_benchmark_task_pack(
                         client, cfg["benchmark"], tasks_root)
@@ -1924,7 +1924,7 @@ def _run_worker_pool(args) -> int:
         client, cfg, phase="before worker pool",
     )
     try:
-        if cfg["benchmark"] != DEFAULT_BENCHMARK and not tasks_root.is_dir():
+        if cfg["benchmark"] != DEFAULT_BENCHMARK:
             try:
                 ensure_benchmark_task_pack(client, cfg["benchmark"], tasks_root)
             except TaskPackError as exc:
