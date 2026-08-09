@@ -620,6 +620,84 @@ def trial_artifact_paths(trial_dir: Path) -> tuple[Path, Path | None, Path | Non
     return patch, (trajectory if trajectory.is_file() else None), (result if result.is_file() else None)
 
 
+def _plain_file(path: Path) -> bool:
+    """True only for a regular file at the named path, never a symlink."""
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _recover_completed_checkpoint_patch(
+    trial_dir: Path,
+    assignment: dict,
+) -> tuple[bool, str | None]:
+    """Recover Pier's downloaded patch from a completed Codex checkpoint.
+
+    Older visual-task bundles omitted ``pre_artifacts.sh``. The Codex agent
+    still committed a valid answer and the checkpoint provider preserved its
+    workspace patch, but Pier had no ``artifacts/model.patch`` to download.
+    Recover only from an identity-matched, completed checkpoint and never
+    follow symlinks or accept arbitrary bytes as a submission patch.
+    """
+    checkpoint_dir = trial_dir / "agent" / "checkpoint"
+    metadata_path = checkpoint_dir / "checkpoint.json"
+    if not _plain_file(metadata_path):
+        return False, None
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False, "completed checkpoint metadata is unreadable"
+    if not isinstance(metadata, dict) or metadata.get("phase") != "agent_completed":
+        return False, None
+
+    expected = {
+        "assignment_id": assignment.get("assignment_id"),
+        "task_id": assignment.get("task_id"),
+        "model": assignment.get("model"),
+        "effort": assignment.get("effort"),
+    }
+    mismatched = [
+        key for key, value in expected.items()
+        if not isinstance(value, str) or metadata.get(key) != value
+    ]
+    if mismatched:
+        return False, (
+            "completed checkpoint identity mismatch: " + ", ".join(mismatched)
+        )
+
+    workspace_name = metadata.get("workspace_patch")
+    if workspace_name != "workspace.patch":
+        return False, "completed checkpoint has an unsafe workspace_patch path"
+    workspace_patch = checkpoint_dir / workspace_name
+    if not _plain_file(workspace_patch):
+        return False, "completed checkpoint is missing its workspace patch"
+    try:
+        data = workspace_patch.read_bytes()
+    except OSError:
+        return False, "completed checkpoint workspace patch is unreadable"
+    if b"\x00" in data or (data and not data.startswith(b"diff --git ")):
+        return False, "completed checkpoint workspace patch is not a Git diff"
+
+    artifact_dir = trial_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = artifact_dir / "model.patch"
+    fd, temp_name = tempfile.mkstemp(prefix=".model.patch.", dir=artifact_dir)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, patch_path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return True, None
+
+
 CODEX_TRAJECTORY_BUNDLE_SCHEMA = "dradar-codex-trajectory-bundle-v1"
 
 
@@ -1377,6 +1455,21 @@ def run_trial(
     if not patch.is_file():
         if terminal_error is not None:
             raise terminal_error
+        recovered, checkpoint_error = _recover_completed_checkpoint_patch(
+            trial_dir, effective_assignment,
+        )
+        if recovered:
+            print(
+                "  recovered model.patch from the completed, identity-matched "
+                "checkpoint (the task artifact hook did not run)"
+            )
+        elif checkpoint_error is not None:
+            raise RunnerError(
+                "agent completed, but model.patch collection failed and the "
+                f"checkpoint could not be recovered: {checkpoint_error}; "
+                f"see {log_path} and {trial_dir}"
+            )
+    if not patch.is_file():
         # No patch at all means the agent never produced anything — usually
         # the environment died under it. Say which, instead of blaming the
         # agent for a mirror hiccup.

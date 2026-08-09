@@ -561,6 +561,119 @@ def test_run_trial_missing_patch_raises(tmp_path, monkeypatch):
         run_trial(_assignment("codex"), tmp_path, tmp_path)
 
 
+def _fake_completed_checkpoint_pier(
+        monkeypatch, work_dir, assignment, *, patch_bytes=None,
+        metadata_overrides=None):
+    captured = {}
+
+    def fake_build(_assignment, tasks_root, jobs_dir, job_name, home,
+                   dev_agent=None):
+        captured["job_name"] = job_name
+        return ["pier"]
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            checkpoint = (
+                work_dir / "jobs" / captured["job_name"] / "task__t0"
+                / "agent" / "checkpoint"
+            )
+            checkpoint.mkdir(parents=True)
+            (checkpoint.parent.parent / "artifacts").mkdir()
+            metadata = {
+                "phase": "agent_completed",
+                "assignment_id": assignment["assignment_id"],
+                "task_id": assignment["task_id"],
+                "model": assignment["model"],
+                "effort": assignment["effort"],
+                "workspace_patch": "workspace.patch",
+            }
+            metadata.update(metadata_overrides or {})
+            (checkpoint / "checkpoint.json").write_text(json.dumps(metadata))
+            if patch_bytes is not None:
+                (checkpoint / "workspace.patch").write_bytes(patch_bytes)
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
+
+
+def test_run_trial_recovers_patch_from_matching_completed_checkpoint(
+        tmp_path, monkeypatch, capsys):
+    assignment = _assignment("codex")
+    patch = b"diff --git a/model_answer.json b/model_answer.json\n"
+    _fake_completed_checkpoint_pier(
+        monkeypatch, tmp_path, assignment, patch_bytes=patch,
+    )
+
+    artifacts = run_trial(assignment, tmp_path, tmp_path)
+
+    assert artifacts.patch.read_bytes() == patch
+    assert "recovered model.patch" in capsys.readouterr().out
+
+
+def test_run_trial_does_not_recover_mismatched_completed_checkpoint(
+        tmp_path, monkeypatch):
+    assignment = _assignment("codex")
+    _fake_completed_checkpoint_pier(
+        monkeypatch, tmp_path, assignment,
+        patch_bytes=b"diff --git a/x b/x\n",
+        metadata_overrides={"assignment_id": "another-lease"},
+    )
+
+    with pytest.raises(RunnerError, match="identity mismatch: assignment_id"):
+        run_trial(assignment, tmp_path, tmp_path)
+
+
+def test_run_trial_reports_completed_checkpoint_collection_failure(
+        tmp_path, monkeypatch):
+    assignment = _assignment("codex")
+    _fake_completed_checkpoint_pier(
+        monkeypatch, tmp_path, assignment, patch_bytes=None,
+    )
+
+    with pytest.raises(RunnerError) as exc:
+        run_trial(assignment, tmp_path, tmp_path)
+    message = str(exc.value)
+    assert "agent completed" in message
+    assert "missing its workspace patch" in message
+    assert "agent likely failed" not in message
+
+
+def test_completed_checkpoint_recovery_rejects_workspace_patch_symlink(
+        tmp_path, monkeypatch):
+    assignment = _assignment("codex")
+    _fake_completed_checkpoint_pier(
+        monkeypatch, tmp_path, assignment, patch_bytes=None,
+    )
+    checkpoint = tmp_path / "jobs" / "aa1" / "task__t0" / "agent" / "checkpoint"
+    # Create the symlink during Popen construction by wrapping the fake.
+    original = runner_mod.subprocess.Popen
+
+    class SymlinkPopen:
+        def __init__(self, cmd, **kwargs):
+            self.inner = original(cmd, **kwargs)
+            target = tmp_path / "outside.patch"
+            target.write_bytes(b"diff --git a/x b/x\n")
+            (checkpoint / "workspace.patch").symlink_to(target)
+            self.returncode = self.inner.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", SymlinkPopen)
+    with pytest.raises(RunnerError, match="missing its workspace patch"):
+        run_trial(assignment, tmp_path, tmp_path)
+
+
 def test_run_trial_classifies_build_failure_from_nested_result(tmp_path, monkeypatch):
     # Pier's console tail can contain only a generic teardown; the actual
     # Docker failure from the production case is preserved in result.json.

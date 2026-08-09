@@ -40,6 +40,26 @@ def _installed(tasks_root: Path, benchmark_id: str, digest: str) -> bool:
             and payload.get("sha256") == digest)
 
 
+def _managed_pack(tasks_root: Path, benchmark_id: str) -> bool:
+    """Whether an existing directory is a checksum-pinned DRadar task pack."""
+    if tasks_root.is_symlink():
+        return False
+    marker = tasks_root / MARKER
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    digest = payload.get("sha256")
+    return (
+        payload.get("benchmark_id") == benchmark_id
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(char in "0123456789abcdef" for char in digest)
+    )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -103,9 +123,15 @@ def ensure_benchmark_task_pack(
         raise TaskPackError("server advertised an invalid task-bundle SHA-256")
     if _installed(tasks_root, benchmark_id, digest):
         return False
+    replace_managed_pack = False
     if tasks_root.exists():
         if tasks_root.is_dir() and not any(tasks_root.iterdir()):
             tasks_root.rmdir()
+        elif _managed_pack(tasks_root, benchmark_id):
+            # A checksum change is a normal signed bundle upgrade. Only a
+            # directory carrying our valid marker may be replaced; arbitrary
+            # user directories remain strictly protected.
+            replace_managed_pack = True
         else:
             raise TaskPackError(
                 f"task directory already exists but does not match the advertised bundle: "
@@ -130,7 +156,20 @@ def ensure_benchmark_task_pack(
             "benchmark_id": benchmark_id,
             "sha256": digest,
         }, indent=2) + "\n")
-        os.replace(staged, tasks_root)
+        if replace_managed_pack:
+            backup = Path(tempfile.mkdtemp(
+                prefix=f".{tasks_root.name}-previous-", dir=parent,
+            ))
+            backup.rmdir()
+            os.replace(tasks_root, backup)
+            try:
+                os.replace(staged, tasks_root)
+            except BaseException:
+                os.replace(backup, tasks_root)
+                raise
+            shutil.rmtree(backup)
+        else:
+            os.replace(staged, tasks_root)
     except (ApiError, OSError, tarfile.TarError, KeyError) as exc:
         raise TaskPackError(f"could not install benchmark task pack: {exc}") from exc
     finally:
