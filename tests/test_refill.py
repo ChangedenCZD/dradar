@@ -92,9 +92,54 @@ def _configure(home: Path, active, **overrides):
 def test_plan_persists_only_bounded_public_metadata(tmp_path: Path):
     _configure(tmp_path, [_assignment("a1")])
     raw = (tmp_path / "refill-plan.json").read_text().lower()
+    plan = refill.load(tmp_path)
     assert "a1" in raw and "max_tasks" in raw
+    assert plan["seed_assignment_ids"] == ["a1"]
+    assert plan["submitted_seed_assignment_ids"] == []
     for secret in ("token", "nonce", "password", "auth.json"):
         assert secret not in raw
+
+
+def test_selected_batch_must_all_submit_before_refill(tmp_path: Path):
+    initial = [_assignment("a1"), _assignment("a2"), _assignment("a3")]
+    client = RefillClient(initial)
+    _configure(tmp_path, initial, refill_to=3, max_tasks=6)
+
+    initial_check = refill.refill_once(tmp_path, client)
+    assert initial_check["claimed"] == 0
+    assert initial_check["seed_pending"] == 3
+
+    for expected_remaining in (2, 1):
+        submitted = client.active.pop(0)
+        assert refill.mark_submitted(
+            tmp_path, submitted["assignment_id"],
+        ) == expected_remaining
+        result = refill.refill_once(tmp_path, client)
+        assert result["claimed"] == 0
+        assert result["seed_pending"] == expected_remaining
+        assert client.claimed == []
+
+    submitted = client.active.pop(0)
+    assert refill.mark_submitted(tmp_path, submitted["assignment_id"]) == 0
+    result = refill.refill_once(tmp_path, client)
+    assert result["claimed"] == 3
+    assert client.claimed == ["new-0", "new-1", "new-2"]
+
+
+def test_idle_worker_cannot_delete_plan_during_final_submission_window(
+    tmp_path: Path,
+):
+    selected = _assignment("a1")
+    client = RefillClient([selected])
+    _configure(tmp_path, [selected], refill_to=1, max_tasks=2)
+
+    client.active.clear()  # server accepted the upload; local marker is next
+    refill.complete_if_empty(tmp_path, held=0)
+    assert refill.load(tmp_path) is not None
+
+    assert refill.mark_submitted(tmp_path, selected["assignment_id"]) == 0
+    result = refill.refill_once(tmp_path, client)
+    assert result["claimed"] == 1
 
 
 def test_paid_api_assignment_cannot_enter_continuous_refill(tmp_path: Path):
@@ -130,12 +175,19 @@ def test_paid_api_assignment_is_not_offered_interactive_refill(
 def test_refill_reserves_a_hard_total_and_naturally_drains(tmp_path: Path):
     client = RefillClient([_assignment("a1"), _assignment("a2")])
     _configure(tmp_path, client.active, refill_to=2, max_tasks=3)
-    client.active.pop(0)  # a1 submitted; held queue fell from 2 to 1
+    first = client.active.pop(0)
+    refill.mark_submitted(tmp_path, first["assignment_id"])
+    result = refill.refill_once(tmp_path, client)
+    assert result["claimed"] == 0
+    assert result["seed_pending"] == 1
+
+    second = client.active.pop(0)
+    refill.mark_submitted(tmp_path, second["assignment_id"])
     result = refill.refill_once(tmp_path, client)
     assert result["claimed"] == 1
     assert len(refill.load(tmp_path)["assignments"]) == 3
 
-    client.active.pop(0)  # a2 submitted; task cap is already fully reserved
+    client.active.pop(0)  # auto task submitted; task cap is fully reserved
     result = refill.refill_once(tmp_path, client)
     assert result["claimed"] == 0
     assert result["status"] == "draining"
@@ -147,6 +199,8 @@ def test_estimated_quota_cap_prevents_an_expensive_refill(tmp_path: Path):
         tmp_path, client.active, refill_to=2, max_tasks=5,
         max_estimated_quota_pct=2.5,
     )
+    submitted = client.active.pop(0)
+    refill.mark_submitted(tmp_path, submitted["assignment_id"])
     result = refill.refill_once(tmp_path, client)
     assert result["claimed"] == 0
     assert result["status"] == "draining"
@@ -227,7 +281,8 @@ def test_setup_clamps_target_to_server_claim_limit(tmp_path: Path, monkeypatch, 
         quota_tier="plus", max_estimated_quota_pct=None,
     )
     active = runloop._setup_refill(args, client, client.active, True)
-    assert len(active) == 3
+    assert len(active) == 1
+    assert client.claimed == []
     plan = refill.load(tmp_path)
     assert plan["refill_to"] == 3
     assert "using 3" in capsys.readouterr().out
@@ -251,7 +306,8 @@ def test_normal_setup_replaces_stale_plan_before_refilling(
     refreshed = runloop._setup_refill(args, client, active, True)
 
     plan = refill.load(tmp_path)
-    assert len(refreshed) == 2
+    assert len(refreshed) == 1
+    assert client.claimed == []
     assert plan["plan_id"] != old["plan_id"]
     assert plan["replaced_plan_id"] == old["plan_id"]
     assert plan["max_estimated_quota_pct"] == 4
@@ -428,12 +484,16 @@ def test_two_workers_keep_draining_after_total_claim_cap(
     running = 0
     peak_running = 0
     completed = []
+    auto_started_before_seed_complete = []
     state_lock = threading.Lock()
     both_started = threading.Barrier(2)
 
     def run(_client, assignment, *_a, **_kw):
         nonlocal running, peak_running
         with state_lock:
+            if (assignment["assignment_id"].startswith("a-new-")
+                    and not {"a1", "a2", "a3"}.issubset(completed)):
+                auto_started_before_seed_complete.append(assignment["assignment_id"])
             running += 1
             peak_running = max(peak_running, running)
         # Synchronize only the first pair. Later tasks should be consumed by
@@ -461,5 +521,6 @@ def test_two_workers_keep_draining_after_total_claim_cap(
     assert len(completed) == 5
     assert len(set(completed)) == 5
     assert len(client.claimed) == 2
+    assert auto_started_before_seed_complete == []
     assert client.active == []
     assert refill.load(tmp_path) is None
