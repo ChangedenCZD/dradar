@@ -147,6 +147,21 @@ def _reserved_quota(plan: dict) -> float:
     )
 
 
+def _pending_seed_assignment_ids(plan: dict) -> list[str]:
+    """Initial user-selected work still awaiting a confirmed submission.
+
+    Plans created by older clients have no seed metadata. Preserve their
+    rolling-refill behavior instead of guessing which already-reserved tasks
+    were originally selected and which were auto-claimed later.
+    """
+    seed_ids = plan.get("seed_assignment_ids")
+    if seed_ids is None:
+        return []
+    submitted = set(plan.get("submitted_seed_assignment_ids", []))
+    return [assignment_id for assignment_id in seed_ids
+            if assignment_id not in submitted]
+
+
 def configure(
     home: Path,
     *,
@@ -183,6 +198,11 @@ def configure(
         if current and current.get("status") in RUNNING_STATES:
             plan = current
         else:
+            seed_assignment_ids = list(dict.fromkeys(
+                assignment.get("assignment_id")
+                for assignment in active
+                if assignment.get("assignment_id")
+            ))
             plan = {
                 "schema_version": SCHEMA_VERSION,
                 "plan_id": uuid4().hex,
@@ -192,6 +212,12 @@ def configure(
                 "stop_reason": None,
                 "assignments": {},
                 "tier_windows_usd": None,
+                # The initial held batch is a user choice. Do not let rolling
+                # refill work begin until every one of these assignments has
+                # been confirmed submitted, even when several workers finish
+                # at different times.
+                "seed_assignment_ids": seed_assignment_ids,
+                "submitted_seed_assignment_ids": [],
                 **desired,
             }
             if replaced_plan_id:
@@ -211,6 +237,27 @@ def configure(
             raise RefillError(plan["stop_reason"])
         _save_unlocked(home, plan)
         return plan
+
+
+def mark_submitted(home: Path, assignment_id: str) -> int:
+    """Persist a successful seed submission and return the remaining count.
+
+    The submission itself is authoritative on the server. This local marker
+    only opens the auto-refill barrier, and is written under the same lock as
+    refill decisions so parallel workers cannot claim early.
+    """
+    with _locked(home):
+        plan = _load_unlocked(home)
+        if not plan or plan.get("status") not in RUNNING_STATES:
+            return 0
+        seed_ids = plan.get("seed_assignment_ids")
+        if seed_ids is None or assignment_id not in seed_ids:
+            return len(_pending_seed_assignment_ids(plan))
+        submitted = plan.setdefault("submitted_seed_assignment_ids", [])
+        if assignment_id not in submitted:
+            submitted.append(assignment_id)
+            _save_unlocked(home, plan)
+        return len(_pending_seed_assignment_ids(plan))
 
 
 def stop(home: Path, reason: str = "user stopped") -> dict | None:
@@ -237,7 +284,12 @@ def complete_if_empty(home: Path, held: int) -> None:
         return
     with _locked(home):
         plan = _load_unlocked(home)
-        if plan and plan.get("status") in RUNNING_STATES:
+        # An active worker may have completed the last held task server-side
+        # and still be between that response and mark_submitted/refill_once.
+        # Deleting an active plan here lets an idle sibling win that race and
+        # prevents the first post-seed refill. Only a plan already known to be
+        # draining has no future claim work and can be removed safely.
+        if plan and plan.get("status") == "draining":
             _path(home).unlink(missing_ok=True)
 
 
@@ -286,6 +338,15 @@ def refill_once(home: Path, client) -> dict:
             return {"status": "stopped", "claimed": 0,
                     "held": len(active), "planned": planned,
                     "reason": plan["stop_reason"]}
+        seed_pending = _pending_seed_assignment_ids(plan)
+        if seed_pending:
+            # A user-selected batch is a priority barrier, not merely older
+            # FIFO work. Waiting here prevents a fast worker from starting an
+            # auto-claimed task while a slower selected task is still running.
+            _save_unlocked(home, plan)
+            return {"status": plan["status"], "claimed": 0,
+                    "held": len(active), "planned": planned,
+                    "seed_pending": len(seed_pending)}
         slots_left = max(0, int(plan["max_tasks"]) - planned)
         missing = max(0, int(plan["refill_to"]) - len(active))
         wanted = min(missing, slots_left)

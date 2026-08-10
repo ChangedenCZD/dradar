@@ -1333,6 +1333,8 @@ def _resume_local_checkpoints(
         if outcome == "busy":
             continue
         results.append(outcome)
+        if outcome == "submitted" and getattr(args, "refill", False):
+            refill_plan.mark_submitted(HOME, item.assignment_id)
         # Super-account batch workers use --parallel. Each process owns one
         # checkpoint for its whole lifetime, so one corrupt worker cannot
         # serialize or block the other 23.
@@ -1429,6 +1431,11 @@ def cmd_refill_status(args) -> int:
     print(f"  queue target: {plan.get('refill_to', '?')}")
     print(f"  task budget: {len(plan.get('assignments', {}))}/{plan.get('max_tasks', '?')}")
     print(f"  estimated quota cap: {quota_text}")
+    seed_ids = plan.get("seed_assignment_ids")
+    if seed_ids is not None:
+        submitted = set(plan.get("submitted_seed_assignment_ids", []))
+        complete = sum(assignment_id in submitted for assignment_id in seed_ids)
+        print(f"  selected batch: {complete}/{len(seed_ids)} submitted before auto-refill")
     if plan.get("stop_reason"):
         print(f"  note: {plan['stop_reason']}")
     return 0
@@ -2309,6 +2316,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                       "will be claimed, and existing leases/checkpoints stay untouched")
                 results.append(outcome)
                 break
+            refill_plan.mark_submitted(HOME, assignment["assignment_id"])
             replenished = None
             runtime_cfg = _load_config()
             maintenance_allows_refill = True
@@ -2341,6 +2349,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 target = (refill_plan.load(HOME) or {}).get("refill_to", "?")
                 if claimed:
                     print(f"submitted 1 task; held {held}/{target}; auto-claimed {claimed}")
+                elif replenished.get("seed_pending"):
+                    print(f"submitted 1 selected task; waiting for "
+                          f"{replenished['seed_pending']} selected task(s) before auto-refill")
                 elif replenished.get("status") == "draining":
                     print("refill limit reached; no more tasks will be claimed, "
                           "draining the existing queue")
@@ -2377,7 +2388,7 @@ def _prompt_positive_int(prompt: str, default: int) -> int:
 
 
 def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) -> list[dict]:
-    """Configure/attach one shared plan, then perform its initial bounded top-up."""
+    """Configure a plan that drains its initial selected batch before refill."""
     explicit = getattr(args, "refill", False)
     if any(item.get("billing_mode") == "api" for item in active):
         if explicit:
@@ -2388,7 +2399,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         return active
     if not explicit and not args.yes and free_pick and active:
         answer = input(
-            f"you selected {len(active)} task(s). Keep auto-refilling as they finish? [y/N] "
+            f"run your {len(active)} selected task(s) first, then keep auto-refilling? [y/N] "
         ).strip().lower()
         if answer not in ("y", "yes"):
             return active
@@ -2442,6 +2453,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
     print(f"  internal task safety cap: {args.max_tasks}")
     if args.max_estimated_quota_pct is not None:
         print(f"  estimated quota cap: {args.max_estimated_quota_pct}% {args.quota_tier}")
+    print("  order: all initially selected tasks must submit before auto-refill starts")
     print("  safety: any non-submitted task stops refill; existing work is never released")
     if not args.yes:
         answer = input("start this refill plan? [y/N] ").strip().lower()
@@ -2477,6 +2489,9 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
     if result.get("claimed"):
         print(f"initial auto-refill claimed {result['claimed']} task(s); "
               f"held {result.get('held', '?')}/{target}")
+    elif result.get("seed_pending"):
+        print(f"selected batch locked first: auto-refill starts after all "
+              f"{result['seed_pending']} selected task(s) submit")
     elif result.get("status") == "stopped":
         raise refill_plan.RefillError(result.get("reason") or "refill plan stopped")
     # Return the authoritative post-refill batch, including claims accepted by
