@@ -103,6 +103,18 @@ not wait for or invoke `/tests/pre_artifacts.sh`, and do not create or inspect
 `/logs/artifacts/model.patch` yourself.
 """
 
+POMPEII_BENCHMARK_ID = "pompeii-adjacency"
+POMPEII_AGENT_TIMEOUT_SEC = 90 * 60
+POMPEII_SUBMISSION_PROMPT = CODEX_SUBMISSION_PROMPT + """
+
+Time budget: aim to complete and commit a valid answer within 60 minutes.
+After 60 minutes, this run may stop at any time; agent execution will stop no later than 90 minutes.
+Keep the best current answer persisted in the repository. As
+the deadline approaches, do not start time-consuming new experiments; use your
+best current judgment to finish and commit. A complete, gradeable answer takes
+priority over further exploration.
+"""
+
 
 @dataclass
 class TrialArtifacts:
@@ -308,9 +320,19 @@ def _ensure_allowlist(home: Path) -> Path:
     return _materialize_shared_file(path, ALLOWLIST_TOML.encode())
 
 
-def _ensure_codex_submission_prompt(home: Path) -> Path:
-    path = home / "codex-submission-prompt.j2"
-    return _materialize_shared_file(path, CODEX_SUBMISSION_PROMPT.encode())
+def _ensure_codex_submission_prompt(
+    home: Path, benchmark_id: str | None = None,
+) -> Path:
+    if benchmark_id == POMPEII_BENCHMARK_ID:
+        # Keep the benchmark-specific prompt at its own immutable path. Workers
+        # from two benchmark channels can share DRADAR_HOME, so overwriting the
+        # generic prompt in place would create a cross-run race.
+        path = home / "codex-submission-prompt-pompeii-v1.j2"
+        prompt = POMPEII_SUBMISSION_PROMPT
+    else:
+        path = home / "codex-submission-prompt.j2"
+        prompt = CODEX_SUBMISSION_PROMPT
+    return _materialize_shared_file(path, prompt.encode())
 
 
 def _ensure_deepseek_config(home: Path) -> Path:
@@ -415,19 +437,27 @@ def _task_agent_timeout_sec(task_path: Path) -> float | None:
 
 
 def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
-    """pier's own inner agent watchdog must never fire before DRadar's outer
-    one (_trial_timeout_sec, which scales with the server's per-cell
-    estimate) -- otherwise a long, healthy trial gets killed by pier itself
-    well before DRadar's watchdog would ever trigger (volunteer report,
-    2026-07-15: a 68-min-estimated ultra cell, outer-allowed ~272 min, killed
-    by pier's flat 90-min inner timeout because build_pier_command never told
-    pier to stretch it). Only ever stretches pier's timeout, never shrinks it
-    below the task's own declared default; +60s of slack keeps DRadar's outer
-    watchdog the one that actually fires on a truly wedged run, not a
-    same-instant race with pier's."""
+    """Resolve Pier's agent watchdog multiplier for one assignment.
+
+    Ordinary benchmarks stretch the task timeout to stay behind DRadar's outer
+    watchdog. Pompeii deliberately does the opposite: it normalizes old and new
+    managed task packs to the benchmark's strict 90-minute agent budget.
+    """
     base = _task_agent_timeout_sec(task_path)
     if not base:
+        if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
+            raise RunnerError(
+                "Pompeii tasks require a readable [agent].timeout_sec so the "
+                "90-minute execution limit can be enforced"
+            )
         return 1.0
+    if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
+        # Old managed Pompeii packs declared 7200s while refreshed packs declare
+        # 5400s. Normalize both at launch so an already-installed old pack cannot
+        # silently retain the former two-hour limit. Floor the serialized ratio
+        # so unusual task defaults can stop a fraction early, never after 90m.
+        raw = POMPEII_AGENT_TIMEOUT_SEC / base
+        return math.floor(raw * 1_000_000) / 1_000_000
     raw = (_trial_timeout_sec(assignment) + 60) / base
     if raw <= 1.0:
         return 1.0
@@ -529,8 +559,8 @@ def build_pier_command(
         "--yes",
     ]
     multiplier = _agent_timeout_multiplier(assignment, task_path)
-    if multiplier > 1.0:
-        cmd += ["--agent-timeout-multiplier", f"{multiplier:.3f}"]
+    if not math.isclose(multiplier, 1.0):
+        cmd += ["--agent-timeout-multiplier", f"{multiplier:.6f}"]
     # Task containers ship no git identity, so an agent's final `git commit`
     # dies with "Author identity unknown" unless the model thinks to configure
     # one (volunteer report, 2026-07-13). These ride pier's --ae into the
@@ -545,7 +575,9 @@ def build_pier_command(
         if not auth.is_file():
             raise RunnerError(f"codex auth not found: {auth} (run `codex login` first)")
         allowlist = _ensure_allowlist(home)
-        submission_prompt = _ensure_codex_submission_prompt(home)
+        submission_prompt = _ensure_codex_submission_prompt(
+            home, assignment.get("benchmark_id")
+        )
         cmd += [
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
@@ -580,7 +612,9 @@ def build_pier_command(
                 "`dradar provider setup deepseek` in your own interactive Terminal"
             )
         config_path = _ensure_deepseek_config(home)
-        submission_prompt = _ensure_codex_submission_prompt(home)
+        submission_prompt = _ensure_codex_submission_prompt(
+            home, assignment.get("benchmark_id")
+        )
         if deepseek_catalog is None:  # defensive: validation must precede argv
             raise RunnerError("DeepSeek model catalog was not prepared")
         cmd += [

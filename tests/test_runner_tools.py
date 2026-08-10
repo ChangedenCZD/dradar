@@ -59,6 +59,32 @@ def test_codex_prompt_leaves_post_run_artifact_to_pier(tmp_path, monkeypatch):
     assert "test -s /logs/artifacts/model.patch" not in text
 
 
+def test_pompeii_prompt_sets_simple_time_budget(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    task = tmp_path / "abs-module-cache-flags"
+    task.mkdir()
+    (task / "task.toml").write_text("[agent]\ntimeout_sec = 7200.0\n")
+    monkeypatch.setenv("CODEX_AUTH_JSON_PATH", str(tmp_path / "auth.json"))
+    (tmp_path / "auth.json").write_text("{}")
+    home = tmp_path / "home"
+    home.mkdir()
+    assignment = _assignment("codex") | {
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+    }
+
+    cmd = build_pier_command(
+        assignment, tmp_path, tmp_path / "jobs", "j", home,
+    )
+
+    prompt = home / "codex-submission-prompt-pompeii-v1.j2"
+    assert f"prompt_template_path={prompt}" in cmd
+    text = prompt.read_text()
+    assert "within 60 minutes" in text
+    assert "no later than 90 minutes" in text
+    assert "do not start time-consuming new experiments" in text
+    assert "complete, gradeable answer" in text
+
+
 def test_dev_agent_codex_keeps_legacy_openai_provider_default(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"
@@ -139,6 +165,34 @@ def test_multiplier_never_shrinks_below_one(tmp_path):
     assert runner_mod._agent_timeout_multiplier(assignment, task) == 1.0
 
 
+def test_pompeii_multiplier_shrinks_old_pack_to_90_minutes(tmp_path):
+    task = _task_with_toml(tmp_path, timeout_sec=7200.0)
+    assignment = {
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "est_minutes": 120,
+    }
+    multiplier = runner_mod._agent_timeout_multiplier(assignment, task)
+    assert multiplier == 0.75
+    assert multiplier * 7200.0 == runner_mod.POMPEII_AGENT_TIMEOUT_SEC
+
+
+def test_pompeii_multiplier_keeps_refreshed_pack_at_90_minutes(tmp_path):
+    task = _task_with_toml(tmp_path, timeout_sec=5400.0)
+    assignment = {
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "est_minutes": 120,
+    }
+    assert runner_mod._agent_timeout_multiplier(assignment, task) == 1.0
+
+
+def test_pompeii_timeout_requires_readable_task_config(tmp_path):
+    task = tmp_path / "no-toml"
+    task.mkdir()
+    assignment = {"benchmark_id": runner_mod.POMPEII_BENCHMARK_ID}
+    with pytest.raises(RunnerError, match="90-minute execution limit"):
+        runner_mod._agent_timeout_multiplier(assignment, task)
+
+
 def test_multiplier_is_one_without_task_toml(tmp_path):
     task = tmp_path / "no-toml"
     task.mkdir()
@@ -165,6 +219,25 @@ def test_build_pier_command_omits_multiplier_for_short_estimate(tmp_path, monkey
     a["est_minutes"] = 5
     cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
     assert "--agent-timeout-multiplier" not in cmd
+
+
+def test_build_pier_command_caps_old_pompeii_pack(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    _task_with_toml(
+        tmp_path, task_id="abs-module-cache-flags", timeout_sec=7200.0,
+    )
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    assignment = _assignment(
+        "claude-code", model="claude-sonnet-5", effort="high",
+    ) | {
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "est_minutes": 120,
+    }
+    cmd = build_pier_command(
+        assignment, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
+    )
+    index = cmd.index("--agent-timeout-multiplier")
+    assert cmd[index + 1] == "0.750000"
 
 
 def test_codex_command_enables_credential_free_checkpoint_metadata(tmp_path, monkeypatch):
