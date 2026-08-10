@@ -1067,7 +1067,10 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             return terminal_outcome or "paused"
     outcome = "interrupted" if interrupted else "completed"
     if telemetry:
-        telemetry.set_phase("uploading", assignment["assignment_id"])
+        telemetry.set_phase(
+            "uploading", assignment["assignment_id"],
+            assignment.get("resume_generation"),
+        )
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
           f"outcome={outcome}); uploading...")
     if interrupted:
@@ -1309,7 +1312,9 @@ def _resume_one_checkpoint(
 
             if telemetry:
                 telemetry.bind_batch(assignment.get("batch_id"))
-                telemetry.set_phase("running", assignment_id)
+                # Register the recovery process without claiming ownership.
+                # checkpoint/resume is the atomic bind + fencing operation.
+                telemetry.set_phase("queued")
                 telemetry.flush()
             try:
                 data = client.checkpoint_resume(
@@ -1333,6 +1338,12 @@ def _resume_one_checkpoint(
                 print(f"  {assignment_id}: couldn't resume checkpoint ({exc}); kept locally")
                 return "paused"
             resumed = data["assignment"]
+            if telemetry:
+                telemetry.set_phase(
+                    "running", assignment_id,
+                    resumed.get("resume_generation"),
+                )
+                telemetry.flush()
             print(f"resuming checkpoint {item.checkpoint_id} for {resumed['task_id']} "
                   f"(generation {resumed.get('resume_generation', '?')})")
             outcome = _run_and_submit(
@@ -2246,7 +2257,10 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                       "to continue or `dradar release` to give them back)")
                 return 1
         if telemetry:
-            telemetry.set_phase("running", assignment["assignment_id"])
+            telemetry.set_phase(
+                "running", assignment["assignment_id"],
+                assignment.get("resume_generation"),
+            )
             # Make the session/assignment relationship visible before the
             # subprocess can start or fail. assignment/started then stamps
             # started_at + this same session id in one server transaction.
@@ -2338,7 +2352,10 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
         extra = data.get("unstarted")
         if telemetry:
             telemetry.bind_batch(assignment.get("batch_id"))
-            telemetry.set_phase("running", assignment["assignment_id"])
+            telemetry.set_phase(
+                "running", assignment["assignment_id"],
+                assignment.get("resume_generation"),
+            )
         print(f"\n=== checked out {assignment['task_id']} "
               f"{assignment['model']}@{assignment['effort']}"
               + (f" · {extra} more waiting" if extra else "") + " ===")

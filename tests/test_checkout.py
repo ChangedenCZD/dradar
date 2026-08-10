@@ -50,8 +50,8 @@ class StubTelemetry:
     def flush(self):
         self.flushes += 1
 
-    def set_phase(self, phase, assignment_id=None):
-        self.phases.append((phase, assignment_id))
+    def set_phase(self, phase, assignment_id=None, resume_generation=None):
+        self.phases.append((phase, assignment_id, resume_generation))
 
 
 def test_checkout_loop_runs_dispensed_cells_until_drained(monkeypatch, capsys, tmp_path):
@@ -82,7 +82,7 @@ def test_checkout_flushes_and_passes_session_id_before_server_stamps_cell(
         _args(), {}, client, tmp_path, telemetry=telemetry) == 0
     assert client.checkout_sessions == ["session-test", "session-test"]
     assert telemetry.flushes >= 2
-    assert ("running", "a1") in telemetry.phases
+    assert ("running", "a1", None) in telemetry.phases
 
 
 def test_checkout_404_falls_back_to_legacy_batch(monkeypatch, tmp_path):
