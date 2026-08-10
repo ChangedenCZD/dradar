@@ -74,6 +74,12 @@ MAX_CHECKPOINT_RESUMES = 5
 _CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
 _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
 
+# Cloudflare's common request-body ceiling is 100 MB. Keep enough headroom
+# for multipart boundaries and form fields so an optional trajectory bundle
+# cannot strand an otherwise valid patch/result at the proxy edge.
+_UPLOAD_BODY_BUDGET_BYTES = 95_000_000
+_MULTIPART_OVERHEAD_BUDGET_BYTES = 64 * 1024
+
 _TERMINAL_FAILURE_OUTCOMES = {
     "auth": ("auth-failure", "agent authentication failed"),
     "insufficient-balance": (
@@ -103,18 +109,44 @@ def _selected_tasks_root(cfg: dict) -> Path:
 
 
 def _is_trajectory_bundle_rejection(exc: ApiError) -> bool:
-    """Whether a 422 only rejects the optional trajectory bundle.
+    """Whether retrying once without the optional bundle is safe.
 
-    Newer servers may provide a stable application code. Older deployments
-    only expose the safe detail string, so keep a deliberately narrow text
-    fallback for compatibility.
+    A proxy-generated 413 cannot identify which multipart field crossed its
+    whole-request limit. The caller invokes this helper only while a bundle
+    is present, so removing that optional field is a safe one-shot downgrade;
+    a second 413 is still terminal. For application 422s, retain the narrow
+    bundle-specific code/text checks so unrelated validation is never bypassed.
     """
+    if exc.status_code == 413:
+        return True
     if exc.status_code != 422:
         return False
     if exc.code and exc.code.startswith("trajectory_bundle_"):
         return True
     detail = str(exc).lower()
     return "trajectory_bundle" in detail or "trajectory bundle" in detail
+
+
+def _estimated_upload_body_bytes(
+    patch: Path,
+    trajectory: Path | None,
+    result: Path | None,
+    trajectory_bundle: Path | None,
+    client_meta: dict,
+) -> int:
+    """Conservatively estimate the multipart request body before submission.
+
+    httpx adds a random boundary plus small per-part headers. A fixed 64 KiB
+    allowance is intentionally much larger than that framing for this handful
+    of fields, while the 5 MB gap below the proxy ceiling absorbs remaining
+    implementation differences.
+    """
+    total = _MULTIPART_OVERHEAD_BUDGET_BYTES
+    total += len(json.dumps(client_meta).encode("utf-8"))
+    for artifact in (patch, trajectory, result, trajectory_bundle):
+        if artifact is not None and artifact.exists():
+            total += artifact.stat().st_size
+    return total
 
 
 def _is_patch_secret_rejection(exc: ApiError) -> bool:
@@ -708,6 +740,23 @@ def _upload_trial(
             None if entry.get("omit_trajectory_bundle")
             else trajectory_bundle_scrubbed
         )
+        if submit_bundle is not None:
+            projected_bytes = _estimated_upload_body_bytes(
+                upload_patch, traj_scrubbed, result_scrubbed,
+                submit_bundle, upload_meta,
+            )
+            if projected_bytes > _UPLOAD_BODY_BUDGET_BYTES:
+                # Persist before submitting so a crash or later transport
+                # failure cannot rebuild and resend the same oversized body.
+                entry["omit_trajectory_bundle"] = True
+                pending.record(HOME, entry)
+                submit_bundle = None
+                print(
+                    f"  {task_id}: projected upload is "
+                    f"{projected_bytes / 1_000_000:.1f} MB, above the safe "
+                    f"{_UPLOAD_BODY_BUDGET_BYTES / 1_000_000:.0f} MB request "
+                    "budget; omitting the optional trajectory bundle"
+                )
         while True:
             submit_kwargs = {
                 "outcome": outcome,
@@ -731,8 +780,9 @@ def _upload_trial(
                     pending.record(HOME, entry)
                     submit_bundle = None
                     print(
-                        f"  {task_id}: server rejected the optional trajectory "
-                        "bundle; retrying the completed result without it"
+                        f"  {task_id}: upload was rejected while it included the "
+                        "optional trajectory bundle; retrying the completed "
+                        "result without it"
                     )
                     continue
 
@@ -752,9 +802,10 @@ def _upload_trial(
                 if (exc.status_code in (404, 413)
                         or _is_patch_secret_rejection(exc)):
                     # These are genuinely terminal for the current payload:
-                    # assignment unknown, request too large, or a patch the
-                    # server still considers unsafe. Never bypass the secret
-                    # gate by retrying a reduced optional-artifact set.
+                    # assignment unknown, the reduced request is still too
+                    # large, or a patch the server still considers unsafe.
+                    # Never bypass the secret gate by retrying a reduced
+                    # optional-artifact set.
                     print(f"  {task_id}: the server rejected this upload for good ({exc}) — "
                           "retrying can't fix it, dropping it from the retry queue "
                           f"(local artifact path: {patch.parent.parent})")

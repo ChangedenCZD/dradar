@@ -959,6 +959,84 @@ def test_bundle_422_retries_completed_result_without_optional_bundle(
     assert client.stopped == []
 
 
+def test_oversized_projected_request_omits_bundle_before_submit(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    # Keep the test fixture tiny while exercising the production size-budget
+    # branch: the patch + framing fit, but adding the bundle does not.
+    monkeypatch.setattr(
+        runloop, "_UPLOAD_BODY_BUDGET_BYTES",
+        runloop._MULTIPART_OVERHEAD_BUDGET_BYTES + 200,
+    )
+    trial_dir = _make_trial_dir(tmp_path)
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100)
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.calls.append(trajectory_bundle is not None)
+            assert trajectory_bundle is None
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    client = CaptureClient(lambda _aid: None)
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "submitted"
+    assert client.calls == [False]
+    assert pending.load(tmp_path) == []
+    assert "omitting the optional trajectory bundle" in capsys.readouterr().out
+
+
+def test_bundle_edge_413_retries_once_without_optional_bundle(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100)
+
+    class EdgeFallbackClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.calls.append(trajectory_bundle is not None)
+            if trajectory_bundle is not None:
+                raise ApiError(
+                    "server returned 413: Payload Too Large (cloudflare)",
+                    status_code=413,
+                )
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    client = EdgeFallbackClient(lambda _aid: None)
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "submitted"
+    assert client.calls == [True, False]
+    assert pending.load(tmp_path) == []
+    assert client.stopped == []
+
+
+def test_bundle_edge_413_is_terminal_if_reduced_request_is_still_too_large(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    sessions = trial_dir / "agent" / "sessions"
+    _write_codex_session(sessions / "root.jsonl", "root-1", "user", 100)
+
+    class AlwaysOversizedClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            self.calls.append(trajectory_bundle is not None)
+            raise ApiError("server returned 413: too large", status_code=413)
+
+    client = AlwaysOversizedClient(lambda _aid: None)
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "rejected"
+    assert client.calls == [True, False]
+    assert pending.load(tmp_path) == []
+    assert client.stopped == ["a1"]
+
+
 def test_bundle_422_persists_downgrade_when_fallback_transport_fails(
     tmp_path: Path, monkeypatch,
 ):
