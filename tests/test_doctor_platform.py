@@ -196,6 +196,9 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
     monkeypatch.setattr(doctor.shutil, "which", which)
     monkeypatch.setattr(doctor, "_probe", lambda _cmd: True)
     monkeypatch.setattr(
+        doctor, "docker_resources", lambda: (8, 16.0, ()),
+    )
+    monkeypatch.setattr(
         doctor,
         "_windows_virtualization_state",
         lambda: pytest.fail("healthy Docker must not run the fallback probe"),
@@ -215,9 +218,44 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
     assert rc == 1  # no agent auth or server login in this isolated test
     assert state == {"pier_ready": True, "pier_calls": 1, "task_calls": 1}
     assert "[ok ] docker daemon" in out
+    assert "[ok ] docker resources (8 CPU / 16.0 GiB memory)" in out
     assert "[ok ] pier" in out
     assert "[ok ] tasks_root" in out
     assert "[skip]" not in out
+
+
+def test_doctor_warns_when_docker_vm_memory_can_distort_results(
+    monkeypatch, capsys, tmp_path,
+):
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+    monkeypatch.setattr(doctor, "_platform", lambda: "macos")
+    monkeypatch.setattr(doctor, "_load_config", lambda: {})
+    monkeypatch.setattr(doctor, "tasks_root_from_config", lambda _cfg: tasks_root)
+    monkeypatch.setattr(doctor, "deepseek_opted_in", lambda: False)
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: f"/usr/bin/{name}" if name in {"docker", "pier"} else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _cmd: True)
+    monkeypatch.setattr(
+        doctor, "docker_resources", lambda: (2, 4.0, ()),
+    )
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor.runner, "_pier_version", lambda _path: doctor.runner.PIER_VERSION,
+    )
+    monkeypatch.setattr(
+        doctor.runner, "_pier_version_compatible", lambda _version: True,
+    )
+
+    doctor.cmd_doctor(SimpleNamespace())
+    out = capsys.readouterr().out
+
+    assert "[warn] docker resources (2 CPU / 4.0 GiB memory)" in out
+    assert "reserve 8 GiB Docker memory" in out
+    assert "distort benchmark results" in out
+    assert "dedicated DRadar profile" in out
 
 
 def test_doctor_blocks_deepseek_when_official_catalog_is_invalid(

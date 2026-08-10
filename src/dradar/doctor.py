@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, runner
+from .capacity import docker_resources, worker_resource_warnings
 from .identity import _client
 from .local_config import _load_config, tasks_root_from_config
 from .providers import (
@@ -29,6 +30,12 @@ def _check(label: str, ok: bool, hint: str = "") -> bool:
 def _skip(label: str, reason: str) -> None:
     """Report a dependency that was deliberately not installed or downloaded."""
     print(f"  [skip] {label}  -> {reason}")
+
+
+def _warn(label: str, reason: str) -> None:
+    """Report a measurement risk without claiming the machine cannot run."""
+
+    print(f"  [warn] {label}  -> {reason}")
 
 
 def _platform(proc_version: Path = Path("/proc/version")) -> str:
@@ -159,6 +166,32 @@ def cmd_doctor(args) -> int:
         all_ok &= _check("docker daemon", daemon_ready, daemon_hint)
         compose = _probe([docker, "compose", "version"])
         all_ok &= _check("docker compose plugin", compose, hints["compose"])
+        if daemon_ready:
+            cpus, memory_gib, probe_warnings = docker_resources()
+            if cpus is not None and memory_gib is not None:
+                resource_label = (
+                    f"docker resources ({cpus} CPU / {memory_gib:.1f} GiB memory)"
+                )
+                resource_warnings = worker_resource_warnings(
+                    1, cpus, memory_gib,
+                )
+                if resource_warnings:
+                    detail = "; ".join(resource_warnings)
+                    detail += (
+                        "; low Docker VM resources can trigger agent retries "
+                        "and distort benchmark results"
+                    )
+                    if plat == "macos":
+                        detail += (
+                            "; Colima users should prefer a dedicated DRadar "
+                            "profile instead of resizing another project's VM"
+                        )
+                    _warn(resource_label, detail)
+                else:
+                    _check(resource_label, True)
+            else:
+                for warning in probe_warnings:
+                    _warn("docker resources", warning)
 
     # Native Windows cannot run a task until Docker Desktop's Linux engine is
     # healthy. Avoid installing Pier or cloning the benchmark repository while
@@ -271,6 +304,6 @@ def cmd_doctor(args) -> int:
 
 
 __all__ = [
-    "cmd_doctor", "_platform", "_check", "_probe", "_DOCKER_HINTS",
+    "cmd_doctor", "_platform", "_check", "_warn", "_probe", "_DOCKER_HINTS",
     "_CODEX_HINTS", "_windows_virtualization_state",
 ]

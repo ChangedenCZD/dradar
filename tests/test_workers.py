@@ -209,6 +209,10 @@ def _patch_pool_setup(monkeypatch, active_count=5):
     monkeypatch.setattr(runloop, "sweep_orphan_compose", lambda _home, _yes: None)
     monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
     monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        "dradar.capacity.docker_resources",
+        lambda: (64, 128.0, ()),
+    )
     monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)
     monkeypatch.setattr(
         runloop, "_maintain_image_cache",
@@ -301,6 +305,30 @@ def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
     assert len(abort_files) == 1
     assert not runloop.Path(abort_files.pop()).exists()
     assert all("resume" in p.command and "--auto" not in p.command for p in calls)
+
+
+def test_manual_workers_warn_before_starting_on_small_docker_vm(
+    monkeypatch, capsys,
+):
+    _patch_pool_setup(monkeypatch, active_count=3)
+    monkeypatch.setattr(
+        "dradar.capacity.docker_resources",
+        lambda: (2, 4.0, ()),
+    )
+    calls = []
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: calls.append(
+            _Process(command, env, **kwargs)
+        ) or calls[-1],
+    )
+
+    assert runloop._run_worker_pool(_args(workers=3)) == 0
+    out = capsys.readouterr().out
+    assert "reserve 6 Docker CPU" in out
+    assert "reserve 20 GiB Docker memory" in out
+    assert "use `--workers auto`" in out
+    assert len(calls) == 3
 
 
 def test_pool_does_not_start_more_workers_than_held_tasks(monkeypatch, capsys):
