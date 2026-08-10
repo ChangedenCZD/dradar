@@ -68,6 +68,17 @@ def test_missing_docker_fails_closed_to_one_worker(monkeypatch):
     assert "falling back to 1 worker" in report.warnings[0]
 
 
+def test_worker_resource_warnings_cover_cpu_and_memory_shortfalls():
+    warnings = capacity.worker_resource_warnings(3, 4, 12)
+
+    assert any("reserve 6 Docker CPU" in warning for warning in warnings)
+    assert any("reserve 20 GiB Docker memory" in warning for warning in warnings)
+
+
+def test_worker_resource_warnings_accept_exact_published_budget():
+    assert capacity.worker_resource_warnings(2, 4, 14) == ()
+
+
 def test_low_disk_space_never_recommends_zero(monkeypatch):
     _docker(monkeypatch, cpus=64, memory_gib=128)
     monkeypatch.setattr(capacity.shutil, "disk_usage", lambda _path: Disk(5))

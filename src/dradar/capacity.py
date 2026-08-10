@@ -63,6 +63,49 @@ def _docker_resources() -> tuple[int | None, float | None, tuple[str, ...]]:
     return cpus, memory, ()
 
 
+def docker_resources() -> tuple[int | None, float | None, tuple[str, ...]]:
+    """Read the capacity exposed by Docker, not the host headline specs."""
+
+    return _docker_resources()
+
+
+def worker_resource_warnings(
+    workers: int,
+    docker_cpus: int | None,
+    docker_memory_gib: float | None,
+) -> tuple[str, ...]:
+    """Explain when a requested worker count exceeds the published budget.
+
+    These are warnings rather than hard failures: task footprints vary, and a
+    user may deliberately accept slower execution.  Surfacing the shortfall is
+    still important because memory/CPU pressure can change an agent's retry
+    path even when the trial eventually completes.
+    """
+
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    if docker_cpus is None or docker_memory_gib is None:
+        return ()
+
+    required_cpus = workers * CPU_PER_WORKER
+    required_memory_gib = (
+        DOCKER_MEM_RESERVE_GIB + workers * MEM_GIB_PER_WORKER
+    )
+    warnings = []
+    if docker_cpus < required_cpus:
+        warnings.append(
+            f"{workers} worker(s) reserve {required_cpus} Docker CPU, but "
+            f"the daemon exposes {docker_cpus}"
+        )
+    if docker_memory_gib < required_memory_gib:
+        warnings.append(
+            f"{workers} worker(s) reserve {required_memory_gib:.0f} GiB Docker "
+            f"memory (including {DOCKER_MEM_RESERVE_GIB} GiB daemon reserve), "
+            f"but the daemon exposes {docker_memory_gib:.1f} GiB"
+        )
+    return tuple(warnings)
+
+
 def inspect_capacity(client, requested_tasks: int | None = None) -> CapacityReport:
     """Inspect Docker + disk + server limits without claiming any task."""
     me = client.whoami()
@@ -75,7 +118,7 @@ def inspect_capacity(client, requested_tasks: int | None = None) -> CapacityRepo
         me.get("concurrent_limit") or me.get("claim_limit") or 1))
     task_limit = max(1, int(requested_tasks or held or account_limit))
 
-    cpus, memory_gib, warnings = _docker_resources()
+    cpus, memory_gib, warnings = docker_resources()
     disk_gib = shutil.disk_usage(Path.home()).free / (1024 ** 3)
     if cpus is None or memory_gib is None:
         cpu_limit = memory_limit = 1
@@ -167,4 +210,7 @@ def cmd_capacity(args) -> int:
     return 0
 
 
-__all__ = ["CapacityReport", "cmd_capacity", "inspect_capacity", "print_report"]
+__all__ = [
+    "CapacityReport", "cmd_capacity", "docker_resources", "inspect_capacity",
+    "print_report", "worker_resource_warnings",
+]

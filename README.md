@@ -151,6 +151,7 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 - Codex CLI + `auth.json`、Claude CLI + OAuth Token，或可选的 DeepSeek API key 与
   官方 Codex `models.json` 完整性；
 - 当前 benchmark 的任务仓库（主站目前为 DeepSWE），缺失时会尝试克隆；
+- Docker daemon 实际可用的 CPU/内存（不足时告警，不读取宿主机宣传配置）；
 - 可用磁盘和服务端登录。
 
 ```bash
@@ -217,6 +218,11 @@ dradar capacity
 当前保守规则包括：每个 worker 至少预留 2 CPU、6 GiB 内存，Docker 额外预留 2 GiB；
 第一个 worker 预留 20 GiB 磁盘，每增加一个再预留 12 GiB。普通自动推荐最多 4，最终
 结果还会被账号并发上限和可运行题目数限制。检测失败时回退到 1。
+
+`doctor` 会按同一内存/CPU预算检查单 worker；手工指定 `--workers N` 时也会在领取任务前
+比较 N 与 Docker 实际资源。资源不足只告警，不会偷偷修改 Docker 配置或替用户降低显式
+指定的 N，但 CPU/内存压力可能改变 agent 的重试路径和最终测量结果，建议改用
+`--workers auto` 或先调整 Docker VM。
 
 ### `dradar link-github`、`rename` 与 `status`
 
@@ -602,6 +608,11 @@ rename 自动重建；若两份文件摘要冲突，则保留两份现场并拒�
 推荐 OrbStack，也支持 Docker Desktop。OrbStack 第一次安装后通常需要打开一次 GUI 完成
 初始化。如果某个 `.venv` 被 macOS 标记为 hidden，Python 可能跳过 editable 安装依赖的
 `.pth` 文件；`doctor` 会识别并提示使用 `chflags -R nohidden <目录>`。
+
+使用 Colima 时，建议建立 DRadar 专用 profile（例如先执行
+`colima start --profile dradar --cpu 4 --memory 8`），再确认当前 Docker context 指向该
+profile。这样可以提高任务资源而不改变其他项目正在使用的默认 Colima VM；DRadar 本身
+不会创建、切换或修改任何 Colima profile。
 
 ### Windows 与 WSL2
 
