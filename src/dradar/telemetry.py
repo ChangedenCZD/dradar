@@ -57,6 +57,7 @@ class RunnerTelemetry:
         self._thread: threading.Thread | None = None
         self._phase = "preparing"
         self._active_assignment_id: str | None = None
+        self._resume_generation: int | None = None
         self._batch_id: str | None = None
         self._seq = 0
         self._progress_counter = 0
@@ -84,13 +85,25 @@ class RunnerTelemetry:
         if changed:
             self._wake.set()
 
-    def set_phase(self, phase: str, assignment_id: str | None = None) -> None:
+    def set_phase(
+        self,
+        phase: str,
+        assignment_id: str | None = None,
+        resume_generation: int | None = None,
+    ) -> None:
         if phase not in {"preparing", "queued", "running", "uploading", "paused"}:
             raise ValueError(f"unknown runner phase {phase!r}")
+        if resume_generation is not None and resume_generation < 0:
+            raise ValueError("resume_generation must be non-negative")
+        if assignment_id is None:
+            resume_generation = None
         with self._lock:
-            changed = (self._phase, self._active_assignment_id) != (phase, assignment_id)
+            changed = (
+                self._phase, self._active_assignment_id, self._resume_generation,
+            ) != (phase, assignment_id, resume_generation)
             self._phase = phase
             self._active_assignment_id = assignment_id
+            self._resume_generation = resume_generation
             if changed:
                 self._progress_counter += 1
         if changed:
@@ -107,6 +120,7 @@ class RunnerTelemetry:
                 "seq": self._seq,
                 "phase": self._phase,
                 "active_assignment_id": self._active_assignment_id,
+                "resume_generation": self._resume_generation,
                 "client_monotonic_ms": int(time.monotonic() * 1000),
                 "progress_counter": self._progress_counter,
                 "platform": platform_family(),

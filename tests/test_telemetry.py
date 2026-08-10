@@ -29,7 +29,7 @@ def test_payload_is_one_session_not_one_per_assignment_and_stays_small():
     client = FakeClient()
     telemetry = RunnerTelemetry(client, jitter=False, target_workers=20)
     telemetry.bind_batch("batch-1")
-    telemetry.set_phase("running", "assignment-1")
+    telemetry.set_phase("running", "assignment-1", 3)
     assert telemetry._send_once() == 60
     telemetry.set_phase("running", "assignment-2")
     telemetry._send_once()
@@ -37,11 +37,13 @@ def test_payload_is_one_session_not_one_per_assignment_and_stays_small():
     assert {p["session_id"] for p in client.heartbeats} == {telemetry.session_id}
     assert [p["active_assignment_id"] for p in client.heartbeats] == [
         "assignment-1", "assignment-2"]
+    assert [p["resume_generation"] for p in client.heartbeats] == [3, None]
     assert client.heartbeats[1]["seq"] > client.heartbeats[0]["seq"]
     assert len(json.dumps(client.heartbeats[-1]).encode()) < 1024
     assert set(client.heartbeats[-1]) == {
         "protocol_version", "client_version", "session_id", "batch_id", "seq",
-        "phase", "active_assignment_id", "client_monotonic_ms", "progress_counter",
+        "phase", "active_assignment_id", "resume_generation",
+        "client_monotonic_ms", "progress_counter",
         "platform", "target_workers",
     }
     assert client.heartbeats[-1]["target_workers"] == 20
