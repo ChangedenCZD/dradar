@@ -18,7 +18,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,10 +34,17 @@ from .providers import (
     DEEPSEEK_MODEL,
     DEEPSEEK_PROVIDER,
     DEEPSEEK_SUPPORTED_EFFORTS,
+    GROK_AGENT,
+    GROK_API_KEY_ENV,
+    GROK_CLI_VERSION,
+    GROK_MODEL,
+    GROK_PROVIDER,
+    GROK_SUPPORTED_EFFORTS,
     assignment_codex_provider,
     create_deepseek_auth_json,
     deepseek_catalog_error,
     deepseek_catalog_path,
+    grok_subscription_session,
 )
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
@@ -85,6 +92,8 @@ DEEPSEEK_TOML = (
 )
 DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
+GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
+GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
 
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
 CLAUDE_DISALLOWED_TOOLS = "WebSearch WebFetch EnterPlanMode"
@@ -127,6 +136,7 @@ class TrialArtifacts:
     duration_sec: float
     log_path: Path
     codex_cli_version: str | None = None
+    grok_cli_version: str | None = None
 
 
 class RunnerError(RuntimeError):
@@ -361,6 +371,17 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
     return _materialize_shared_file(target, source.read_bytes())
 
 
+def _ensure_grok_agent_module(home: Path) -> Path:
+    source = Path(__file__).with_name("pier_grok.py")
+    if not source.is_file():
+        raise RunnerError(
+            "Grok Build Pier adapter is missing; reinstall or upgrade dradar"
+        )
+    return _materialize_shared_file(
+        home / GROK_AGENT_MODULE_FILENAME, source.read_bytes()
+    )
+
+
 def _version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))
 
@@ -401,10 +422,35 @@ def _validate_deepseek_assignment(assignment: dict) -> None:
     _deepseek_codex_version(assignment)
 
 
+def _validate_grok_assignment(assignment: dict) -> None:
+    if assignment.get("provider") != GROK_PROVIDER:
+        raise RunnerError(
+            "Grok Build assignments must explicitly use provider "
+            f"{GROK_PROVIDER!r}"
+        )
+    if assignment.get("model") != GROK_MODEL:
+        raise RunnerError(
+            f"unsupported Grok subscription model {assignment.get('model')!r}; "
+            f"only {GROK_MODEL!r} is enabled"
+        )
+    if assignment.get("effort") not in GROK_SUPPORTED_EFFORTS:
+        raise RunnerError(
+            "Grok subscription effort must be low, medium, or high; "
+            f"got {assignment.get('effort')!r}"
+        )
+    requested = assignment.get("agent_version") or GROK_CLI_VERSION
+    if requested != GROK_CLI_VERSION:
+        raise RunnerError(
+            f"Grok subscription runs are pinned to CLI {GROK_CLI_VERSION}; "
+            f"the server requested unverified {requested!r}"
+        )
+
+
 def _pier_process_env(
     assignment: dict,
     *,
     deepseek_module_dir: Path | None = None,
+    grok_module_dir: Path | None = None,
 ) -> dict[str, str]:
     """Keep provider secrets out of Pier's inherited environment."""
 
@@ -421,6 +467,12 @@ def _pier_process_env(
         env.pop("PYTHONHOME", None)
         if deepseek_module_dir is not None:
             env["PYTHONPATH"] = str(deepseek_module_dir)
+    if assignment.get("agent") == GROK_AGENT:
+        env.pop(GROK_API_KEY_ENV, None)
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        if grok_module_dir is not None:
+            env["PYTHONPATH"] = str(grok_module_dir)
     return env
 
 
@@ -545,6 +597,15 @@ def build_pier_command(
                 "start a fresh explicit run"
             )
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
+    elif agent == GROK_AGENT:
+        _validate_grok_assignment(assignment)
+        _ensure_grok_agent_module(home)
+        if resume_checkpoint is not None:
+            raise RunnerError(
+                "Grok subscription checkpoints are not supported yet; start a "
+                "fresh explicit run"
+            )
+        agent_args = ["--agent-import-path", GROK_AGENT_IMPORT_PATH]
     else:
         agent_args = ["--agent", agent]
     cmd = [
@@ -647,6 +708,22 @@ def build_pier_command(
             "--ae", "API_TIMEOUT_MS=3000000",
             "--ae", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000",
             "--ae", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000",
+        ]
+    elif agent == GROK_AGENT:
+        if provider_auth_path is None or not provider_auth_path.is_file():
+            raise RunnerError(
+                "Grok subscription OAuth is unavailable; run "
+                "`dradar provider setup grok` in your own interactive Terminal"
+            )
+        submission_prompt = _ensure_codex_submission_prompt(
+            home, assignment.get("benchmark_id")
+        )
+        cmd += [
+            "--model", assignment["model"],
+            "--ak", f"reasoning_effort={assignment['effort']}",
+            "--ak", f"auth_json_file={provider_auth_path}",
+            "--ak", f"prompt_template_path={submission_prompt}",
+            "--ak", f"version={GROK_CLI_VERSION}",
         ]
     return cmd
 
@@ -1332,7 +1409,8 @@ def run_trial(
     effective_assignment = assignment
     codex_cli_version = None
     codex_provider = None
-    if (dev_agent or assignment["agent"]) == "codex":
+    effective_agent = dev_agent or assignment["agent"]
+    if effective_agent == "codex":
         codex_provider = (
             assignment_codex_provider(assignment) or DEFAULT_CODEX_PROVIDER
         )
@@ -1353,6 +1431,13 @@ def run_trial(
             **assignment,
             "agent_version": codex_cli_version,
         }
+    elif effective_agent == GROK_AGENT:
+        _validate_grok_assignment(assignment)
+        effective_assignment = {
+            **assignment,
+            "agent_version": GROK_CLI_VERSION,
+        }
+        print(f"verified pinned Grok subscription CLI: {GROK_CLI_VERSION}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = work_dir / "jobs"
@@ -1375,15 +1460,23 @@ def run_trial(
     )
 
     provider_auth_path = None
+    provider_stack = ExitStack()
     try:
         if codex_provider == DEEPSEEK_PROVIDER:
             try:
                 provider_auth_path = create_deepseek_auth_json(work_dir)
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
+        elif effective_agent == GROK_AGENT:
+            try:
+                provider_auth_path = provider_stack.enter_context(
+                    grok_subscription_session(work_dir)
+                )
+            except (OSError, ValueError) as exc:
+                raise RunnerError(str(exc)) from exc
         provider_kwargs = (
             {"provider_auth_path": provider_auth_path}
-            if codex_provider == DEEPSEEK_PROVIDER
+            if codex_provider == DEEPSEEK_PROVIDER or effective_agent == GROK_AGENT
             else {}
         )
         if resume_checkpoint is None:
@@ -1402,6 +1495,7 @@ def run_trial(
             deepseek_module_dir=(
                 work_dir if codex_provider == DEEPSEEK_PROVIDER else None
             ),
+            grok_module_dir=(work_dir if effective_agent == GROK_AGENT else None),
         )
         if on_started is not None:
             # Best-effort by design: this only confirms to the server that a
@@ -1475,15 +1569,20 @@ def run_trial(
                     raise
     finally:
         if provider_auth_path is not None:
-            try:
-                provider_auth_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                raise RunnerError(
-                    f"could not remove temporary DeepSeek auth file "
-                    f"{provider_auth_path}: {exc}"
-                ) from exc
+            if codex_provider == DEEPSEEK_PROVIDER:
+                try:
+                    provider_auth_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise RunnerError(
+                        f"could not remove temporary DeepSeek auth file "
+                        f"{provider_auth_path}: {exc}"
+                    ) from exc
+        try:
+            provider_stack.close()
+        except (OSError, ValueError) as exc:
+            raise RunnerError(str(exc)) from exc
     duration = time.time() - started
     if isinstance(terminal_error, LiveAccountTerminalError):
         # Let the existing runloop checkpoint/pause path classify this
@@ -1552,6 +1651,9 @@ def run_trial(
         duration_sec=duration,
         log_path=log_path,
         codex_cli_version=codex_cli_version,
+        grok_cli_version=(
+            GROK_CLI_VERSION if effective_agent == GROK_AGENT else None
+        ),
     )
 
 

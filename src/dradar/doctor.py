@@ -14,9 +14,14 @@ from .identity import _client
 from .local_config import _load_config, tasks_root_from_config
 from .providers import (
     DEEPSEEK_API_KEY_ENV,
+    GROK_CLI_VERSION,
     deepseek_api_key,
     deepseek_catalog_error,
     deepseek_opted_in,
+    grok_auth_error,
+    grok_auth_path,
+    grok_cli_path,
+    parse_grok_cli_version,
 )
 from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
@@ -223,9 +228,38 @@ def cmd_doctor(args) -> int:
     auth = runner.codex_auth_path()
     codex_ready = bool(codex) and auth.is_file()
     claude_ready = bool(shutil.which("claude")) and bool(runner.claude_oauth_token())
+    grok = grok_cli_path()
+    grok_requested = grok_auth_path().exists()
+    grok_cli_ready = False
+    if grok:
+        try:
+            grok_version = subprocess.run(
+                [grok, "--version"], capture_output=True, text=True, timeout=10,
+            )
+            grok_cli_ready = (
+                grok_version.returncode == 0
+                and parse_grok_cli_version(grok_version.stdout) == GROK_CLI_VERSION
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    grok_oauth_issue = grok_auth_error() if grok_requested else None
+    grok_ready = grok_cli_ready and grok_requested and grok_oauth_issue is None
     deepseek_requested = deepseek_opted_in()
     deepseek_key_ready = bool(deepseek_api_key())
-    if deepseek_requested:
+    if grok_requested:
+        all_ok &= _check(
+            f"Grok CLI {GROK_CLI_VERSION} — subscription runner",
+            grok_cli_ready,
+            f"install official Grok CLI {GROK_CLI_VERSION}",
+        )
+        all_ok &= _check(
+            "Grok subscription OAuth — dedicated DRadar slot",
+            grok_oauth_issue is None,
+            grok_oauth_issue or "run `dradar provider setup grok`",
+        )
+        if grok_ready:
+            _check("Grok 4.5 — subscription provider ready", True)
+    elif deepseek_requested:
         catalog_issue = deepseek_catalog_error()
         catalog_ready = catalog_issue is None
         all_ok &= _check(
@@ -253,7 +287,7 @@ def cmd_doctor(args) -> int:
         _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
                bool(runner.claude_oauth_token()),
                "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
-    if not deepseek_requested:
+    if not deepseek_requested and not grok_requested:
         all_ok &= (codex_ready or claude_ready)
 
     # The task repo is auto-cloned on `dradar go`; do it here too so a missing

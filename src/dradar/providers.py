@@ -9,8 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import stat
 import tempfile
+from contextlib import contextmanager
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -35,6 +38,23 @@ DEEPSEEK_CATALOG_SOURCE = (
 DEEPSEEK_CATALOG_SOURCE_VERSION = "1.0.0"
 DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v1"
 DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
+
+# Grok Build is intentionally subscription/OAuth-only.  In particular, the
+# runner strips XAI_API_KEY from Pier's environment and never accepts a key in
+# config, argv, or an assignment.  A dedicated DRadar-owned GROK_HOME keeps a
+# benchmark credential separate from the user's everyday Grok CLI session.
+GROK_PROVIDER = "xai-subscription"
+GROK_AGENT = "grok-build"
+GROK_MODEL = "grok-4.5"
+GROK_CLI_VERSION = "1.0.0"
+GROK_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high"})
+GROK_CAPABILITY = "grok-build-subscription-oauth-v1"
+GROK_RUN_CONFIG_VERSION = "grok-subscription-oauth-isolated-v1"
+GROK_RUNTIME_PROFILE = "pier-grok-build-single-slot-v1"
+GROK_HOME_RELATIVE_PATH = Path("providers") / "grok"
+GROK_AUTH_FILENAME = "auth.json"
+GROK_API_KEY_ENV = "XAI_API_KEY"
+_GROK_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -253,13 +273,171 @@ def create_deepseek_auth_json(directory: Path) -> Path:
     return path
 
 
+def grok_home(home: Path | None = None) -> Path:
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    return Path(home) / GROK_HOME_RELATIVE_PATH
+
+
+def grok_auth_path(home: Path | None = None) -> Path:
+    return grok_home(home) / GROK_AUTH_FILENAME
+
+
+def _valid_grok_auth_payload(payload: object) -> bool:
+    """Recognize an OAuth credential without depending on account-specific IDs."""
+
+    if not isinstance(payload, dict) or not payload:
+        return False
+    for record in payload.values():
+        if not isinstance(record, dict):
+            continue
+        if (
+            isinstance(record.get("key"), str)
+            and record["key"].strip()
+            and isinstance(record.get("refresh_token"), str)
+            and record["refresh_token"].strip()
+            and record.get("auth_mode") != "api_key"
+        ):
+            return True
+    return False
+
+
+def grok_auth_error(path: Path | None = None) -> str | None:
+    """Fail closed for missing, broad, symlinked, or non-OAuth credentials."""
+
+    path = grok_auth_path() if path is None else path
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return f"Grok subscription OAuth is not configured at {path}"
+    except OSError as exc:
+        return f"cannot inspect {path}: {exc}"
+    if stat.S_ISLNK(info.st_mode):
+        return f"{path} must be a regular file, not a symlink"
+    if not stat.S_ISREG(info.st_mode):
+        return f"{path} must be a regular file"
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+        return f"{path} is too broadly readable; run: chmod 600 {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"Grok OAuth credential is unreadable or invalid JSON: {exc}"
+    if not _valid_grok_auth_payload(payload):
+        return "Grok credential is not a refreshable subscription OAuth session"
+    return None
+
+
+def grok_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    explicit = env.get("GROK_CLI_PATH")
+    if explicit:
+        return explicit
+    # Keep the ordinary call signature compatible with doctor/test shims that
+    # replace shutil.which with a one-argument platform probe.
+    if environ is None:
+        discovered = shutil.which("grok")
+        if discovered:
+            return discovered
+        official = Path.home() / ".grok" / "bin" / "grok"
+        return str(official) if official.is_file() and os.access(official, os.X_OK) else None
+    return shutil.which("grok", path=env.get("PATH"))
+
+
+def parse_grok_cli_version(output: str) -> str | None:
+    match = _GROK_VERSION_RE.search(output.strip())
+    return match.group(1) if match else None
+
+
+def _replace_private_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(target.parent, 0o700)
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            with source.open("rb") as incoming:
+                shutil.copyfileobj(incoming, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def grok_subscription_session(directory: Path, *, home: Path | None = None):
+    """Yield a private run copy while serializing OAuth refresh/writeback.
+
+    The lock covers the entire paid CLI process.  The Pier adapter downloads
+    the possibly refreshed container credential back onto the yielded file;
+    this context validates it before atomically advancing the canonical slot.
+    """
+
+    canonical = grok_auth_path(home)
+    issue = grok_auth_error(canonical)
+    if issue is not None:
+        raise ValueError(issue + "; run `dradar provider setup grok` first")
+    canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = canonical.parent / "auth.lock"
+    directory.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        if os.name == "nt":  # pragma: no cover - Windows runner
+            import msvcrt
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        fd, name = tempfile.mkstemp(
+            prefix=".grok-oauth-run.", suffix=".json", dir=directory,
+        )
+        os.close(fd)
+        run_copy = Path(name)
+        try:
+            _replace_private_file(canonical, run_copy)
+            yield run_copy
+            issue = grok_auth_error(run_copy)
+            if issue is not None:
+                raise ValueError(
+                    "Grok returned an invalid refreshed OAuth credential: " + issue
+                )
+            _replace_private_file(run_copy, canonical)
+        finally:
+            try:
+                run_copy.unlink()
+            except FileNotFoundError:
+                pass
+            if os.name == "nt":  # pragma: no cover - Windows runner
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def advertised_capabilities(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Advertise only a complete, integrity-checked paid-provider runtime."""
 
-    del environ
-    return () if deepseek_catalog_error() is not None else (DEEPSEEK_CAPABILITY,)
+    capabilities = []
+    if deepseek_catalog_error() is None:
+        capabilities.append(DEEPSEEK_CAPABILITY)
+    # Unlike API-key providers, a subscription slot is scarce and stateful.
+    # Advertise it only when both the CLI and a safe refreshable OAuth session
+    # are actually present, preventing the server from assigning unusable work.
+    if grok_cli_path(environ) and grok_auth_error() is None:
+        capabilities.append(GROK_CAPABILITY)
+    return tuple(capabilities)
 
 
 def normalize_capabilities(values: Iterable[str]) -> tuple[str, ...]:
