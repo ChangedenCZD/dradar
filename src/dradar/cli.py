@@ -235,12 +235,12 @@ def main(argv: list[str] | None = None) -> int:
     provider_sub = p_provider.add_subparsers(
         dest="provider_command", required=True)
     p_provider_setup = provider_sub.add_parser(
-        "setup", help="securely enter and save a provider API key")
-    p_provider_setup.add_argument("provider", choices=("deepseek",))
+        "setup", help="securely configure a provider credential or OAuth session")
+    p_provider_setup.add_argument("provider", choices=("deepseek", "grok"))
     p_provider_setup.set_defaults(func=cmd_provider_setup)
     p_provider_status = provider_sub.add_parser(
-        "status", help="check provider readiness without displaying its key")
-    p_provider_status.add_argument("provider", choices=("deepseek",))
+        "status", help="check provider readiness without displaying credentials")
+    p_provider_status.add_argument("provider", choices=("deepseek", "grok"))
     p_provider_status.set_defaults(func=cmd_provider_status)
 
     p_refill = sub.add_parser("refill", help="inspect or stop continuous auto-refill")

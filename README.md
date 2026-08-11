@@ -204,6 +204,29 @@ auth 文件，再从 Pier 的继承环境中移除该变量。
 [Responses API](https://api-docs.deepseek.com/guides/responses_api/) 和
 [Codex 自定义 provider](https://developers.openai.com/codex/config-advanced/#custom-model-providers)。
 
+### Grok 订阅 OAuth 补充 agent
+
+Grok Build 只使用 grok.com 订阅的官方 OAuth/device login，不接受 `XAI_API_KEY`，也不接
+xAI 按量 API。首次在跑题机器的交互式终端中建立 DRadar 专用会话：
+
+```bash
+dradar provider setup grok
+dradar provider status grok
+dradar doctor
+dradar go --pick TASK_ID:grok-4.5:high
+```
+
+凭证保存在 `~/.dradar/providers/grok/auth.json`（目录 `0700`、文件 `0600`），与日常
+`~/.grok` 分离。每次运行只上传一个临时副本，整个模型会话持有独占锁；官方 CLI 静默
+刷新后，DRadar 校验并原子回写，再删除副本。因此同一订阅槽固定单并发，不会让两个
+Pier 容器同时刷新同一个 token。
+
+当前 canary 边界：官方 Grok CLI 固定为 `1.0.0`，模型固定为 `grok-4.5`，档位为
+`low`/`medium`/`high`；只能显式领取，不进入自动推荐或补题；禁用 web search、memory、
+subagents 和 plan，并把容器运行时网络限制为 `auth.x.ai` 与
+`cli-chat-proxy.grok.com`。第一版不支持 checkpoint。轨迹按 ATIF-v1.7 保存，但订阅
+运行没有 API 账单，因此 cost 保持未知，不伪报为 `$0`。
+
 体检失败不会领取任务。修复所有 `FAIL` 后重新运行即可。
 
 ### `dradar capacity`

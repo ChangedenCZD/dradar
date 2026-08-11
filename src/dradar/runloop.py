@@ -36,6 +36,9 @@ from .providers import (
     DEEPSEEK_PROVIDER,
     DEEPSEEK_RUN_CONFIG_VERSION,
     DEEPSEEK_RUNTIME_PROFILE,
+    GROK_AGENT,
+    GROK_RUN_CONFIG_VERSION,
+    GROK_RUNTIME_PROFILE,
     assignment_codex_provider,
 )
 from .runner import (
@@ -1137,6 +1140,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "task_content_hash_match": hash_match,
         "deep_swe_commit": local_commit,
         "codex_cli_version": art.codex_cli_version,
+        "grok_cli_version": art.grok_cli_version,
         **stats,
     }
     if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
@@ -1147,6 +1151,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "model_config_version": DEEPSEEK_RUN_CONFIG_VERSION,
             "model_catalog_sha256": DEEPSEEK_CATALOG_SHA256,
             "model_runtime_profile": DEEPSEEK_RUNTIME_PROFILE,
+        })
+    if assignment.get("agent") == GROK_AGENT:
+        meta.update({
+            "model_config_version": GROK_RUN_CONFIG_VERSION,
+            "model_runtime_profile": GROK_RUNTIME_PROFILE,
+            "subscription_oauth": True,
+            "subscription_concurrency": 1,
         })
 
     if item is not None and item.job_dir == art.job_dir:
