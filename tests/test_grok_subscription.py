@@ -98,14 +98,18 @@ def test_pier_command_uses_private_adapter_without_key_in_argv(
     home = tmp_path / "home"
     home.mkdir()
     auth = _write_auth(tmp_path / "run-auth.json")
+    cli = tmp_path / "grok"
+    cli.write_text("binary", encoding="utf-8")
 
     cmd = runner.build_pier_command(
         _assignment(), tasks, tmp_path / "jobs", "job", home,
         provider_auth_path=auth,
+        provider_cli_path=cli,
     )
 
     assert runner.GROK_AGENT_IMPORT_PATH in cmd
     assert f"auth_json_file={auth}" in cmd
+    assert f"grok_cli_file={cli}" in cmd
     assert f"version={GROK_CLI_VERSION}" in cmd
     assert "must-not-leak" not in " ".join(cmd)
     assert (home / runner.GROK_AGENT_MODULE_FILENAME).is_file()
@@ -132,10 +136,13 @@ def test_unverified_grok_assignments_fail_before_paid_run(
     tasks = tmp_path / "tasks"
     (tasks / assignment["task_id"]).mkdir(parents=True)
     auth = _write_auth(tmp_path / "auth.json")
+    cli = tmp_path / "grok"
+    cli.write_text("binary", encoding="utf-8")
     with pytest.raises(RunnerError, match=message):
         runner.build_pier_command(
             assignment, tasks, tmp_path / "jobs", "job", tmp_path,
             provider_auth_path=auth,
+            provider_cli_path=cli,
         )
 
 
@@ -144,9 +151,12 @@ def test_grok_checkpoint_resume_is_rejected(tmp_path: Path, monkeypatch):
     tasks = tmp_path / "tasks"
     (tasks / "task-1").mkdir(parents=True)
     auth = _write_auth(tmp_path / "auth.json")
+    cli = tmp_path / "grok"
+    cli.write_text("binary", encoding="utf-8")
     with pytest.raises(RunnerError, match="checkpoints are not supported"):
         runner.build_pier_command(
             _assignment(), tasks, tmp_path / "jobs", "job", tmp_path,
             resume_checkpoint=tmp_path / "checkpoint",
             provider_auth_path=auth,
+            provider_cli_path=cli,
         )

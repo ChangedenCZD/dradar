@@ -44,7 +44,9 @@ from .providers import (
     create_deepseek_auth_json,
     deepseek_catalog_error,
     deepseek_catalog_path,
+    grok_cli_path,
     grok_subscription_session,
+    parse_grok_cli_version,
 )
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
@@ -529,6 +531,7 @@ def build_pier_command(
     dev_agent: str | None = None,
     resume_checkpoint: Path | None = None,
     provider_auth_path: Path | None = None,
+    provider_cli_path: Path | None = None,
 ) -> list[str]:
     task_path = tasks_root / assignment["task_id"]
     if not task_path.is_dir():
@@ -715,6 +718,11 @@ def build_pier_command(
                 "Grok subscription OAuth is unavailable; run "
                 "`dradar provider setup grok` in your own interactive Terminal"
             )
+        if provider_cli_path is None or not provider_cli_path.is_file():
+            raise RunnerError(
+                "Pinned Grok CLI executable is unavailable; run "
+                "`dradar provider status grok` first"
+            )
         submission_prompt = _ensure_codex_submission_prompt(
             home, assignment.get("benchmark_id")
         )
@@ -722,10 +730,46 @@ def build_pier_command(
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"auth_json_file={provider_auth_path}",
+            "--ak", f"grok_cli_file={provider_cli_path}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={GROK_CLI_VERSION}",
         ]
     return cmd
+
+
+def _validated_grok_cli_path() -> Path:
+    """Resolve and verify the standalone subscription CLI before claiming quota."""
+
+    discovered = grok_cli_path()
+    if not discovered:
+        raise RunnerError(
+            f"Official Grok CLI {GROK_CLI_VERSION} is unavailable; run "
+            "`dradar provider setup grok` first"
+        )
+    try:
+        executable = Path(discovered).expanduser().resolve(strict=True)
+        info = executable.stat()
+    except OSError as exc:
+        raise RunnerError(f"cannot inspect pinned Grok CLI: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode) or not os.access(executable, os.X_OK):
+        raise RunnerError("Pinned Grok CLI must resolve to an executable regular file")
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(f"could not verify pinned Grok CLI: {exc}") from exc
+    found = parse_grok_cli_version(result.stdout)
+    if result.returncode != 0 or found != GROK_CLI_VERSION:
+        raise RunnerError(
+            f"Grok subscription runs require CLI {GROK_CLI_VERSION}; "
+            f"found {found or 'an unrecognized version'}"
+        )
+    return executable
 
 
 def locate_artifacts(jobs_dir: Path, job_name: str) -> tuple[Path, Path]:
@@ -1460,6 +1504,7 @@ def run_trial(
     )
 
     provider_auth_path = None
+    provider_cli_path = None
     provider_stack = ExitStack()
     try:
         if codex_provider == DEEPSEEK_PROVIDER:
@@ -1469,13 +1514,20 @@ def run_trial(
                 raise RunnerError(str(exc)) from exc
         elif effective_agent == GROK_AGENT:
             try:
+                provider_cli_path = _validated_grok_cli_path()
                 provider_auth_path = provider_stack.enter_context(
                     grok_subscription_session(work_dir)
                 )
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
         provider_kwargs = (
-            {"provider_auth_path": provider_auth_path}
+            {
+                "provider_auth_path": provider_auth_path,
+                **(
+                    {"provider_cli_path": provider_cli_path}
+                    if effective_agent == GROK_AGENT else {}
+                ),
+            }
             if codex_provider == DEEPSEEK_PROVIDER or effective_agent == GROK_AGENT
             else {}
         )
