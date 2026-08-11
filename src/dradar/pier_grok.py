@@ -29,6 +29,8 @@ class GrokBuild(BaseInstalledAgent):
     SUPPORTS_ATIF = True
     _REMOTE_HOME = PurePosixPath("/tmp/dradar-grok-home")
     _REMOTE_AUTH = _REMOTE_HOME / "auth.json"
+    _REMOTE_BIN_DIR = PurePosixPath("/tmp/dradar-grok-bin")
+    _REMOTE_CLI = _REMOTE_BIN_DIR / "grok"
     _STREAM_FILE = "grok-build.jsonl"
     _TOOLS = "read_file,grep,list_dir,search_replace,run_terminal_cmd,todo_write"
 
@@ -40,48 +42,39 @@ class GrokBuild(BaseInstalledAgent):
         self,
         *args: Any,
         auth_json_file: str,
+        grok_cli_file: str,
         reasoning_effort: str,
         **kwargs: Any,
     ):
         auth = Path(auth_json_file)
         if not auth.is_file():
             raise ValueError("Grok OAuth run credential is missing")
+        cli = Path(grok_cli_file)
+        if not cli.is_file():
+            raise ValueError("Pinned Grok CLI executable is missing")
         if reasoning_effort not in {"low", "medium", "high"}:
             raise ValueError("Grok reasoning_effort must be low, medium, or high")
         self._auth_json_file = auth
+        self._grok_cli_file = cli
         self._reasoning_effort = reasoning_effort
         super().__init__(*args, **kwargs)
 
     def get_version_command(self) -> str:
-        return 'export PATH="$HOME/.grok/bin:$PATH"; grok --version'
+        # The pinned host binary is uploaded only after the task container is
+        # running.  The exact version is verified immediately after upload.
+        return "true"
 
     def install_spec(self) -> AgentInstallSpec:
         version = self._version or "1.0.0"
-        version_pattern = version.replace(".", r"\.")
-        root_run = (
-            "set -euo pipefail; "
-            "if command -v apt-get >/dev/null; then "
-            "apt-get update && DEBIAN_FRONTEND=noninteractive "
-            "apt-get install -y curl ca-certificates; "
-            "elif command -v apk >/dev/null; then apk add --no-cache curl ca-certificates; "
-            "elif command -v yum >/dev/null; then yum install -y curl ca-certificates; "
-            "else command -v curl >/dev/null; fi"
-        )
-        agent_run = (
-            "set -euo pipefail; "
-            f"curl -fsSL https://x.ai/cli/install.sh | bash -s {shlex.quote(version)}; "
-            'export PATH="$HOME/.grok/bin:$PATH"; '
-            f"grok --version | grep -Eq '(^| ){version_pattern}( |$)'"
-        )
         return AgentInstallSpec(
             agent_name=self.name(),
             version=version,
-            steps=[
-                InstallStep(user="root", run=root_run),
-                InstallStep(user="agent", run=agent_run),
-            ],
-            verification_command=self.get_version_command(),
-            cache_key=f"dradar-grok-subscription-{version}-v1",
+            # Docker build networking happens before Pier's runtime egress
+            # proxy exists.  Keep the image layer offline and inject the
+            # already verified standalone CLI binary at runtime instead.
+            steps=[InstallStep(user="root", run="true")],
+            verification_command="true",
+            cache_key=f"dradar-grok-subscription-{version}-host-binary-v2",
         )
 
     def network_allowlist(self) -> NetworkAllowlist:
@@ -99,29 +92,52 @@ class GrokBuild(BaseInstalledAgent):
         del context
         remote_home = self._REMOTE_HOME.as_posix()
         remote_auth = self._REMOTE_AUTH.as_posix()
+        remote_bin = self._REMOTE_BIN_DIR.as_posix()
+        remote_cli = self._REMOTE_CLI.as_posix()
         env = self.build_process_env({"GROK_HOME": remote_home})
         # API keys are intentionally unsupported, including accidental ambient
         # keys baked into a task image or injected by a caller.
         env.pop("XAI_API_KEY", None)
         await self.exec_as_agent(
             environment,
-            command=f"mkdir -p {shlex.quote(remote_home)} && chmod 700 {shlex.quote(remote_home)}",
+            command=(
+                f"mkdir -p {shlex.quote(remote_home)} {shlex.quote(remote_bin)} "
+                f"&& chmod 700 {shlex.quote(remote_home)} {shlex.quote(remote_bin)}"
+            ),
             env=env,
         )
+        await environment.upload_file(self._grok_cli_file, remote_cli)
         await environment.upload_file(self._auth_json_file, remote_auth)
         if environment.default_user is not None:
             await self.exec_as_root(
                 environment,
                 command=(
-                    f"chown {shlex.quote(str(environment.default_user))} {shlex.quote(remote_auth)} "
+                    f"chown {shlex.quote(str(environment.default_user))} "
+                    f"{shlex.quote(remote_cli)} {shlex.quote(remote_auth)} "
+                    f"&& chmod 700 {shlex.quote(remote_cli)} "
                     f"&& chmod 600 {shlex.quote(remote_auth)}"
                 ),
                 env=env,
             )
         else:
             await self.exec_as_agent(
-                environment, command=f"chmod 600 {shlex.quote(remote_auth)}", env=env
+                environment,
+                command=(
+                    f"chmod 700 {shlex.quote(remote_cli)} "
+                    f"&& chmod 600 {shlex.quote(remote_auth)}"
+                ),
+                env=env,
             )
+        version = self._version or "1.0.0"
+        version_pattern = version.replace(".", r"\.")
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"{shlex.quote(remote_cli)} --version "
+                f"| grep -Eq '(^| ){version_pattern}( |$)'"
+            ),
+            env=env,
+        )
 
         stream = f"/logs/agent/{self._STREAM_FILE}"
         model = self.model_name or "grok-4.5"
@@ -148,8 +164,8 @@ class GrokBuild(BaseInstalledAgent):
         ]
         cli = " ".join(shlex.quote(part) for part in flags)
         command = (
-            'export PATH="$HOME/.grok/bin:$PATH"; '
-            f"grok -p {shlex.quote(instruction)} {cli} 2>&1 </dev/null | "
+            f"{shlex.quote(remote_cli)} -p {shlex.quote(instruction)} "
+            f"{cli} 2>&1 </dev/null | "
             f"tee {shlex.quote(stream)}"
         )
         try:

@@ -221,6 +221,10 @@ dradar go --pick TASK_ID:grok-4.5:high
 刷新后，DRadar 校验并原子回写，再删除副本。因此同一订阅槽固定单并发，不会让两个
 Pier 容器同时刷新同一个 token。
 
+DRadar 会在宿主机上先校验官方 CLI 的固定版本，再把解析后的独立可执行文件作为只读
+运行输入上传到任务容器并二次验版。Docker build 不访问 x.ai，也不会把 OAuth 凭证或
+日常 `~/.grok` 目录烘焙进镜像；凭证仍只在容器启动后临时注入。
+
 当前 canary 边界：官方 Grok CLI 固定为 `1.0.0`，模型固定为 `grok-4.5`，档位为
 `low`/`medium`/`high`；只能显式领取，不进入自动推荐或补题；禁用 web search、memory、
 subagents 和 plan，并把容器运行时网络限制为 `auth.x.ai` 与
