@@ -1,4 +1,4 @@
-"""DeepSeek V4 Flash is an additive, public-safe Codex provider."""
+"""DeepSeek V4 Flash / Pro are additive, public-safe Codex providers."""
 
 import hashlib
 import json
@@ -21,6 +21,9 @@ from dradar.providers import (
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_CODEX_VERSION,
     DEEPSEEK_MODEL,
+    DEEPSEEK_MODELS,
+    DEEPSEEK_PRO_CAPABILITY,
+    DEEPSEEK_PRO_MODEL,
     DEEPSEEK_PROVIDER,
     advertised_capabilities,
     assignment_codex_provider,
@@ -71,9 +74,11 @@ def _command(tmp_path: Path, monkeypatch, assignment=None) -> tuple[list[str], P
 
 
 def test_capability_advertises_software_support_before_first_key_setup():
-    assert advertised_capabilities({}) == (DEEPSEEK_CAPABILITY,)
+    assert advertised_capabilities({}) == (
+        DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
+    )
     assert advertised_capabilities({DEEPSEEK_API_KEY_ENV: "key"}) == (
-        DEEPSEEK_CAPABILITY,
+        DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
     )
 
 
@@ -81,16 +86,18 @@ def test_bundled_catalog_has_expected_integrity_and_reasoning_levels():
     catalog = deepseek_catalog_path()
     payload = catalog.read_bytes()
     parsed = json.loads(payload)
-    flash = next(item for item in parsed["models"] if item["slug"] == DEEPSEEK_MODEL)
+    by_slug = {item["slug"]: item for item in parsed["models"]}
+    flash = by_slug[DEEPSEEK_MODEL]
 
     assert hashlib.sha256(payload).hexdigest() == DEEPSEEK_CATALOG_SHA256
     assert [item["slug"] for item in parsed["models"]] == [
         "deepseek-v4-flash", "deepseek-v4-pro",
     ]
     assert deepseek_catalog_error(catalog) is None
-    assert {level["effort"] for level in flash["supported_reasoning_levels"]} >= {
-        "high", "max",
-    }
+    for model in DEEPSEEK_MODELS:
+        assert {level["effort"] for level in by_slug[model]["supported_reasoning_levels"]} >= {
+            "low", "high", "max",
+        }
     assert flash["supports_parallel_tool_calls"] is True
     assert flash["apply_patch_tool_type"] == "freeform"
     assert flash["multi_agent_version"] == "v2"
@@ -151,7 +158,7 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
         item for item in command if item.startswith("config_toml_file=")
     )
     config_path = Path(config_arg.split("=", 1)[1])
-    assert config_path == home / "codex-deepseek-v4-flash.toml"
+    assert config_path == home / "codex-deepseek-v4.toml"
     parsed = tomllib.loads(config_path.read_text())
     assert parsed["model_provider"] == DEEPSEEK_PROVIDER
     assert parsed["model_catalog_json"] == DEEPSEEK_CATALOG_REMOTE_PATH
@@ -168,6 +175,20 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     }
 
 
+def test_command_routes_pro_with_its_requested_reasoning_effort(
+    tmp_path: Path,
+    monkeypatch,
+):
+    command, _home = _command(
+        tmp_path,
+        monkeypatch,
+        _assignment(model=DEEPSEEK_PRO_MODEL, effort="high"),
+    )
+    assert command[command.index("--model") + 1] == DEEPSEEK_PRO_MODEL
+    assert "reasoning_effort=high" in command
+    assert f"version={DEEPSEEK_CODEX_VERSION}" in command
+
+
 def test_deepseek_shared_inputs_are_reused_and_owner_only(
     tmp_path: Path,
     monkeypatch,
@@ -178,7 +199,7 @@ def test_deepseek_shared_inputs_are_reused_and_owner_only(
         home / runner.DEEPSEEK_AGENT_MODULE_FILENAME: (
             Path(runner.__file__).with_name("pier_deepseek.py").read_bytes()
         ),
-        home / "codex-deepseek-v4-flash.toml": runner.DEEPSEEK_TOML.encode(),
+        home / "codex-deepseek-v4.toml": runner.DEEPSEEK_TOML.encode(),
         home / "codex-submission-prompt.j2": (
             runner.CODEX_SUBMISSION_PROMPT.encode()
         ),
@@ -212,7 +233,7 @@ def test_shared_input_publication_is_atomic_under_concurrency(
     tmp_path: Path,
     monkeypatch,
 ):
-    path = tmp_path / "codex-deepseek-v4-flash.toml"
+    path = tmp_path / "codex-deepseek-v4.toml"
     old = b"complete-old-config\n"
     payload = (b"complete-new-config\n" * 65536)
     path.write_bytes(old)
@@ -284,13 +305,13 @@ def test_command_fails_before_paid_run_when_catalog_is_modified(
     assert not (tmp_path / "home" / runner.DEEPSEEK_AGENT_MODULE_FILENAME).exists()
 
 
-@pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+@pytest.mark.parametrize("effort", ["medium", "xhigh"])
 def test_compatibility_aliases_are_not_duplicate_benchmark_cells(
     tmp_path: Path,
     monkeypatch,
     effort: str,
 ):
-    with pytest.raises(RunnerError, match="effort must be one of high, max"):
+    with pytest.raises(RunnerError, match="effort must be one of high, low, max"):
         _command(tmp_path, monkeypatch, _assignment(effort=effort))
 
 

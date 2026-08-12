@@ -19,14 +19,19 @@ from pathlib import Path
 
 DEFAULT_CODEX_PROVIDER = "openai"
 DEEPSEEK_PROVIDER = "deepseek"
-DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
+DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
+# Backwards-compatible import used by older extensions and Flash-only tests.
+DEEPSEEK_MODEL = DEEPSEEK_FLASH_MODEL
+DEEPSEEK_MODELS = (DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL)
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_ENABLE_ENV = "DRADAR_ENABLE_DEEPSEEK"
 DEEPSEEK_SECRET_RELATIVE_PATH = Path("secrets") / "deepseek_api_key"
 DEEPSEEK_CAPABILITY = "codex-deepseek-v4-flash-v2"
-DEEPSEEK_CODEX_VERSION = "0.146.0"
+DEEPSEEK_PRO_CAPABILITY = "codex-deepseek-v4-pro-v1"
+DEEPSEEK_CODEX_VERSION = "0.147.0"
 DEEPSEEK_MIN_CODEX_VERSION = "0.144.0"
-DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"high", "max"})
+DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 DEEPSEEK_CATALOG_FILENAME = "deepseek_codex_models.json"
 DEEPSEEK_CATALOG_SHA256 = (
     "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
@@ -86,22 +91,25 @@ def deepseek_catalog_error(path: Path | None = None) -> str | None:
     models = parsed.get("models") if isinstance(parsed, dict) else None
     if not isinstance(models, list):
         return "DeepSeek model catalog has no models list"
-    flash = next(
-        (
-            item for item in models
-            if isinstance(item, dict) and item.get("slug") == DEEPSEEK_MODEL
-        ),
-        None,
-    )
-    if flash is None:
-        return f"DeepSeek model catalog is missing {DEEPSEEK_MODEL}"
-    efforts = {
-        item.get("effort")
-        for item in flash.get("supported_reasoning_levels", [])
-        if isinstance(item, dict)
+    by_slug = {
+        item.get("slug"): item
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("slug"), str)
     }
-    if not DEEPSEEK_SUPPORTED_EFFORTS <= efforts:
-        return "DeepSeek model catalog is missing the benchmark reasoning levels"
+    for model in DEEPSEEK_MODELS:
+        entry = by_slug.get(model)
+        if entry is None:
+            return f"DeepSeek model catalog is missing {model}"
+        efforts = {
+            item.get("effort")
+            for item in entry.get("supported_reasoning_levels", [])
+            if isinstance(item, dict)
+        }
+        if not DEEPSEEK_SUPPORTED_EFFORTS <= efforts:
+            return (
+                f"DeepSeek model catalog entry {model} is missing the "
+                "benchmark reasoning levels"
+            )
     return None
 
 
@@ -431,7 +439,7 @@ def advertised_capabilities(
 
     capabilities = []
     if deepseek_catalog_error() is None:
-        capabilities.append(DEEPSEEK_CAPABILITY)
+        capabilities.extend((DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY))
     # Unlike API-key providers, a subscription slot is scarce and stateful.
     # Advertise it only when both the CLI and a safe refreshable OAuth session
     # are actually present, preventing the server from assigning unusable work.
