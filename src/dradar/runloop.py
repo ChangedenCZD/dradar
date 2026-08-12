@@ -2012,8 +2012,33 @@ def _assignment_is_ready_for_checkout(
     return ready_at <= (now or datetime.now(timezone.utc))
 
 
-def _pool_ready_waiting_count(client: ApiClient) -> int | None:
-    """Read the authoritative held queue without claiming anything.
+def _assignment_is_recoverable_checkpoint(
+    assignment: dict, local: dict[str, checkpoints.Checkpoint],
+) -> bool:
+    """Whether a paused server lease has matching, safe local recovery state."""
+    assignment_id = assignment.get("assignment_id")
+    item = local.get(assignment_id) if assignment_id else None
+    server_generation = assignment.get("resume_generation", 0)
+    if (
+        item is None or not item.valid or checkpoints.is_expired(item)
+        or checkpoints.is_terminal(HOME, item)
+        or assignment.get("execution_state") != "paused"
+        or assignment.get("runner_state") not in {None, "paused", "resumable"}
+        or not assignment.get("checkpoint_id")
+        or not isinstance(server_generation, int)
+        or isinstance(server_generation, bool)
+        or server_generation < 0
+    ):
+        return False
+    return (
+        item.checkpoint_id == assignment.get("checkpoint_id")
+        and item.resume_generation == server_generation
+        and _checkpoint_backoff_seconds(item) <= 0
+    )
+
+
+def _pool_ready_work_count(client: ApiClient) -> int | None:
+    """Read fresh checkout work plus safely recoverable checkpoints.
 
     ``None`` means the safety check itself failed. The supervisor then keeps
     current workers but fails closed instead of guessing and overspawning.
@@ -2027,11 +2052,18 @@ def _pool_ready_waiting_count(client: ApiClient) -> int | None:
     if active is None:
         one = data.get("assignment")
         active = [one] if one else []
-    return sum(
+    waiting = sum(
         _assignment_is_ready_for_checkout(assignment)
         for assignment in active
         if assignment
     )
+    local = checkpoints.latest_by_assignment(HOME)
+    recoverable = sum(
+        _assignment_is_recoverable_checkpoint(assignment, local)
+        for assignment in active
+        if assignment
+    )
+    return waiting + recoverable
 
 
 def _run_worker_pool(args) -> int:
@@ -2220,7 +2252,7 @@ def _run_worker_pool(args) -> int:
             if (not backfill_disabled
                     and len(active_processes) < target
                     and current_time >= next_backfill_check):
-                ready = _pool_ready_waiting_count(client)
+                ready = _pool_ready_work_count(client)
                 next_backfill_check = (
                     current_time + (
                         _POOL_BACKFILL_ERROR_RETRY_SECONDS
