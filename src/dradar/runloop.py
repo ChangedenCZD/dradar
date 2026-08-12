@@ -1797,7 +1797,9 @@ def cmd_go(args) -> int:
     if getattr(args, "refill_to", None) is not None:
         args.refill = True
     target_file = _pool_target_file(args)
-    if target_file is not None and (auto_workers or workers <= 1):
+    if (target_file is not None
+            and not getattr(args, "worker_child", False)
+            and (auto_workers or workers <= 1)):
         sys.exit("--worker-target-file requires a fixed --workers N greater than 1")
     refill_options = (
         getattr(args, "max_tasks", None),
