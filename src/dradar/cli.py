@@ -288,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
             help="run up to N tasks concurrently, or use 'auto' for a "
                  "conservative Docker-based recommendation (default: 1; maximum: 40)",
         )
+        p.add_argument(
+            "--worker-target-file", metavar="PATH",
+            help="dynamically resize a fixed worker pool by atomically writing "
+                 "a number from 1 through --workers to PATH; scale-down lets "
+                 "in-flight tasks finish",
+        )
         p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
         p.add_argument(
             "--refill", action="store_true",
