@@ -56,6 +56,21 @@ def test_dynamic_target_requires_a_fixed_multi_worker_pool():
         runloop.cmd_go(_args(workers="auto", worker_target_file="target"))
 
 
+def test_internal_worker_child_accepts_parent_dynamic_target_env(
+        tmp_path, monkeypatch):
+    target = tmp_path / "workers"
+    target.write_text("3")
+    monkeypatch.setenv("DRADAR_POOL_TARGET_FILE", str(target))
+    monkeypatch.setattr(runloop, "_load_config", lambda: pytest.fail(
+        "validation passed; stop before runtime setup",
+    ))
+
+    with pytest.raises(pytest.fail.Exception, match="validation passed"):
+        runloop.cmd_go(_args(
+            workers=1, worker_child=True, parallel=True, resume=True,
+        ))
+
+
 def test_workers_cannot_mix_with_manual_parallel():
     with pytest.raises(SystemExit, match="already manages parallel"):
         runloop.cmd_go(_args(parallel=True))
