@@ -68,11 +68,13 @@ _ACCOUNT_TERMINAL_OUTCOMES = {
     "recovery-exhausted", "runtime-incompatible",
 }
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
+_POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
 _POOL_DRAIN_PREFIX = "drain:"
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
 _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
 _POOL_IMAGE_CACHE_MAINTENANCE_SECONDS = 15 * 60
+_POOL_TARGET_CACHE: dict[Path, int] = {}
 MAX_CHECKPOINT_RESUMES = 5
 _CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
 _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
@@ -224,6 +226,51 @@ def _pool_stop_directive(path: Path | None = None) -> tuple[bool, str] | None:
 def _pool_abort_reason() -> str | None:
     directive = _pool_stop_directive()
     return directive[1] if directive is not None else None
+
+
+def _pool_target_file(args=None) -> Path | None:
+    raw = (
+        getattr(args, "worker_target_file", None) if args is not None else None
+    ) or os.environ.get(_POOL_TARGET_FILE_ENV)
+    return Path(raw).expanduser() if raw else None
+
+
+def _read_pool_target(path: Path | None, *, default: int, maximum: int) -> int:
+    """Read a live worker target without ever guessing past safe bounds."""
+    if path is None:
+        return default
+    try:
+        value = int(path.read_text().strip())
+    except (OSError, ValueError):
+        print(
+            f"worker target file {path} is unavailable or invalid; "
+            f"keeping {default} worker(s)", file=sys.stderr,
+        )
+        return default
+    if not 1 <= value <= maximum:
+        print(
+            f"worker target {value} is outside 1..{maximum}; "
+            f"keeping {default} worker(s)", file=sys.stderr,
+        )
+        return default
+    return value
+
+
+def _worker_slot_is_enabled() -> bool:
+    """Whether this child may check out another task after a live resize."""
+    path = _pool_target_file()
+    if path is None:
+        return True
+    try:
+        slot = int(os.environ.get("DRADAR_WORKER_INDEX", "1"))
+        maximum = int(os.environ.get("DRADAR_POOL_MAX_SIZE", "40"))
+        previous = int(os.environ.get("DRADAR_POOL_SIZE", str(maximum)))
+    except ValueError:
+        return False
+    previous = _POOL_TARGET_CACHE.get(path, previous)
+    target = _read_pool_target(path, default=previous, maximum=maximum)
+    _POOL_TARGET_CACHE[path] = target
+    return slot <= target
 
 
 def _announce_account_stop(outcome: str) -> None:
@@ -1749,6 +1796,9 @@ def cmd_go(args) -> int:
         sys.exit("--assignment targets one checkpoint and requires --workers 1")
     if getattr(args, "refill_to", None) is not None:
         args.refill = True
+    target_file = _pool_target_file(args)
+    if target_file is not None and (auto_workers or workers <= 1):
+        sys.exit("--worker-target-file requires a fixed --workers N greater than 1")
     refill_options = (
         getattr(args, "max_tasks", None),
         getattr(args, "max_estimated_quota_pct", None),
@@ -2079,10 +2129,15 @@ def _run_worker_pool(args) -> int:
     active, _free_pick = _prepare_batch(args, client)
     if not active:
         return 0
-    count = min(args.workers, len(active))
-    if count < args.workers:
+    maximum = args.workers
+    target_file = _pool_target_file(args)
+    target = _read_pool_target(target_file, default=maximum, maximum=maximum)
+    count = min(target, len(active))
+    if count < target:
         print(f"only {len(active)} task(s) are currently held; starting {count} worker(s)")
     print(f"starting {count} worker(s); server-side checkout assigns each task exactly once")
+    if target_file is not None:
+        print(f"live worker target: {target_file} (range 1..{maximum})")
     command = _worker_command(args)
     pool_abort_file = configured_abort_file or (
         Path(tempfile.gettempdir())
@@ -2107,7 +2162,10 @@ def _run_worker_pool(args) -> int:
     def spawn_worker(slot: int) -> None:
         env = os.environ.copy()
         env["DRADAR_WORKER_INDEX"] = str(slot)
-        env["DRADAR_POOL_SIZE"] = str(count)
+        env["DRADAR_POOL_SIZE"] = str(target)
+        env["DRADAR_POOL_MAX_SIZE"] = str(maximum)
+        if target_file is not None:
+            env[_POOL_TARGET_FILE_ENV] = str(target_file)
         env[_POOL_ABORT_ENV] = str(pool_abort_file)
         process = subprocess.Popen(command, env=env, **popen_kwargs)
         processes.append(process)
@@ -2129,6 +2187,13 @@ def _run_worker_pool(args) -> int:
 
             if not active_processes:
                 break
+            new_target = _read_pool_target(
+                target_file, default=target, maximum=maximum,
+            )
+            if new_target != target:
+                direction = "up" if new_target > target else "down"
+                print(f"scaling worker pool {direction}: {target} -> {new_target}")
+                target = new_target
             if pool_abort_file.is_file():
                 if abort_reason is None:
                     directive = _pool_stop_directive(pool_abort_file)
@@ -2153,7 +2218,7 @@ def _run_worker_pool(args) -> int:
 
             current_time = time.monotonic()
             if (not backfill_disabled
-                    and len(active_processes) < count
+                    and len(active_processes) < target
                     and current_time >= next_backfill_check):
                 ready = _pool_ready_waiting_count(client)
                 next_backfill_check = (
@@ -2164,12 +2229,12 @@ def _run_worker_pool(args) -> int:
                 )
                 if ready:
                     vacant_slots = sorted(
-                        set(range(1, count + 1)) - set(active_processes)
+                        set(range(1, target + 1)) - set(active_processes)
                     )
                     for slot in vacant_slots[:ready]:
                         print(
                             f"held work is waiting; restoring worker slot "
-                            f"{slot}/{count}"
+                            f"{slot}/{target}"
                         )
                         try:
                             spawn_worker(slot)
@@ -2180,7 +2245,7 @@ def _run_worker_pool(args) -> int:
                             backfill_error = str(exc)
                             backfill_disabled = True
                             print(
-                                f"couldn't restore worker slot {slot}/{count} "
+                                f"couldn't restore worker slot {slot}/{target} "
                                 f"({exc}); current workers will finish safely"
                             )
                             break
@@ -2342,6 +2407,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                                       args.allow_task_drift)
     results, failed_ids = [], set()
     while True:
+        if not _worker_slot_is_enabled():
+            print("worker slot retired by the live pool target; leaving after current work")
+            break
         pool_abort_reason = _pool_abort_reason()
         if pool_abort_reason:
             print(f"worker pool stopped before another checkout: {pool_abort_reason}")

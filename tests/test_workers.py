@@ -14,6 +14,7 @@ def _args(**overrides):
         dev_agent=None, refill=False, refill_to=None, max_tasks=None,
         max_estimated_quota_pct=None, quota_tier="plus", auto=5, pick=None,
         assignment=None, parallel=False, worker_child=False, resume=False,
+        worker_target_file=None,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -45,6 +46,13 @@ def test_worker_count_accepts_40(monkeypatch):
     monkeypatch.setattr(runloop, "_run_worker_pool", lambda args: seen.append(args.workers) or 0)
     assert runloop.cmd_go(_args(workers=40)) == 0
     assert seen == [40]
+
+
+def test_dynamic_target_requires_a_fixed_multi_worker_pool():
+    with pytest.raises(SystemExit, match="fixed --workers N greater than 1"):
+        runloop.cmd_go(_args(workers=1, worker_target_file="target"))
+    with pytest.raises(SystemExit, match="fixed --workers N greater than 1"):
+        runloop.cmd_go(_args(workers="auto", worker_target_file="target"))
 
 
 def test_workers_cannot_mix_with_manual_parallel():
@@ -312,6 +320,90 @@ def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
     assert len(abort_files) == 1
     assert not runloop.Path(abort_files.pop()).exists()
     assert all("resume" in p.command and "--auto" not in p.command for p in calls)
+
+
+def test_pool_live_target_scales_up_without_restarting_existing_workers(
+        tmp_path, monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=4)
+    target = tmp_path / "workers"
+    target.write_text("2")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runloop, "_pool_ready_waiting_count", lambda _client: 2)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        if len(calls) == 1:
+            target.write_text("4")
+        polls = [None, 0] if len(calls) < 2 else [0]
+        process = _ScriptedProcess(command, env, polls, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+    assert runloop._run_worker_pool(
+        _args(workers=4, worker_target_file=str(target)),
+    ) == 0
+    assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "3", "4"]
+    assert calls[0].signals == [] if hasattr(calls[0], "signals") else True
+    assert "scaling worker pool up: 2 -> 4" in capsys.readouterr().out
+
+
+def test_pool_live_target_scales_down_without_signalling_inflight_workers(
+        tmp_path, monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=4)
+    target = tmp_path / "workers"
+    target.write_text("4")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop, "_signal_workers",
+        lambda _processes: pytest.fail("live scale-down must not signal workers"),
+    )
+    monkeypatch.setattr(runloop, "_pool_ready_waiting_count", lambda _client: 4)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        on_poll = (lambda: target.write_text("2")) if len(calls) == 0 else None
+        polls = [None, 0] if len(calls) < 2 else [0]
+        process = _ScriptedProcess(
+            command, env, polls, on_poll=on_poll, **kwargs,
+        )
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+    assert runloop._run_worker_pool(
+        _args(workers=4, worker_target_file=str(target)),
+    ) == 0
+    assert len(calls) == 4
+    assert "scaling worker pool down: 4 -> 2" in capsys.readouterr().out
+
+
+def test_worker_above_live_target_retires_before_next_checkout(
+        tmp_path, monkeypatch):
+    target = tmp_path / "workers"
+    target.write_text("2")
+    monkeypatch.setenv("DRADAR_POOL_TARGET_FILE", str(target))
+    monkeypatch.setenv("DRADAR_WORKER_INDEX", "3")
+    monkeypatch.setenv("DRADAR_POOL_MAX_SIZE", "4")
+    monkeypatch.setenv("DRADAR_POOL_SIZE", "4")
+    runloop._POOL_TARGET_CACHE.clear()
+    assert runloop._worker_slot_is_enabled() is False
+    monkeypatch.setenv("DRADAR_WORKER_INDEX", "2")
+    assert runloop._worker_slot_is_enabled() is True
+
+
+def test_worker_keeps_last_valid_target_during_atomic_file_replacement(
+        tmp_path, monkeypatch):
+    target = tmp_path / "workers"
+    target.write_text("2")
+    monkeypatch.setenv("DRADAR_POOL_TARGET_FILE", str(target))
+    monkeypatch.setenv("DRADAR_WORKER_INDEX", "3")
+    monkeypatch.setenv("DRADAR_POOL_MAX_SIZE", "4")
+    monkeypatch.setenv("DRADAR_POOL_SIZE", "4")
+    runloop._POOL_TARGET_CACHE.clear()
+    assert runloop._worker_slot_is_enabled() is False
+    target.write_text("")
+    assert runloop._worker_slot_is_enabled() is False
 
 
 def test_manual_workers_warn_before_starting_on_small_docker_vm(
