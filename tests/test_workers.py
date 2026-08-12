@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -328,7 +329,7 @@ def test_pool_live_target_scales_up_without_restarting_existing_workers(
     target = tmp_path / "workers"
     target.write_text("2")
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runloop, "_pool_ready_waiting_count", lambda _client: 2)
+    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda _client: 2)
     calls = []
 
     def popen(command, env, **kwargs):
@@ -358,7 +359,7 @@ def test_pool_live_target_scales_down_without_signalling_inflight_workers(
         runloop, "_signal_workers",
         lambda _processes: pytest.fail("live scale-down must not signal workers"),
     )
-    monkeypatch.setattr(runloop, "_pool_ready_waiting_count", lambda _client: 4)
+    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda _client: 4)
     calls = []
 
     def popen(command, env, **kwargs):
@@ -518,7 +519,7 @@ def test_pool_abort_never_restores_a_worker(monkeypatch):
     _patch_pool_setup(monkeypatch, active_count=2)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        runloop, "_pool_ready_waiting_count",
+        runloop, "_pool_ready_work_count",
         lambda _client: pytest.fail("aborted pool must not inspect or backfill"),
     )
     calls = []
@@ -548,7 +549,7 @@ def test_pool_drain_keeps_active_siblings_running_without_backfill(
     _patch_pool_setup(monkeypatch, active_count=2)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        runloop, "_pool_ready_waiting_count",
+        runloop, "_pool_ready_work_count",
         lambda _client: pytest.fail("draining pool must not inspect or backfill"),
     )
     monkeypatch.setattr(
@@ -651,12 +652,71 @@ def test_ready_assignment_filter_excludes_running_paused_and_bad_retry_time():
     )
 
 
+def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
+    checkpoint = SimpleNamespace(
+        valid=True, checkpoint_id="cp-1", resume_generation=2,
+    )
+    monkeypatch.setattr(
+        runloop.checkpoints, "latest_by_assignment", lambda _home: {"a-2": checkpoint},
+    )
+    monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
+    monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
+    monkeypatch.setattr(runloop, "_checkpoint_backoff_seconds", lambda _item: 0)
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [
+                {"assignment_id": "a-1", "started_at": None},
+                {
+                    "assignment_id": "a-2", "started_at": "earlier",
+                    "execution_state": "paused", "runner_state": "resumable",
+                    "checkpoint_id": "cp-1", "resume_generation": 2,
+                },
+            ]}
+
+    assert runloop._pool_ready_work_count(Client()) == 2
+
+
+@pytest.mark.parametrize(
+    ("override", "local_override"),
+    [
+        ({"execution_state": "running"}, {}),
+        ({"runner_state": "running"}, {}),
+        ({"checkpoint_id": "different"}, {}),
+        ({"resume_generation": 3}, {}),
+        ({"resume_generation": "2"}, {}),
+        ({}, {"valid": False}),
+    ],
+)
+def test_backfill_rejects_unsafe_checkpoint_candidates(
+    monkeypatch, override, local_override,
+):
+    assignment = {
+        "assignment_id": "a-1", "started_at": "earlier",
+        "execution_state": "paused", "runner_state": "paused",
+        "checkpoint_id": "cp-1", "resume_generation": 2,
+    }
+    assignment.update(override)
+    checkpoint_values = {
+        "valid": True, "checkpoint_id": "cp-1", "resume_generation": 2,
+    }
+    checkpoint_values.update(local_override)
+    checkpoint = SimpleNamespace(**checkpoint_values)
+    monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
+    monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
+    monkeypatch.setattr(runloop, "_checkpoint_backoff_seconds", lambda _item: 0)
+
+    assert not runloop._assignment_is_recoverable_checkpoint(
+        assignment, {"a-1": checkpoint},
+    )
+
+
 def test_backfill_queue_read_fails_closed(monkeypatch, capsys):
     class Client:
         def get_assignment(self):
             raise runloop.ApiError("network unavailable")
 
-    assert runloop._pool_ready_waiting_count(Client()) is None
+    assert runloop._pool_ready_work_count(Client()) is None
     assert "keeping current workers only" in capsys.readouterr().out
 
 
