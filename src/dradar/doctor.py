@@ -274,7 +274,7 @@ def cmd_doctor(args) -> int:
             catalog_issue or "reinstall or upgrade dradar",
         )
         if deepseek_key_ready and catalog_ready:
-            _check("DeepSeek V4 Flash — Codex provider ready", True)
+            _check("DeepSeek V4 Flash / Pro — Codex provider ready", True)
     elif codex_ready:
         _check("codex — agent ready", True)
     elif claude_ready:

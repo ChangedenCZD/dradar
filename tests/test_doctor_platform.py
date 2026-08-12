@@ -293,4 +293,4 @@ def test_doctor_blocks_deepseek_when_official_catalog_is_invalid(
     assert rc == 1
     assert "[FAIL] DeepSeek Codex models.json — official catalog" in out
     assert "integrity check failed" in out
-    assert "DeepSeek V4 Flash — Codex provider ready" not in out
+    assert "DeepSeek V4 Flash / Pro — Codex provider ready" not in out

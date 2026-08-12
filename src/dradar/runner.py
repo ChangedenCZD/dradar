@@ -32,6 +32,7 @@ from .providers import (
     DEEPSEEK_CODEX_VERSION,
     DEEPSEEK_MIN_CODEX_VERSION,
     DEEPSEEK_MODEL,
+    DEEPSEEK_MODELS,
     DEEPSEEK_PROVIDER,
     DEEPSEEK_SUPPORTED_EFFORTS,
     GROK_AGENT,
@@ -348,7 +349,7 @@ def _ensure_codex_submission_prompt(
 
 
 def _ensure_deepseek_config(home: Path) -> Path:
-    path = home / "codex-deepseek-v4-flash.toml"
+    path = home / "codex-deepseek-v4.toml"
     return _materialize_shared_file(path, DEEPSEEK_TOML.encode())
 
 
@@ -410,10 +411,10 @@ def _deepseek_codex_version(assignment: dict) -> str:
 
 
 def _validate_deepseek_assignment(assignment: dict) -> None:
-    if assignment.get("model") != DEEPSEEK_MODEL:
+    if assignment.get("model") not in DEEPSEEK_MODELS:
         raise RunnerError(
             f"unsupported DeepSeek model {assignment.get('model')!r}; "
-            f"only {DEEPSEEK_MODEL!r} is enabled"
+            f"enabled models are {', '.join(DEEPSEEK_MODELS)}"
         )
     if assignment.get("effort") not in DEEPSEEK_SUPPORTED_EFFORTS:
         supported = ", ".join(sorted(DEEPSEEK_SUPPORTED_EFFORTS))

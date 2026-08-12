@@ -158,7 +158,7 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 dradar doctor
 ```
 
-### DeepSeek V4 Flash 补充 provider
+### DeepSeek V4 Flash / Pro 补充 provider
 
 DeepSeek 是 Codex 路径的可选补充，不会替换 `~/.codex/config.toml`、Codex
 `auth.json`、Claude 配置，也不会让原有任务自动切换 provider。只有在网页明确选择
@@ -171,6 +171,7 @@ dradar provider setup deepseek
 dradar provider status deepseek
 dradar doctor
 dradar go --pick TASK_ID:deepseek-v4-flash:max
+dradar go --pick TASK_ID:deepseek-v4-pro:high
 ```
 
 key 保存在 `~/.dradar/secrets/deepseek_api_key`，POSIX 系统权限固定为 `0600`，
@@ -181,15 +182,16 @@ auth 文件，再从 Pier 的继承环境中移除该变量。
 
 运行前 CLI 会校验随包发布的 DeepSeek 官方 Codex `models.json` 的 SHA-256，并由一个
 很窄的公开 Pier 子类把它上传到任务容器隔离的 `/tmp/codex-home/models.json`。文件缺失、
-被修改或不含 `high`/`max` 档位时，能力不会上报、`doctor` 会失败，任务也会在发出任何
+被修改或不含 `low`/`high`/`max` 档位时，能力不会上报、`doctor` 会失败，任务也会在发出任何
 付费模型请求前终止。目录启用后，上下文、自动压缩、推理摘要、并行工具和补丁工具等
 元数据均由目录决定，不再用本地 TOML 重复覆盖。
 
 当前公开边界：
 
-- 模型固定为 `deepseek-v4-flash`，有效 effort 只有 `high` 和 `max`；DeepSeek 接受的
-  `low`/`medium`、`xhigh` 只是这两档的兼容别名，不建立重复实验格。
-- 使用已验证的正式版 Codex `0.146.0`、Responses API，以及官方目录声明的
+- 模型固定为 `deepseek-v4-flash` 或 `deepseek-v4-pro`，两者的有效 effort 都是
+  `low`、`high` 和 `max`；DeepSeek 接受的
+  `medium`、`xhigh` 都映射到 `high`，不建立重复实验格。
+- 使用已验证的正式版 Codex `0.147.0`、Responses API，以及官方目录声明的
   1,048,576 token 上下文和 95% 有效上下文比例。
 - 基于公开 `datacurve-pier==0.3.0` 的标准 `codex` agent；附加代码只负责校验并上传
   官方模型目录，不包含 checkpoint 或任何 DRadar 私有 Pier 实现。
