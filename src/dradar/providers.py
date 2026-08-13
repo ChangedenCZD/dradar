@@ -29,19 +29,22 @@ DEEPSEEK_ENABLE_ENV = "DRADAR_ENABLE_DEEPSEEK"
 DEEPSEEK_SECRET_RELATIVE_PATH = Path("secrets") / "deepseek_api_key"
 DEEPSEEK_CAPABILITY = "codex-deepseek-v4-flash-v2"
 DEEPSEEK_PRO_CAPABILITY = "codex-deepseek-v4-pro-v1"
+DEEPSEEK_FLASH_OFF_CAPABILITY = "codex-deepseek-v4-flash-off-v1"
+DEEPSEEK_PRO_OFF_CAPABILITY = "codex-deepseek-v4-pro-off-v1"
 DEEPSEEK_CODEX_VERSION = "0.147.0"
 DEEPSEEK_MIN_CODEX_VERSION = "0.144.0"
-DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
+DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"off", "low", "high", "max"})
+DEEPSEEK_CATALOG_EFFORTS = frozenset({"none", "low", "high", "max"})
 DEEPSEEK_CATALOG_FILENAME = "deepseek_codex_models.json"
 DEEPSEEK_CATALOG_SHA256 = (
-    "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
+    "8cfa8ab037573ae9914478e6dcd544c43d93c1b126cab5ad58252230dcbe071d"
 )
 DEEPSEEK_CATALOG_REMOTE_PATH = "/tmp/codex-home/models.json"
 DEEPSEEK_CATALOG_SOURCE = (
     "https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.sh"
 )
-DEEPSEEK_CATALOG_SOURCE_VERSION = "1.0.0"
-DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v1"
+DEEPSEEK_CATALOG_SOURCE_VERSION = "1.1.0+dradar-off"
+DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v2"
 DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
 # Grok Build is intentionally subscription/OAuth-only.  In particular, the
@@ -105,7 +108,7 @@ def deepseek_catalog_error(path: Path | None = None) -> str | None:
             for item in entry.get("supported_reasoning_levels", [])
             if isinstance(item, dict)
         }
-        if not DEEPSEEK_SUPPORTED_EFFORTS <= efforts:
+        if not DEEPSEEK_CATALOG_EFFORTS <= efforts:
             return (
                 f"DeepSeek model catalog entry {model} is missing the "
                 "benchmark reasoning levels"
@@ -120,6 +123,12 @@ def assignment_codex_provider(assignment: dict) -> str | None:
         return None
     value = assignment.get("provider")
     return value if isinstance(value, str) and value else DEFAULT_CODEX_PROVIDER
+
+
+def deepseek_codex_reasoning_effort(effort: str) -> str:
+    """Translate the product's Off label to Responses API's ``none``."""
+
+    return "none" if effort == "off" else effort
 
 
 def deepseek_secret_path(home: Path | None = None) -> Path:
@@ -439,7 +448,12 @@ def advertised_capabilities(
 
     capabilities = []
     if deepseek_catalog_error() is None:
-        capabilities.extend((DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY))
+        capabilities.extend((
+            DEEPSEEK_CAPABILITY,
+            DEEPSEEK_PRO_CAPABILITY,
+            DEEPSEEK_FLASH_OFF_CAPABILITY,
+            DEEPSEEK_PRO_OFF_CAPABILITY,
+        ))
     # Unlike API-key providers, a subscription slot is scarce and stateful.
     # Advertise it only when both the CLI and a safe refreshable OAuth session
     # are actually present, preventing the server from assigning unusable work.
