@@ -35,6 +35,7 @@ from .providers import (
     DEEPSEEK_MODELS,
     DEEPSEEK_PROVIDER,
     DEEPSEEK_SUPPORTED_EFFORTS,
+    deepseek_codex_reasoning_effort,
     GROK_AGENT,
     GROK_API_KEY_ENV,
     GROK_CLI_VERSION,
@@ -684,7 +685,9 @@ def build_pier_command(
             raise RunnerError("DeepSeek model catalog was not prepared")
         cmd += [
             "--model", assignment["model"],
-            "--ak", f"reasoning_effort={assignment['effort']}",
+            "--ak", "reasoning_effort=" + deepseek_codex_reasoning_effort(
+                assignment["effort"]
+            ),
             "--ak", f"config_toml_file={config_path}",
             "--ak", f"model_catalog_json_file={deepseek_catalog}",
             "--ak", f"prompt_template_path={submission_prompt}",

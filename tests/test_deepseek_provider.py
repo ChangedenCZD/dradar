@@ -20,9 +20,11 @@ from dradar.providers import (
     DEEPSEEK_CATALOG_REMOTE_PATH,
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_CODEX_VERSION,
+    DEEPSEEK_FLASH_OFF_CAPABILITY,
     DEEPSEEK_MODEL,
     DEEPSEEK_MODELS,
     DEEPSEEK_PRO_CAPABILITY,
+    DEEPSEEK_PRO_OFF_CAPABILITY,
     DEEPSEEK_PRO_MODEL,
     DEEPSEEK_PROVIDER,
     advertised_capabilities,
@@ -76,9 +78,11 @@ def _command(tmp_path: Path, monkeypatch, assignment=None) -> tuple[list[str], P
 def test_capability_advertises_software_support_before_first_key_setup():
     assert advertised_capabilities({}) == (
         DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
+        DEEPSEEK_FLASH_OFF_CAPABILITY, DEEPSEEK_PRO_OFF_CAPABILITY,
     )
     assert advertised_capabilities({DEEPSEEK_API_KEY_ENV: "key"}) == (
         DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
+        DEEPSEEK_FLASH_OFF_CAPABILITY, DEEPSEEK_PRO_OFF_CAPABILITY,
     )
 
 
@@ -96,7 +100,7 @@ def test_bundled_catalog_has_expected_integrity_and_reasoning_levels():
     assert deepseek_catalog_error(catalog) is None
     for model in DEEPSEEK_MODELS:
         assert {level["effort"] for level in by_slug[model]["supported_reasoning_levels"]} >= {
-            "low", "high", "max",
+            "none", "low", "high", "max",
         }
     assert flash["supports_parallel_tool_calls"] is True
     assert flash["apply_patch_tool_type"] == "freeform"
@@ -187,6 +191,21 @@ def test_command_routes_pro_with_its_requested_reasoning_effort(
     assert command[command.index("--model") + 1] == DEEPSEEK_PRO_MODEL
     assert "reasoning_effort=high" in command
     assert f"version={DEEPSEEK_CODEX_VERSION}" in command
+
+
+@pytest.mark.parametrize("model", DEEPSEEK_MODELS)
+def test_command_routes_product_off_to_responses_api_none(
+    tmp_path: Path,
+    monkeypatch,
+    model: str,
+):
+    command, _home = _command(
+        tmp_path,
+        monkeypatch,
+        _assignment(model=model, effort="off"),
+    )
+    assert "reasoning_effort=none" in command
+    assert "reasoning_effort=off" not in command
 
 
 def test_deepseek_shared_inputs_are_reused_and_owner_only(
