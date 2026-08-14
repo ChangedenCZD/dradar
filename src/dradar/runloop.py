@@ -683,6 +683,58 @@ def _dsh_trial_usage(trial_dir: Path) -> dict | None:
     }
 
 
+def _dsh_completed_outcome(
+    trial_dir: Path, patch: Path, result: Path | None,
+) -> dict | None:
+    """Return pinned DSH completion evidence after a Pier post-run failure.
+
+    Pier's process can fail after the in-container agent has completed and the
+    task hook has harvested a valid patch.  That outer rc must not discard paid
+    work, but a non-empty patch alone is insufficient: API failures can leave a
+    partial or empty artifact too.  The pinned headless runner therefore writes
+    a minimal terminal sidecar before Pier starts post-run collection.  Recover
+    only when that sidecar, result timestamps, exception state, and git diff all
+    independently agree that the agent completed.
+    """
+    outcome_path = trial_dir / "agent" / "dsh-home" / "dsh-outcome.json"
+    try:
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+        result_value = json.loads(result.read_text(encoding="utf-8")) if result else None
+        patch_bytes = patch.read_bytes()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(outcome, dict) or not isinstance(result_value, dict):
+        return None
+    request_count = outcome.get("requestCount")
+    if (
+        outcome.get("schema") != "dradar-dsh-outcome-v1"
+        or outcome.get("terminalKind") != "completed"
+        or outcome.get("agentCompleted") is not True
+        or outcome.get("errorCode") is not None
+        or not isinstance(request_count, int)
+        or isinstance(request_count, bool)
+        or request_count < 1
+    ):
+        return None
+    agent_execution = result_value.get("agent_execution")
+    if (
+        result_value.get("exception_info")
+        or not result_value.get("started_at")
+        or not result_value.get("finished_at")
+        or not isinstance(agent_execution, dict)
+        or not agent_execution.get("started_at")
+        or not agent_execution.get("finished_at")
+        or not patch_bytes
+        or not patch_structure_is_valid(patch_bytes)
+    ):
+        return None
+    return {
+        "schema": outcome["schema"],
+        "terminal_kind": outcome["terminalKind"],
+        "request_count": request_count,
+    }
+
+
 def _upload_trial(
     client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
 ) -> str:
@@ -1215,9 +1267,24 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     )
 
     stats = summarize_result(art.result)
-    # An interrupted/failed run (nonzero pier rc or recorded exception) is not a
-    # model failure: report it so the server marks it invalid, not graded 0.
-    interrupted = art.returncode != 0 or stats.get("exception_info")
+    # A recorded agent exception is always interrupted.  For pinned DSH only,
+    # a nonzero outer Pier rc may happen after the agent completed and the task
+    # hook harvested its patch.  Accept that paid work only with the independent
+    # terminal sidecar + result timestamps + structurally valid patch added by
+    # this CLI version; older opaque rc=1 runs remain invalid and require an
+    # audited operator recovery.
+    dsh_completion = None
+    if (
+        assignment.get("agent") == DSH_AGENT
+        and art.returncode != 0
+        and not stats.get("exception_info")
+    ):
+        dsh_completion = _dsh_completed_outcome(
+            art.trial_dir, art.patch, art.result,
+        )
+    interrupted = bool(stats.get("exception_info")) or (
+        art.returncode != 0 and dsh_completion is None
+    )
     diag = diagnose_exception(art.result) if interrupted else {}
     failure_kind = diag.get("kind")
     terminal_outcome = _terminal_failure_outcome(failure_kind)
@@ -1236,6 +1303,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         )
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
           f"outcome={outcome}); uploading...")
+    if dsh_completion is not None:
+        print(
+            "DSH agent completed and produced a verified patch; treating the "
+            "nonzero Pier return code as a post-run infrastructure warning"
+        )
     if interrupted:
         # Say what ACTUALLY failed. pier's rc=0 covers only its own process;
         # the recorded exception carries the in-container agent's real error
@@ -1292,6 +1364,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "dsh_minimal_tools": ["bash", "str_replace_editor"],
             "dsh_native_efforts": ["off", "high", "max"],
         })
+        if dsh_completion is not None:
+            meta.update({
+                "dsh_completion_evidence": dsh_completion,
+                "pier_postrun_warning": True,
+                "pier_failure_phase": "post_agent",
+            })
 
     if item is not None and item.job_dir == art.job_dir:
         checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
