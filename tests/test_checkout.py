@@ -147,6 +147,56 @@ def test_supervised_worker_stops_checkout_after_any_failed_outcome(
     assert "before resuming" in capsys.readouterr().out
 
 
+def test_auto_batch_stops_after_failure_without_checking_out_next_task(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        return "failed"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    client = CheckoutClient(
+        {"active": [_cell("bad")], "free_pick": True},
+        [{"assignment": _cell("bad"), "held": 2, "unstarted": 1},
+         {"assignment": _cell("must-not-run"), "held": 2, "unstarted": 0}],
+    )
+    args = _args(auto=2)
+
+    rc = runloop._run_checkout_loop(args, client, tmp_path, [_cell("bad")])
+
+    assert rc == 1
+    assert attempts == ["bad"]
+    assert client.checkout_exclusions == [set()]
+    assert len(client._checkouts) == 1
+    assert "automatic batch runner" in capsys.readouterr().out
+
+
+def test_multi_cell_resume_stops_after_failure_without_auto_flag(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+    monkeypatch.setattr(
+        runloop, "_run_and_submit",
+        lambda _client, assignment, *_a, **_kw: (
+            attempts.append(assignment["assignment_id"]) or "failed"
+        ),
+    )
+    cells = [_cell("bad"), _cell("must-not-run")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [{"assignment": cells[0], "held": 2, "unstarted": 1},
+         {"assignment": cells[1], "held": 2, "unstarted": 0}],
+    )
+
+    rc = runloop._run_checkout_loop(_args(), client, tmp_path, cells)
+
+    assert rc == 1
+    assert attempts == ["bad"]
+    assert len(client._checkouts) == 1
+
+
 def test_checkout_loop_fuses_after_environment_build_failure(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
@@ -189,7 +239,7 @@ def test_checkout_loop_fuses_after_interrupted_trial(monkeypatch, capsys, tmp_pa
     assert rc == 0
     assert attempts == ["network-failure"]
     assert len(client._checkouts) == 1
-    assert "stopping this batch runner" in capsys.readouterr().out
+    assert "stopping this automatic batch runner" in capsys.readouterr().out
 
 
 def test_checkout_loop_always_fuses_after_insufficient_balance(
