@@ -70,6 +70,33 @@ def test_server_can_slow_cadence_but_not_make_it_pathological():
     assert telemetry._send_once() == 30
 
 
+def test_server_notices_are_bounded_validated_and_printed_once(capsys):
+    notice = {
+        "id": "dsh-usage-upgrade-20260814",
+        "severity": "warning",
+        "message": "当前任务继续运行。\n完成后刷新 CLI。",
+    }
+    client = FakeClient([
+        {"next_heartbeat_sec": 60, "notices": [notice]},
+        {"next_heartbeat_sec": 60, "notices": [notice]},
+        {"next_heartbeat_sec": 60, "notices": [
+            {"id": "bad", "severity": "unknown", "message": "ignored"},
+            "not-an-object",
+        ]},
+    ])
+    telemetry = RunnerTelemetry(client, jitter=False)
+
+    telemetry._send_once()
+    telemetry._send_once()
+    telemetry._send_once()
+
+    err = capsys.readouterr().err
+    assert err.count("dsh-usage-upgrade-20260814") == 0
+    assert err.count("server notice [warning]") == 1
+    assert "当前任务继续运行。 完成后刷新 CLI。" in err
+    assert "ignored" not in err
+
+
 def test_three_failures_warn_once_then_recovery_is_visible(capsys):
     client = FakeClient([
         ApiError("offline"), ApiError("offline"), ApiError("offline"),

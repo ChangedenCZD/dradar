@@ -66,6 +66,31 @@ class RunnerTelemetry:
         self._warned = False
         self._disabled = False
         self._jitter = jitter
+        self._shown_notice_ids: set[str] = set()
+
+    def _show_notices(self, response: dict) -> None:
+        """Print each bounded server notice at most once per runner process."""
+        notices = response.get("notices")
+        if not isinstance(notices, list):
+            return
+        for value in notices[:10]:
+            if not isinstance(value, dict):
+                continue
+            notice_id = value.get("id")
+            message = value.get("message")
+            severity = value.get("severity", "info")
+            if (
+                not isinstance(notice_id, str)
+                or not 1 <= len(notice_id) <= 100
+                or not isinstance(message, str)
+                or not 1 <= len(message) <= 1000
+                or severity not in {"info", "warning", "critical"}
+                or notice_id in self._shown_notice_ids
+            ):
+                continue
+            self._shown_notice_ids.add(notice_id)
+            clean = " ".join(message.splitlines())
+            print(f"server notice [{severity}]: {clean}", file=sys.stderr)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -159,6 +184,7 @@ class RunnerTelemetry:
                 print("runner heartbeat recovered", file=sys.stderr)
             self._failures = 0
             self._warned = False
+            self._show_notices(response)
             if response.get("batch_id"):
                 with self._lock:
                     self._batch_id = response["batch_id"]
