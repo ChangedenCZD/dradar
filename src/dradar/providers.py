@@ -33,7 +33,9 @@ DEEPSEEK_FLASH_OFF_CAPABILITY = "codex-deepseek-v4-flash-off-v1"
 DEEPSEEK_PRO_OFF_CAPABILITY = "codex-deepseek-v4-pro-off-v1"
 DEEPSEEK_CODEX_VERSION = "0.147.0"
 DEEPSEEK_MIN_CODEX_VERSION = "0.144.0"
-DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"off", "low", "high", "max"})
+# The bundled upstream catalog still describes ``low`` for integrity and
+# compatibility checks, but DRadar's public DeepSeek Codex lane retires it.
+DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})
 DEEPSEEK_CATALOG_EFFORTS = frozenset({"none", "low", "high", "max"})
 DEEPSEEK_CATALOG_FILENAME = "deepseek_codex_models.json"
 DEEPSEEK_CATALOG_SHA256 = (
