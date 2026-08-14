@@ -1113,6 +1113,7 @@ def _mark_stopped_quietly(
     assignment: dict | str,
     *,
     defer_seconds: int = 300,
+    failure_kind: str | None = None,
 ) -> bool:
     """Best-effort checkout cleanup with bounded retry and visible failure.
 
@@ -1133,6 +1134,8 @@ def _mark_stopped_quietly(
             stop_kwargs = {"defer_seconds": defer_seconds}
             if resume_generation is not None:
                 stop_kwargs["resume_generation"] = resume_generation
+            if failure_kind is not None:
+                stop_kwargs["failure_kind"] = failure_kind
             client.mark_stopped(assignment_id, **stop_kwargs)
             return True
         except ApiError as exc:
@@ -1292,8 +1295,10 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                   "`dradar resume` (still free: the agent never started), or "
                   "use `dradar release` if you do not want to keep the cell")
             if _pause_checkpoint_quietly(client, assignment) is None:
-                _mark_stopped_quietly(client, assignment)
-            return "failed"
+                _mark_stopped_quietly(
+                    client, assignment, failure_kind="environment_build_failed",
+                )
+            return "environment-build-failed"
         except RunnerError as exc:
             failure_kind = classify_exception_message(str(exc))
             terminal_outcome = _terminal_failure_outcome(failure_kind)
@@ -1306,7 +1311,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             print(f"trial failed: {exc}\n"
                   "use `dradar resume` to retry later, or `dradar release` to "
                   "give the cell back")
-            _mark_stopped_quietly(client, assignment)
+            _mark_stopped_quietly(
+                client,
+                assignment,
+                failure_kind=failure_kind or "runner_failed",
+            )
             return terminal_outcome or "failed"
         except (KeyboardInterrupt, EOFError):
             # A user can interrupt before an agent has produced a resumable
@@ -1316,7 +1325,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             # while every later ``dradar resume`` sees it as already checked
             # out and has nothing it can start.
             if _pause_checkpoint_quietly(client, assignment) is None:
-                _mark_stopped_quietly(client, assignment, defer_seconds=0)
+                _mark_stopped_quietly(
+                    client,
+                    assignment,
+                    defer_seconds=0,
+                    failure_kind="user_interrupted",
+                )
             raise
 
     # Make the authoritative source copy immediately after Pier returns,
@@ -2689,6 +2703,13 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
         if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
             _announce_account_stop(outcome)
             break
+        if outcome == "environment-build-failed":
+            print(
+                "stopping this batch after repeated environment setup failures; "
+                "no later cell will be started. Fix Docker/network/Pier, then run "
+                "`dradar resume`."
+            )
+            break
     ok = all(o in ("submitted", "interrupted") for o in results)
     return 0 if ok else 1
 
@@ -2791,6 +2812,19 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             if getattr(args, "refill", False):
                 refill_plan.stop(HOME, f"account stop: {outcome}")
             _announce_account_stop(outcome)
+            results.append(outcome)
+            break
+        if outcome == "environment-build-failed":
+            if getattr(args, "refill", False):
+                refill_plan.stop(HOME, "local environment build failed")
+            _signal_pool_abort(
+                "local environment build failed", interrupt_siblings=False,
+            )
+            print(
+                "stopping this worker before the next checkout after repeated "
+                "environment setup failures. Fix Docker/network/Pier, then run "
+                "`dradar resume`."
+            )
             results.append(outcome)
             break
         fail_fast = os.environ.get("DRADAR_BATCH_FAIL_FAST", "").lower() in {

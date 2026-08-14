@@ -304,8 +304,12 @@ class ApiClient:
         return self._post("/api/v1/runner/close", json=payload, timeout=3.0)
 
     def mark_stopped(
-        self, assignment_id: str, *, defer_seconds: int = 300,
+        self,
+        assignment_id: str,
+        *,
+        defer_seconds: int = 300,
         resume_generation: int | None = None,
+        failure_kind: str | None = None,
     ) -> dict[str, Any]:
         """The counterpart of mark_started: this trial died client-side
         (build flake, agent crash, abandonment) with nothing uploaded, so the
@@ -319,6 +323,8 @@ class ApiClient:
         }
         if resume_generation is not None:
             data["resume_generation"] = str(resume_generation)
+        if failure_kind:
+            data["failure_kind"] = failure_kind
         return self._post(
             "/api/v1/assignment/stopped",
             # A cross-session cooldown keeps a second `--parallel` process

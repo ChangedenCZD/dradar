@@ -120,6 +120,27 @@ def test_checkout_loop_never_retries_a_cell_that_failed_this_session(
     assert rc == 1                            # the failure still fails the run
 
 
+def test_checkout_loop_fuses_after_environment_build_failure(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runloop, "_run_and_submit",
+        lambda *a, **kw: "environment-build-failed",
+    )
+    client = CheckoutClient(
+        {"active": [_cell("broken")], "free_pick": True},
+        [{"assignment": _cell("broken"), "held": 2, "unstarted": 1},
+         {"assignment": _cell("must-not-run"), "held": 2, "unstarted": 0}],
+    )
+
+    rc = runloop._go_menu(_args(), {}, client, tmp_path)
+
+    assert rc == 1
+    assert client.checkout_exclusions == [set()]
+    assert len(client._checkouts) == 1
+    assert "before the next checkout" in capsys.readouterr().out
+
+
 def test_checkout_loop_fuses_after_interrupted_trial(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("DRADAR_BATCH_FAIL_FAST", "1")
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)

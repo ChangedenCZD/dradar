@@ -233,7 +233,10 @@ def test_failed_trial_reports_stopped_to_server(monkeypatch, tmp_path):
     client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
     tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
     assert tag == "failed"
-    assert stopped == [(ASSIGNMENT["assignment_id"], {"defer_seconds": 300})]
+    assert stopped == [(
+        ASSIGNMENT["assignment_id"],
+        {"defer_seconds": 300, "failure_kind": "runner_failed"},
+    )]
 
 
 def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
@@ -251,7 +254,10 @@ def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
     with pytest.raises(KeyboardInterrupt):
         runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
 
-    assert stopped == [(ASSIGNMENT["assignment_id"], {"defer_seconds": 0})]
+    assert stopped == [(
+        ASSIGNMENT["assignment_id"],
+        {"defer_seconds": 0, "failure_kind": "user_interrupted"},
+    )]
 
 
 def test_user_interrupt_with_checkpoint_keeps_server_paused(
