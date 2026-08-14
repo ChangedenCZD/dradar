@@ -2496,6 +2496,19 @@ def _run_worker_pool(args) -> int:
                     continue
                 returncodes.append((slot, returncode))
                 del active_processes[slot]
+                if returncode != 0 and not backfill_disabled:
+                    # A child already returned its failed assignment to a
+                    # retryable state. Replacing that child automatically can
+                    # pick the same cell again as soon as its cooldown expires
+                    # (or rotate through other cells with the same local
+                    # fault). Drain only: paid sibling runs stay untouched,
+                    # while an explicit later `dradar resume` starts a fresh
+                    # pool after the operator has inspected the failure.
+                    backfill_disabled = True
+                    print(
+                        f"worker {slot} exited {returncode}; disabling automatic "
+                        "backfill and draining workers already in flight"
+                    )
 
             if not active_processes:
                 break
@@ -2827,7 +2840,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             )
             results.append(outcome)
             break
-        fail_fast = os.environ.get("DRADAR_BATCH_FAIL_FAST", "").lower() in {
+        configured_fail_fast = os.environ.get(
+            "DRADAR_BATCH_FAIL_FAST", "",
+        ).lower() in {
             "1", "true", "yes", "on",
         }
         if getattr(args, "refill", False):
@@ -2879,11 +2894,17 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 elif replenished.get("status") == "stopped":
                     print(f"continuous refill stopped: "
                           f"{replenished.get('reason') or 'safety limit reached'}")
-        if fail_fast and outcome != "submitted":
+        worker_failure = (
+            getattr(args, "worker_child", False)
+            and outcome not in ("submitted", "interrupted")
+        )
+        configured_failure = configured_fail_fast and outcome != "submitted"
+        if worker_failure or configured_failure:
             # Large operator-managed batches should fail closed: continuing to
             # drain the queue turned one shared proxy incident into 27 invalid
-            # submissions on 2026-07-16. Keep ordinary volunteer behavior
-            # unchanged unless the dedicated batch launcher opts in.
+            # submissions on 2026-07-16. Supervised children also fail closed
+            # so their parent can drain healthy siblings without respawning a
+            # worker onto the same cooled-down assignment.
             print(f"stopping this batch runner after outcome={outcome} — fix "
                   "the shared agent/network issue before resuming")
             results.append(outcome)
