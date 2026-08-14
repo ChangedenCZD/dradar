@@ -15,6 +15,11 @@ from dradar.providers import (
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_RUN_CONFIG_VERSION,
     DEEPSEEK_RUNTIME_PROFILE,
+    DSH_AGENT,
+    DSH_FLASH_MODEL,
+    DSH_RUN_CONFIG_VERSION,
+    DSH_RUNTIME_PROFILE,
+    DSH_VERSION,
 )
 from dradar.runner import RunnerError, TrialArtifacts
 
@@ -589,6 +594,35 @@ def test_deepseek_submission_attests_catalog_and_runtime_profile(
     assert meta["model_config_version"] == DEEPSEEK_RUN_CONFIG_VERSION
     assert meta["model_catalog_sha256"] == DEEPSEEK_CATALOG_SHA256
     assert meta["model_runtime_profile"] == DEEPSEEK_RUNTIME_PROFILE
+
+
+def test_dsh_submission_attests_minimal_native_runtime(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    art = _fake_art(tmp_path, rc=0, codex_cli_version=None)
+    art.dsh_version = DSH_VERSION
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+    assignment = {
+        **ASSIGNMENT,
+        "agent": DSH_AGENT,
+        "provider": "deepseek",
+        "model": DSH_FLASH_MODEL,
+        "effort": "off",
+    }
+
+    tag = runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "submitted"
+    meta = client.submissions[0]["meta"]
+    assert meta["dsh_version"] == DSH_VERSION
+    assert meta["model_config_version"] == DSH_RUN_CONFIG_VERSION
+    assert meta["model_runtime_profile"] == DSH_RUNTIME_PROFILE
+    assert meta["dsh_minimal_tools"] == ["bash", "str_replace_editor"]
+    assert meta["dsh_native_efforts"] == ["off", "high", "max"]
 
 
 def test_nonzero_pier_rc_submits_outcome_interrupted_with_meta(monkeypatch, tmp_path: Path):

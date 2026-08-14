@@ -27,6 +27,8 @@ from dradar.providers import (
     DEEPSEEK_PRO_OFF_CAPABILITY,
     DEEPSEEK_PRO_MODEL,
     DEEPSEEK_PROVIDER,
+    DSH_FLASH_CAPABILITY,
+    DSH_PRO_CAPABILITY,
     advertised_capabilities,
     assignment_codex_provider,
     deepseek_catalog_error,
@@ -83,6 +85,7 @@ def test_capability_advertises_software_support_before_first_key_setup():
     assert advertised_capabilities({DEEPSEEK_API_KEY_ENV: "key"}) == (
         DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
         DEEPSEEK_FLASH_OFF_CAPABILITY, DEEPSEEK_PRO_OFF_CAPABILITY,
+        DSH_FLASH_CAPABILITY, DSH_PRO_CAPABILITY,
     )
 
 

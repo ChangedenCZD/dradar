@@ -36,6 +36,10 @@ from .providers import (
     DEEPSEEK_PROVIDER,
     DEEPSEEK_SUPPORTED_EFFORTS,
     deepseek_codex_reasoning_effort,
+    DSH_AGENT,
+    DSH_MODELS,
+    DSH_SUPPORTED_EFFORTS,
+    DSH_VERSION,
     GROK_AGENT,
     GROK_API_KEY_ENV,
     GROK_CLI_VERSION,
@@ -43,6 +47,7 @@ from .providers import (
     GROK_PROVIDER,
     GROK_SUPPORTED_EFFORTS,
     assignment_codex_provider,
+    create_deepseek_api_key_file,
     create_deepseek_auth_json,
     deepseek_catalog_error,
     deepseek_catalog_path,
@@ -98,6 +103,25 @@ DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
 GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
 GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
+DSH_AGENT_IMPORT_PATH = "_dradar_pier_dsh:DshMinimal"
+DSH_AGENT_MODULE_FILENAME = "_dradar_pier_dsh.py"
+
+# Public Pier 0.3.0 only runs ``<task>/pre_artifacts.sh``.  Older published
+# DeepSWE packs may not contain that hook, so DSH gets a per-run compatibility
+# overlay with this narrow, deterministic collector.  The shared checkout is
+# never modified and the overlay disappears with the provider context.
+DSH_PRE_ARTIFACTS_SCRIPT = """#!/bin/sh
+set -eu
+cd /app
+mkdir -p /logs/artifacts
+base_ref='__DRADAR_BASE_COMMIT__'
+if [ -n "$base_ref" ]; then
+  base=$(git rev-parse --verify "${base_ref}^{commit}")
+else
+  base=$(git rev-list --max-parents=0 HEAD | tail -1)
+fi
+git diff --binary "$base" HEAD > /logs/artifacts/model.patch
+"""
 
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
 CLAUDE_DISALLOWED_TOOLS = "WebSearch WebFetch EnterPlanMode"
@@ -141,6 +165,7 @@ class TrialArtifacts:
     log_path: Path
     codex_cli_version: str | None = None
     grok_cli_version: str | None = None
+    dsh_version: str | None = None
 
 
 class RunnerError(RuntimeError):
@@ -386,6 +411,19 @@ def _ensure_grok_agent_module(home: Path) -> Path:
     )
 
 
+def _ensure_dsh_agent_module(home: Path) -> Path:
+    """Expose only the pinned standalone DSH adapter to public Pier."""
+
+    source = Path(__file__).with_name("pier_dsh.py")
+    if not source.is_file():
+        raise RunnerError(
+            "DSH Minimal Pier adapter is missing; reinstall or upgrade dradar"
+        )
+    return _materialize_shared_file(
+        home / DSH_AGENT_MODULE_FILENAME, source.read_bytes()
+    )
+
+
 def _version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))
 
@@ -450,11 +488,37 @@ def _validate_grok_assignment(assignment: dict) -> None:
         )
 
 
+def _validate_dsh_assignment(assignment: dict) -> None:
+    if assignment.get("provider") != DEEPSEEK_PROVIDER:
+        raise RunnerError(
+            "DSH Minimal assignments must explicitly use provider "
+            f"{DEEPSEEK_PROVIDER!r}"
+        )
+    if assignment.get("model") not in DSH_MODELS:
+        raise RunnerError(
+            f"unsupported DSH model {assignment.get('model')!r}; enabled "
+            f"models are {', '.join(DSH_MODELS)}"
+        )
+    if assignment.get("effort") not in DSH_SUPPORTED_EFFORTS:
+        supported = ", ".join(sorted(DSH_SUPPORTED_EFFORTS))
+        raise RunnerError(
+            f"DSH effort must be one of {supported}; "
+            f"got {assignment.get('effort')!r}"
+        )
+    requested = assignment.get("agent_version") or DSH_VERSION
+    if requested != DSH_VERSION:
+        raise RunnerError(
+            f"DSH Minimal runs are pinned to {DSH_VERSION}; "
+            f"the server requested unverified {requested!r}"
+        )
+
+
 def _pier_process_env(
     assignment: dict,
     *,
     deepseek_module_dir: Path | None = None,
     grok_module_dir: Path | None = None,
+    dsh_module_dir: Path | None = None,
 ) -> dict[str, str]:
     """Keep provider secrets out of Pier's inherited environment."""
 
@@ -477,6 +541,12 @@ def _pier_process_env(
         env.pop("PYTHONHOME", None)
         if grok_module_dir is not None:
             env["PYTHONPATH"] = str(grok_module_dir)
+    if assignment.get("agent") == DSH_AGENT:
+        env.pop(DEEPSEEK_API_KEY_ENV, None)
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        if dsh_module_dir is not None:
+            env["PYTHONPATH"] = str(dsh_module_dir)
     return env
 
 
@@ -563,7 +633,7 @@ def build_pier_command(
         # A developer override from another agent family predates provider
         # support and must retain the original OpenAI behavior.
         provider = DEFAULT_CODEX_PROVIDER
-    if provider == DEEPSEEK_PROVIDER:
+    if provider == DEEPSEEK_PROVIDER or agent == DSH_AGENT:
         # Keep the provider independent of DRadar's legacy checkpoint Pier
         # build. uvx resolves this exact public PyPI release in an isolated
         # tool environment; PYTHONPATH later exposes only the narrow catalog
@@ -582,7 +652,7 @@ def build_pier_command(
             ]
         else:
             raise RunnerError(
-                "uv/uvx is required for the isolated public DeepSeek runner"
+                "uv/uvx is required for the isolated public DeepSeek/DSH runner"
             )
     else:
         pier = shutil.which("pier")
@@ -611,6 +681,15 @@ def build_pier_command(
                 "fresh explicit run"
             )
         agent_args = ["--agent-import-path", GROK_AGENT_IMPORT_PATH]
+    elif agent == DSH_AGENT:
+        _validate_dsh_assignment(assignment)
+        _ensure_dsh_agent_module(home)
+        if resume_checkpoint is not None:
+            raise RunnerError(
+                "DSH Minimal checkpoints are not supported yet; start a fresh "
+                "explicit run"
+            )
+        agent_args = ["--agent-import-path", DSH_AGENT_IMPORT_PATH]
     else:
         agent_args = ["--agent", agent]
     cmd = [
@@ -715,6 +794,22 @@ def build_pier_command(
             "--ae", "API_TIMEOUT_MS=3000000",
             "--ae", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000",
             "--ae", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000",
+        ]
+    elif agent == DSH_AGENT:
+        if provider_auth_path is None or not provider_auth_path.is_file():
+            raise RunnerError(
+                "DSH runtime credential is unavailable; run "
+                "`dradar provider setup deepseek` in your own interactive Terminal"
+            )
+        submission_prompt = _ensure_codex_submission_prompt(
+            home, assignment.get("benchmark_id")
+        )
+        cmd += [
+            "--model", assignment["model"],
+            "--ak", f"reasoning_effort={assignment['effort']}",
+            "--ak", f"api_key_file={provider_auth_path}",
+            "--ak", f"prompt_template_path={submission_prompt}",
+            "--ak", f"version={DSH_VERSION}",
         ]
     elif agent == GROK_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -1446,6 +1541,81 @@ def _trial_timeout_sec(assignment: dict) -> int:
     return max(3600, int(est_min) * 60 * 4)
 
 
+@contextmanager
+def _dsh_tasks_overlay(
+    assignment: dict,
+    tasks_root: Path,
+    work_dir: Path,
+    job_name: str,
+):
+    """Supply public Pier's artifact hook without mutating the task pack."""
+
+    task_id = assignment.get("task_id")
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or Path(task_id).name != task_id
+    ):
+        raise RunnerError(f"unsafe DSH task id {task_id!r}")
+    source = tasks_root / task_id
+    if not source.is_dir():
+        raise RunnerError(f"DSH task directory is missing: {source}")
+    task_toml = source / "task.toml"
+    try:
+        task_text = task_toml.read_text(encoding="utf-8")
+        task_config = tomllib.loads(task_text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise RunnerError(f"DSH task.toml is unreadable: {exc}") from exc
+    no_network = task_config.get("agent", {}).get("network_mode") == "no-network"
+    allow_internet = task_config.get("environment", {}).get("allow_internet")
+    if no_network and allow_internet is True:
+        raise RunnerError(
+            "DSH task has contradictory no-network/allow_internet=true policy"
+        )
+    needs_network_fence = no_network and allow_internet is not False
+    needs_artifact_hook = not (source / "pre_artifacts.sh").is_file()
+    base_commit = task_config.get("metadata", {}).get("base_commit_hash", "")
+    if not isinstance(base_commit, str) or (
+        base_commit and re.fullmatch(r"[0-9a-f]{40}", base_commit) is None
+    ):
+        raise RunnerError("DSH task has an invalid metadata.base_commit_hash")
+    if not needs_network_fence and not needs_artifact_hook:
+        yield tasks_root
+        return
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{job_name}-dsh-task-", dir=work_dir,
+    ) as temporary:
+        overlay_root = Path(temporary)
+        overlay_task = overlay_root / task_id
+        shutil.copytree(source, overlay_task, symlinks=True)
+        if needs_network_fence:
+            environment_header = re.search(
+                r"(?m)^\[environment\][ \t]*(?:#.*)?$", task_text
+            )
+            if environment_header is None:
+                task_text = task_text.rstrip() + "\n\n[environment]\nallow_internet = false\n"
+            else:
+                insert_at = environment_header.end()
+                task_text = (
+                    task_text[:insert_at]
+                    + "\nallow_internet = false"
+                    + task_text[insert_at:]
+                )
+            (overlay_task / "task.toml").write_text(task_text, encoding="utf-8")
+        if needs_artifact_hook:
+            hook = overlay_task / "pre_artifacts.sh"
+            hook.write_text(
+                DSH_PRE_ARTIFACTS_SCRIPT.replace(
+                    "__DRADAR_BASE_COMMIT__", base_commit
+                ),
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+        yield overlay_root
+
+
 def run_trial(
     assignment: dict,
     tasks_root: Path,
@@ -1456,6 +1626,7 @@ def run_trial(
 ) -> TrialArtifacts:
     effective_assignment = assignment
     codex_cli_version = None
+    dsh_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
     if effective_agent == "codex":
@@ -1486,6 +1657,14 @@ def run_trial(
             "agent_version": GROK_CLI_VERSION,
         }
         print(f"verified pinned Grok subscription CLI: {GROK_CLI_VERSION}")
+    elif effective_agent == DSH_AGENT:
+        _validate_dsh_assignment(assignment)
+        dsh_version = DSH_VERSION
+        effective_assignment = {
+            **assignment,
+            "agent_version": dsh_version,
+        }
+        print(f"verified pinned DSH Minimal: {dsh_version}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = work_dir / "jobs"
@@ -1504,7 +1683,7 @@ def run_trial(
     live_error_offsets: dict[Path, int] = {}
     live_error_counts: dict[str, int] = {}
     watch_live_account_errors = (
-        (dev_agent or effective_assignment["agent"]) == "codex"
+        (dev_agent or effective_assignment["agent"]) in ("codex", DSH_AGENT)
     )
 
     provider_auth_path = None
@@ -1514,6 +1693,11 @@ def run_trial(
         if codex_provider == DEEPSEEK_PROVIDER:
             try:
                 provider_auth_path = create_deepseek_auth_json(work_dir)
+            except (OSError, ValueError) as exc:
+                raise RunnerError(str(exc)) from exc
+        elif effective_agent == DSH_AGENT:
+            try:
+                provider_auth_path = create_deepseek_api_key_file(work_dir)
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
         elif effective_agent == GROK_AGENT:
@@ -1532,17 +1716,30 @@ def run_trial(
                     if effective_agent == GROK_AGENT else {}
                 ),
             }
-            if codex_provider == DEEPSEEK_PROVIDER or effective_agent == GROK_AGENT
+            if (
+                codex_provider == DEEPSEEK_PROVIDER
+                or effective_agent in (GROK_AGENT, DSH_AGENT)
+            )
             else {}
         )
+        pier_tasks_root = tasks_root
+        if effective_agent == DSH_AGENT:
+            pier_tasks_root = provider_stack.enter_context(
+                _dsh_tasks_overlay(
+                    effective_assignment,
+                    tasks_root,
+                    work_dir,
+                    job_name,
+                )
+            )
         if resume_checkpoint is None:
             cmd = build_pier_command(
-                effective_assignment, tasks_root, jobs_dir, job_name, work_dir,
+                effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
                 dev_agent, **provider_kwargs,
             )
         else:
             cmd = build_pier_command(
-                effective_assignment, tasks_root, jobs_dir, job_name, work_dir,
+                effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
                 dev_agent, resume_checkpoint=resume_checkpoint,
                 **provider_kwargs,
             )
@@ -1552,6 +1749,7 @@ def run_trial(
                 work_dir if codex_provider == DEEPSEEK_PROVIDER else None
             ),
             grok_module_dir=(work_dir if effective_agent == GROK_AGENT else None),
+            dsh_module_dir=(work_dir if effective_agent == DSH_AGENT else None),
         )
         if on_started is not None:
             # Best-effort by design: this only confirms to the server that a
@@ -1625,14 +1823,17 @@ def run_trial(
                     raise
     finally:
         if provider_auth_path is not None:
-            if codex_provider == DEEPSEEK_PROVIDER:
+            if (
+                codex_provider == DEEPSEEK_PROVIDER
+                or effective_agent == DSH_AGENT
+            ):
                 try:
                     provider_auth_path.unlink()
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
                     raise RunnerError(
-                        f"could not remove temporary DeepSeek auth file "
+                        f"could not remove temporary DeepSeek credential file "
                         f"{provider_auth_path}: {exc}"
                     ) from exc
         try:
@@ -1710,6 +1911,7 @@ def run_trial(
         grok_cli_version=(
             GROK_CLI_VERSION if effective_agent == GROK_AGENT else None
         ),
+        dsh_version=dsh_version,
     )
 
 

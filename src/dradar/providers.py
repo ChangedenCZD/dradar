@@ -47,6 +47,24 @@ DEEPSEEK_CATALOG_SOURCE_VERSION = "1.1.0+dradar-off"
 DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v2"
 DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
+# DSH Minimal is a separate Pier agent, not a Codex provider alias. It reuses
+# the same local DeepSeek credential while preserving DSH rc.6's native effort
+# surface exactly: off/high/max (there is deliberately no synthetic low mode).
+DSH_AGENT = "dsh-minimal"
+DSH_VERSION = "0.1.0-rc.6"
+DSH_FLASH_MODEL = "dsh-deepseek-v4-flash"
+DSH_PRO_MODEL = "dsh-deepseek-v4-pro"
+DSH_MODELS = (DSH_FLASH_MODEL, DSH_PRO_MODEL)
+DSH_RUNTIME_MODELS = {
+    DSH_FLASH_MODEL: DEEPSEEK_FLASH_MODEL,
+    DSH_PRO_MODEL: DEEPSEEK_PRO_MODEL,
+}
+DSH_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})
+DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-v1"
+DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-v1"
+DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-rc6-v1"
+DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-v1"
+
 # Grok Build is intentionally subscription/OAuth-only.  In particular, the
 # runner strips XAI_API_KEY from Pier's environment and never accepts a key in
 # config, argv, or an assignment.  A dedicated DRadar-owned GROK_HOME keeps a
@@ -269,6 +287,8 @@ def create_deepseek_auth_json(directory: Path) -> Path:
             "DeepSeek API key is not configured; run "
             "`dradar provider setup deepseek` in your own interactive Terminal"
         )
+    if any(character.isspace() for character in key):
+        raise ValueError("DeepSeek API key must be one non-empty line")
     directory.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(
         prefix=".deepseek-auth.", suffix=".json", dir=directory,
@@ -277,6 +297,43 @@ def create_deepseek_auth_json(directory: Path) -> Path:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"OPENAI_API_KEY": key}, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def create_deepseek_api_key_file(directory: Path) -> Path:
+    """Create DSH's short-lived owner-only raw-key input file.
+
+    The DSH Pier adapter uploads this file and converts it to DSH's credential
+    document inside the task container. The secret value therefore never
+    appears in Pier's argv, inherited environment, or DRadar log.
+    """
+
+    key = deepseek_api_key()
+    if key is None:
+        raise ValueError(
+            "DeepSeek API key is not configured; run "
+            "`dradar provider setup deepseek` in your own interactive Terminal"
+        )
+    if any(character.isspace() for character in key):
+        raise ValueError("DeepSeek API key must be one non-empty line")
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=".deepseek-dsh-key.", suffix=".txt", dir=directory,
+    )
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(key + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         if os.name != "nt":
@@ -454,6 +511,15 @@ def advertised_capabilities(
             DEEPSEEK_FLASH_OFF_CAPABILITY,
             DEEPSEEK_PRO_OFF_CAPABILITY,
         ))
+    # The adapter installs its pinned DSH runtime inside each task image, so
+    # its only local runtime prerequisite is a usable DeepSeek credential.
+    # Unlike the legacy Codex capabilities, keep these new paid-agent cells
+    # hidden until the key is actually ready.
+    if (
+        deepseek_api_key(environ) is not None
+        and Path(__file__).with_name("pier_dsh.py").is_file()
+    ):
+        capabilities.extend((DSH_FLASH_CAPABILITY, DSH_PRO_CAPABILITY))
     # Unlike API-key providers, a subscription slot is scarce and stateful.
     # Advertise it only when both the CLI and a safe refreshable OAuth session
     # are actually present, preventing the server from assigning unusable work.
