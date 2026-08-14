@@ -62,8 +62,8 @@ DSH_RUNTIME_MODELS = {
     DSH_PRO_MODEL: DEEPSEEK_PRO_MODEL,
 }
 DSH_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})
-DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-usage-v2"
-DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-usage-v2"
+DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-postrun-v3"
+DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-postrun-v3"
 DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-rc6-v1"
 DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-v1"
 

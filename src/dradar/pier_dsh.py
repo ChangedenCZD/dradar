@@ -235,6 +235,16 @@ async function run(ctx, task, io) {
   await agent.whenIdle();
   await sessions.flush(agent.session);
   const outcome = summarize(agent.session.events, firstSeq);
+  const terminalKind = outcome.reason?.kind;
+  writeFileSync(process.env.DSH_OUTCOME_FILE, JSON.stringify({
+    schema: "dradar-dsh-outcome-v1",
+    terminalKind: terminalKind ?? null,
+    requestCount: outcome.usage.requestCount,
+    agentCompleted: terminalKind === "completed",
+    errorCode: terminalKind === "error"
+      ? (outcome.reason?.error?.code ?? null)
+      : null,
+  }), { encoding: "utf8", mode: 0o600 });
   if (outcome.usage.requestCount > 0) {
     writeFileSync(process.env.DSH_USAGE_FILE, JSON.stringify({
       schema: "dsh-provider-usage-v1",
@@ -316,6 +326,7 @@ class DshMinimal(BaseInstalledAgent):
     _REMOTE_SECRET_ROOT = PurePosixPath("/tmp/dsh-secrets")
     _STREAM_FILE = "dsh-headless.txt"
     _USAGE_FILE = "dsh-usage.json"
+    _OUTCOME_FILE = "dsh-outcome.json"
 
     @staticmethod
     def name() -> str:
@@ -445,6 +456,7 @@ class DshMinimal(BaseInstalledAgent):
         remote_credentials = self._remote_credentials.as_posix()
         stream = f"{remote_home}/{self._STREAM_FILE}"
         usage_file = f"{remote_home}/{self._USAGE_FILE}"
+        outcome_file = f"{remote_home}/{self._OUTCOME_FILE}"
 
         env = self.build_process_env(
             {
@@ -457,6 +469,7 @@ class DshMinimal(BaseInstalledAgent):
                 "DSH_TOOLS_MODE": "native",
                 "DSH_CREDENTIALS_FILE": remote_credentials,
                 "DSH_USAGE_FILE": usage_file,
+                "DSH_OUTCOME_FILE": outcome_file,
                 # Pier routes allowlisted task traffic through HTTP(S)_PROXY.
                 # Node 22 fetch only honors those variables when this is enabled.
                 "NODE_USE_ENV_PROXY": "1",
