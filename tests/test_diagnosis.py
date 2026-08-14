@@ -189,6 +189,8 @@ def test_interrupted_insufficient_balance_returns_batch_terminal_outcome(
     out = capsys.readouterr().out
     assert "insufficient balance" in out.lower()
     assert client.submissions[0]["outcome"] == "interrupted"
+    assert client.submissions[0]["meta"]["failure_kind"] == "insufficient-balance"
+    assert client.submissions[0]["meta"]["exception_type"] == "AgentError"
 
 
 def test_interrupted_model_capacity_advice_is_not_a_quota_guess(
