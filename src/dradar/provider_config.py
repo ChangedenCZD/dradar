@@ -7,8 +7,11 @@ import os
 import subprocess
 import sys
 
+import httpx
+
 from .providers import (
     DEEPSEEK_API_KEY_ENV,
+    DEEPSEEK_MODELS,
     GROK_API_KEY_ENV,
     GROK_CLI_VERSION,
     deepseek_api_key,
@@ -22,6 +25,8 @@ from .providers import (
     parse_grok_cli_version,
     store_deepseek_api_key,
 )
+
+_DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
 
 
 def cmd_provider_setup(args) -> int:
@@ -47,7 +52,8 @@ def cmd_provider_setup(args) -> int:
         return 1
     print(
         f"DeepSeek API key saved locally at {path} (value hidden).\n"
-        "It is not stored in config.json and is never sent to the DRadar server."
+        "It is not stored in config.json and is never sent to the DRadar server.\n"
+        "Next, verify it with: dradar provider status deepseek --live"
     )
     return 0
 
@@ -55,7 +61,11 @@ def cmd_provider_setup(args) -> int:
 def cmd_provider_status(args) -> int:
     """Report credential readiness without printing secret material."""
 
+    live = bool(getattr(args, "live", False))
     if args.provider == "grok":
+        if live:
+            print("--live is currently supported only for the DeepSeek provider.")
+            return 2
         return _status_grok_subscription()
     if args.provider != "deepseek":
         raise ValueError(f"unsupported provider: {args.provider}")
@@ -65,17 +75,67 @@ def cmd_provider_status(args) -> int:
         print(f"DeepSeek provider not ready: {error}")
         return 1
     source = deepseek_credential_source()
-    if source == "environment":
-        print(f"DeepSeek provider ready via {DEEPSEEK_API_KEY_ENV} (value hidden).")
-        return 0
-    if source == "file" and deepseek_api_key():
-        print(f"DeepSeek provider ready via {path} (value hidden).")
-        return 0
+    key = deepseek_api_key()
+    if source == "environment" and key:
+        print(f"DeepSeek provider configured via {DEEPSEEK_API_KEY_ENV} (value hidden).")
+        return _live_deepseek_status(key) if live else 0
+    if source == "file" and key:
+        print(f"DeepSeek provider configured via {path} (value hidden).")
+        return _live_deepseek_status(key) if live else 0
     print(
         "DeepSeek provider not configured. In your own interactive Terminal run:\n"
         "  dradar provider setup deepseek"
     )
     return 1
+
+
+def _live_deepseek_status(key: str) -> int:
+    """Verify auth and reachability without making a billable model request."""
+
+    try:
+        response = httpx.get(
+            _DEEPSEEK_MODELS_URL,
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=10.0,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        print(
+            "DeepSeek live check failed before authentication completed: "
+            f"{type(exc).__name__}. Check this machine's network/proxy, then retry."
+        )
+        return 1
+    if response.status_code == 401:
+        print(
+            "DeepSeek live check rejected this API key (HTTP 401). Run "
+            "`dradar provider setup deepseek` to replace it."
+        )
+        return 1
+    if response.status_code != 200:
+        print(
+            "DeepSeek live check failed "
+            f"(HTTP {response.status_code}); the saved key was not displayed."
+        )
+        return 1
+    try:
+        payload = response.json()
+    except ValueError:
+        print("DeepSeek live check returned an invalid models response.")
+        return 1
+    available = {
+        item.get("id")
+        for item in payload.get("data", [])
+        if isinstance(item, dict)
+    } if isinstance(payload, dict) else set()
+    missing = [model for model in DEEPSEEK_MODELS if model not in available]
+    if missing:
+        print(
+            "DeepSeek authentication succeeded, but the required V4 models are "
+            "not available to this account: " + ", ".join(missing)
+        )
+        return 1
+    print("DeepSeek API authentication and V4 model availability verified live.")
+    return 0
 
 
 def _setup_grok_subscription() -> int:

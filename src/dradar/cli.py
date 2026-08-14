@@ -245,6 +245,10 @@ def main(argv: list[str] | None = None) -> int:
     p_provider_status = provider_sub.add_parser(
         "status", help="check provider readiness without displaying credentials")
     p_provider_status.add_argument("provider", choices=("deepseek", "grok"))
+    p_provider_status.add_argument(
+        "--live", action="store_true",
+        help="also verify the configured credential against the provider API",
+    )
     p_provider_status.set_defaults(func=cmd_provider_status)
 
     p_refill = sub.add_parser("refill", help="inspect or stop continuous auto-refill")
