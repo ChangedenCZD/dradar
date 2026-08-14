@@ -152,11 +152,18 @@ def _windows_daemon_hint(virtualization_state: str) -> str:
 def cmd_doctor(args) -> int:
     cfg = _load_config()
     plat = _platform()
-    print(f"dradar {__version__} doctor ({plat})")
+    selected_agent = getattr(args, "agent", None)
+    dsh_only = selected_agent == "dsh-minimal"
+    scope = " — DSH Minimal" if dsh_only else ""
+    print(f"dradar {__version__} doctor ({plat}{scope})")
     if plat == "windows":
+        dependencies = (
+            "Docker Desktop (Linux containers), uv/uvx, and the DeepSeek credential"
+            if dsh_only else
+            "Docker Desktop (Linux containers), Pier, and the Codex CLI"
+        )
         print("  native Windows support is experimental — this check validates "
-              "Docker Desktop (Linux containers), Pier, and the Codex CLI; "
-              "WSL2 remains the established fallback")
+              f"{dependencies}; WSL2 remains the established fallback")
     hints = _DOCKER_HINTS[plat]
     all_ok = True
 
@@ -205,10 +212,20 @@ def cmd_doctor(args) -> int:
     # established bootstrap behavior.
     windows_bootstrap_blocked = plat == "windows" and not daemon_ready
 
-    # pier is auto-installed on `dradar go`; do it here too so doctor reflects
+    # DSH runs the published Pier release in an isolated uvx environment. It
+    # deliberately does not require or alter the host Pier used by other agent
+    # families.
+    if dsh_only:
+        uvx = shutil.which("uvx")
+        all_ok &= _check(
+            "uvx — isolated public DSH runner",
+            bool(uvx),
+            "install uv from https://docs.astral.sh/uv/getting-started/installation/",
+        )
+    # Pier is auto-installed on `dradar go`; do it here too so doctor reflects
     # the ready state instead of a scary FAIL a volunteer (or an agent following
     # a runbook) then chases with the wrong fix.
-    if windows_bootstrap_blocked:
+    elif windows_bootstrap_blocked:
         _skip("pier bootstrap", "fix the Docker daemon first; no installation attempted")
     else:
         try:
@@ -246,7 +263,16 @@ def cmd_doctor(args) -> int:
     grok_ready = grok_cli_ready and grok_requested and grok_oauth_issue is None
     deepseek_requested = deepseek_opted_in()
     deepseek_key_ready = bool(deepseek_api_key())
-    if grok_requested:
+    if dsh_only:
+        all_ok &= _check(
+            "DeepSeek API key — local provider credential",
+            deepseek_key_ready,
+            "run `dradar provider setup deepseek` in your own interactive "
+            f"Terminal, or temporarily export {DEEPSEEK_API_KEY_ENV}",
+        )
+        if deepseek_key_ready:
+            _check("DeepSeek V4 Flash / Pro — DSH Minimal agent ready", True)
+    elif grok_requested:
         all_ok &= _check(
             f"Grok CLI {GROK_CLI_VERSION} — subscription runner",
             grok_cli_ready,
@@ -275,6 +301,8 @@ def cmd_doctor(args) -> int:
         )
         if deepseek_key_ready and catalog_ready:
             _check("DeepSeek V4 Flash / Pro — Codex provider ready", True)
+        if deepseek_key_ready:
+            _check("DeepSeek V4 Flash / Pro — DSH Minimal agent ready", True)
     elif codex_ready:
         _check("codex — agent ready", True)
     elif claude_ready:
@@ -287,7 +315,7 @@ def cmd_doctor(args) -> int:
         _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
                bool(runner.claude_oauth_token()),
                "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
-    if not deepseek_requested and not grok_requested:
+    if not dsh_only and not deepseek_requested and not grok_requested:
         all_ok &= (codex_ready or claude_ready)
 
     # The task repo is auto-cloned on `dradar go`; do it here too so a missing
@@ -333,7 +361,8 @@ def cmd_doctor(args) -> int:
     else:
         all_ok &= _check("server login", False, "dradar login --server <url> --token <token>")
 
-    print("all checks passed" if all_ok else "fix the FAIL items above, then re-run: dradar doctor")
+    retry = "dradar doctor --agent dsh-minimal" if dsh_only else "dradar doctor"
+    print("all checks passed" if all_ok else f"fix the FAIL items above, then re-run: {retry}")
     return 0 if all_ok else 1
 
 

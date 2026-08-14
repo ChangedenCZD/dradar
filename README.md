@@ -207,6 +207,25 @@ auth 文件，再从 Pier 的继承环境中移除该变量。
 [Responses API](https://api-docs.deepseek.com/guides/responses_api/) 和
 [Codex 自定义 provider](https://developers.openai.com/codex/config-advanced/#custom-model-providers)。
 
+### DeepSeek Harness Minimal
+
+DSH Minimal 是与 Codex 分开的实验 Harness。它复用同一份本地 DeepSeek key，但只接受
+`off`、`high`、`max` 三档，并固定使用 DSH 自带的 `minimal` 双工具组合（持久 Bash 与
+字符串替换编辑器）。网页认领 DSH 格子后，仍走普通志愿者的本机流程：本机 Docker、
+公开 CLI、当前账号已认领批次，再由 `resume` 启动，不需要单独安装宿主机 Pier。
+
+```bash
+dradar provider setup deepseek
+dradar provider status deepseek
+dradar doctor --agent dsh-minimal
+# 回到网页认领 DSH 格子后：
+dradar resume -y
+```
+
+运行器通过 `uvx --isolated` 使用公开 `datacurve-pier==0.3.0`，并在任务容器内安装固定的
+`@deepseek-ai/dsh` 版本。普通 Codex、Claude、Grok 和 DeepSeek Codex 的环境检查与运行
+路径不受影响。DSH 第一版不恢复 checkpoint；中断任务会按现有失效/重新认领流程处理。
+
 ### Grok 订阅 OAuth 补充 agent
 
 Grok Build 只使用 grok.com 订阅的官方 OAuth/device login，不接受 `XAI_API_KEY`，也不接

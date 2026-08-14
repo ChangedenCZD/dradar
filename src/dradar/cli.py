@@ -11,8 +11,8 @@ The actual command implementations live in sibling modules, split by concern:
 This file owns only the argparse tree + `main()`, this package's
 console-script entry point (see pyproject.toml). Import everything else from
 the module that defines it — the single-file-era courtesy re-exports were
-dropped once a grep of every known consumer (this repo's tests and the ds0
-pipeline scripts) showed nothing reaching through `dradar.cli`.
+dropped once a grep of the public consumers showed nothing reaching through
+`dradar.cli`.
 """
 
 import argparse
@@ -92,6 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     p_login.set_defaults(func=cmd_login)
 
     p_doc = sub.add_parser("doctor", help="preflight checks")
+    p_doc.add_argument(
+        "--agent", choices=("dsh-minimal",), default=None,
+        help="check only the dependencies required by this agent",
+    )
     p_doc.set_defaults(func=cmd_doctor)
 
     p_capacity = sub.add_parser(

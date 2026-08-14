@@ -36,6 +36,9 @@ from .providers import (
     DEEPSEEK_PROVIDER,
     DEEPSEEK_RUN_CONFIG_VERSION,
     DEEPSEEK_RUNTIME_PROFILE,
+    DSH_AGENT,
+    DSH_RUN_CONFIG_VERSION,
+    DSH_RUNTIME_PROFILE,
     GROK_AGENT,
     GROK_RUN_CONFIG_VERSION,
     GROK_RUNTIME_PROFILE,
@@ -1188,6 +1191,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "deep_swe_commit": local_commit,
         "codex_cli_version": art.codex_cli_version,
         "grok_cli_version": art.grok_cli_version,
+        "dsh_version": art.dsh_version,
         **stats,
     }
     if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
@@ -1205,6 +1209,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "model_runtime_profile": GROK_RUNTIME_PROFILE,
             "subscription_oauth": True,
             "subscription_concurrency": 1,
+        })
+    if assignment.get("agent") == DSH_AGENT:
+        meta.update({
+            "model_config_version": DSH_RUN_CONFIG_VERSION,
+            "model_runtime_profile": DSH_RUNTIME_PROFILE,
+            "dsh_minimal_tools": ["bash", "str_replace_editor"],
+            "dsh_native_efforts": ["off", "high", "max"],
         })
 
     if item is not None and item.job_dir == art.job_dir:
@@ -1357,6 +1368,16 @@ def _resume_one_checkpoint(
                 print(
                     f"  {assignment_id}: DeepSeek checkpoints are not supported; "
                     "discarding the stale local checkpoint"
+                )
+                if _discard_checkpoint_quietly(
+                    client, item, assignment, reason="incompatible",
+                ):
+                    return "discarded"
+                return "paused"
+            if assignment.get("agent") == DSH_AGENT:
+                print(
+                    f"  {assignment_id}: DSH Minimal checkpoints are not "
+                    "supported; discarding the stale local checkpoint"
                 )
                 if _discard_checkpoint_quietly(
                     client, item, assignment, reason="incompatible",
