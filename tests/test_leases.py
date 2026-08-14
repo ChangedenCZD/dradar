@@ -73,8 +73,9 @@ def test_started_history_without_healthy_runner_is_resumable_not_running(
     assert leases.cmd_leases(Namespace()) == 0
 
     out = capsys.readouterr().out
-    assert "1 running, 1 paused, 1 resumable" in out
-    assert "a1" in out and "resumable" in out
+    assert "1 running, 1 paused, 1 stale" in out
+    assert "a1" in out and "stale" in out
+    assert "not actually resumable" in out
 
 
 def test_release_all_protects_running_without_force(monkeypatch, capsys):

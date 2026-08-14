@@ -60,6 +60,7 @@ def cmd_leases(args) -> int:
         return 0
 
     running = sum(_state(item) == "running" for item in active)
+    stale = sum(_state(item) == "stale" for item in active)
     print(f"holding {len(active)} cell(s): {state_summary(active)}")
     _print_active(active)
     print("\nrelease waiting cells: `dradar release <assignment-id>` or "
@@ -67,6 +68,11 @@ def cmd_leases(args) -> int:
     if running:
         print("a running cell is protected; only use `--force` after its local "
               "runner has definitely stopped")
+    if stale:
+        print("a stale cell has no usable checkpoint and is not actually resumable; "
+              "do not start a duplicate local model process. Retry after the server "
+              "refreshes it, or use `dradar release --force` only after confirming "
+              "the original runner/container is gone")
     return 0
 
 

@@ -9,6 +9,7 @@ filesystem/process isolation boundary.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import stat
 import uuid
@@ -35,6 +36,7 @@ RUNTIME_MODELS = {
     "dsh-deepseek-v4-pro": "deepseek-v4-pro",
 }
 SUPPORTED_REASONING_EFFORTS = frozenset({"off", "high", "max"})
+_ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 _MINIMAL_PATCH = """\
 # Run DSH's shipped `minimal` agent preset through a one-shot headless runner.
@@ -238,6 +240,11 @@ async function run(ctx, task, io) {
   const terminalKind = outcome.reason?.kind;
   writeFileSync(process.env.DSH_OUTCOME_FILE, JSON.stringify({
     schema: "dradar-dsh-outcome-v1",
+    assignmentId: process.env.DRADAR_ASSIGNMENT_ID ?? null,
+    artifactRunId: process.env.DRADAR_ARTIFACT_RUN_ID ?? null,
+    taskId: process.env.DRADAR_TASK_ID ?? null,
+    assignmentModel: process.env.DRADAR_ASSIGNMENT_MODEL ?? null,
+    reasoningEffort: process.env.DSH_REASONING_EFFORT ?? null,
     terminalKind: terminalKind ?? null,
     requestCount: outcome.usage.requestCount,
     agentCompleted: terminalKind === "completed",
@@ -339,6 +346,9 @@ class DshMinimal(BaseInstalledAgent):
         reasoning_effort: str = "high",
         model_name: str | None = None,
         version: str | None = DSH_VERSION,
+        artifact_assignment_id: str | None = None,
+        artifact_run_id: str | None = None,
+        artifact_task_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
@@ -367,6 +377,18 @@ class DshMinimal(BaseInstalledAgent):
         runtime_model = RUNTIME_MODELS[assignment_model]
         if reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
             raise ValueError("DSH reasoning_effort must be off, high, or max")
+        for label, value in (
+            ("assignment", artifact_assignment_id),
+            ("artifact run", artifact_run_id),
+        ):
+            if value is not None and _ARTIFACT_ID_RE.fullmatch(value) is None:
+                raise ValueError(f"DSH {label} id must be 32 lowercase hex characters")
+        if artifact_task_id is not None and (
+            not artifact_task_id
+            or len(artifact_task_id) > 200
+            or re.fullmatch(r"[A-Za-z0-9._-]+", artifact_task_id) is None
+        ):
+            raise ValueError("DSH artifact task id is invalid")
         resolved_version = version or DSH_VERSION
         if resolved_version != DSH_VERSION:
             raise ValueError(f"DSH adapter requires exact version {DSH_VERSION}")
@@ -401,6 +423,9 @@ class DshMinimal(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._assignment_model = assignment_model
         self._dsh_model = runtime_model
+        self._artifact_assignment_id = artifact_assignment_id
+        self._artifact_run_id = artifact_run_id
+        self._artifact_task_id = artifact_task_id
         run_secret_dir = self._REMOTE_SECRET_ROOT / uuid.uuid4().hex
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "deepseek-api-key"
@@ -470,6 +495,10 @@ class DshMinimal(BaseInstalledAgent):
                 "DSH_CREDENTIALS_FILE": remote_credentials,
                 "DSH_USAGE_FILE": usage_file,
                 "DSH_OUTCOME_FILE": outcome_file,
+                "DRADAR_ASSIGNMENT_ID": self._artifact_assignment_id or "",
+                "DRADAR_ARTIFACT_RUN_ID": self._artifact_run_id or "",
+                "DRADAR_TASK_ID": self._artifact_task_id or "",
+                "DRADAR_ASSIGNMENT_MODEL": self._assignment_model,
                 # Pier routes allowlisted task traffic through HTTP(S)_PROXY.
                 # Node 22 fetch only honors those variables when this is enabled.
                 "NODE_USE_ENV_PROXY": "1",

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -166,6 +167,7 @@ class TrialArtifacts:
     codex_cli_version: str | None = None
     grok_cli_version: str | None = None
     dsh_version: str | None = None
+    dsh_artifact_binding: dict[str, str] | None = None
 
 
 class RunnerError(RuntimeError):
@@ -810,6 +812,9 @@ def build_pier_command(
             "--ak", f"api_key_file={provider_auth_path}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={DSH_VERSION}",
+            "--ak", f"artifact_assignment_id={assignment['assignment_id']}",
+            "--ak", f"artifact_run_id={assignment.get('_artifact_run_id') or uuid.uuid4().hex}",
+            "--ak", f"artifact_task_id={assignment['task_id']}",
         ]
     elif agent == GROK_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -890,6 +895,71 @@ def trial_artifact_paths(trial_dir: Path) -> tuple[Path, Path | None, Path | Non
     trajectory = trial_dir / "agent" / "trajectory.json"
     result = trial_dir / "result.json"
     return patch, (trajectory if trajectory.is_file() else None), (result if result.is_file() else None)
+
+
+def _verify_dsh_artifact_binding(
+    trial_dir: Path, assignment: dict,
+) -> dict[str, str]:
+    """Reject DSH artifacts that cannot be tied to this exact checkout/run."""
+    path = trial_dir / "agent" / "dsh-home" / "dsh-outcome.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerError(
+            "DSH artifact identity sidecar is missing or unreadable; refusing "
+            "to upload files that cannot be bound to this assignment"
+        ) from exc
+    expected = {
+        "schema": "dradar-dsh-outcome-v1",
+        "assignmentId": assignment.get("assignment_id"),
+        "artifactRunId": assignment.get("_artifact_run_id"),
+        "taskId": assignment.get("task_id"),
+        "assignmentModel": assignment.get("model"),
+        "reasoningEffort": assignment.get("effort"),
+    }
+    if not isinstance(value, dict) or any(
+        value.get(key) != expected_value
+        for key, expected_value in expected.items()
+    ):
+        raise RunnerError(
+            "DSH artifact identity does not match the current assignment/run; "
+            "the stale files were kept locally and will not be uploaded"
+        )
+    return expected
+
+
+def _normalize_utf16_patch(patch: Path) -> bool:
+    """Convert a BOM-marked, valid unified diff to UTF-8 before upload."""
+    try:
+        raw = patch.read_bytes()
+    except OSError as exc:
+        raise RunnerError(f"model.patch is unreadable: {exc}") from exc
+    if not raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return False
+    try:
+        normalized = raw.decode("utf-16").encode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError) as exc:
+        raise RunnerError(
+            "model.patch has a malformed UTF-16 encoding; keeping it locally "
+            "instead of uploading an ungradeable patch"
+        ) from exc
+    try:
+        parsed = subprocess.run(
+            ["git", "apply", "--numstat", "-"],
+            input=normalized,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError as exc:
+        raise RunnerError(f"could not validate normalized model.patch: {exc}") from exc
+    if parsed.returncode != 0:
+        raise RunnerError(
+            "UTF-16 model.patch could not be converted into a valid unified "
+            "diff; keeping it locally instead of uploading"
+        )
+    _materialize_shared_file(patch, normalized, mode=0o600)
+    return True
 
 
 def _plain_file(path: Path) -> bool:
@@ -1663,6 +1733,7 @@ def run_trial(
         effective_assignment = {
             **assignment,
             "agent_version": dsh_version,
+            "_artifact_run_id": uuid.uuid4().hex,
         }
         print(f"verified pinned DSH Minimal: {dsh_version}")
 
@@ -1860,6 +1931,11 @@ def run_trial(
                 f"last lines of the log:\n{tail}")
         raise
     patch, trajectory, result = trial_artifact_paths(trial_dir)
+    dsh_artifact_binding = None
+    if effective_agent == DSH_AGENT:
+        dsh_artifact_binding = _verify_dsh_artifact_binding(
+            trial_dir, effective_assignment,
+        )
     if not patch.is_file():
         if terminal_error is not None:
             raise terminal_error
@@ -1877,6 +1953,12 @@ def run_trial(
                 f"checkpoint could not be recovered: {checkpoint_error}; "
                 f"see {log_path} and {trial_dir}"
             )
+    if (
+        effective_agent == DSH_AGENT
+        and patch.is_file()
+        and _normalize_utf16_patch(patch)
+    ):
+        print("  normalized BOM-marked UTF-16 model.patch to validated UTF-8")
     if not patch.is_file():
         # No patch at all means the agent never produced anything — usually
         # the environment died under it. Say which, instead of blaming the
@@ -1912,6 +1994,7 @@ def run_trial(
             GROK_CLI_VERSION if effective_agent == GROK_AGENT else None
         ),
         dsh_version=dsh_version,
+        dsh_artifact_binding=dsh_artifact_binding,
     )
 
 
