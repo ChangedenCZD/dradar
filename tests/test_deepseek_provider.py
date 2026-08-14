@@ -327,13 +327,13 @@ def test_command_fails_before_paid_run_when_catalog_is_modified(
     assert not (tmp_path / "home" / runner.DEEPSEEK_AGENT_MODULE_FILENAME).exists()
 
 
-@pytest.mark.parametrize("effort", ["medium", "xhigh"])
-def test_compatibility_aliases_are_not_duplicate_benchmark_cells(
+@pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+def test_retired_or_compatibility_efforts_are_not_benchmark_cells(
     tmp_path: Path,
     monkeypatch,
     effort: str,
 ):
-    with pytest.raises(RunnerError, match="effort must be one of high, low, max"):
+    with pytest.raises(RunnerError, match="effort must be one of high, max, off"):
         _command(tmp_path, monkeypatch, _assignment(effort=effort))
 
 
