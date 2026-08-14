@@ -1446,6 +1446,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "model_runtime_profile": DSH_RUNTIME_PROFILE,
             "dsh_minimal_tools": ["bash", "str_replace_editor"],
             "dsh_native_efforts": ["off", "high", "max"],
+            "dsh_artifact_binding": art.dsh_artifact_binding,
         })
         if dsh_completion is not None:
             meta.update({

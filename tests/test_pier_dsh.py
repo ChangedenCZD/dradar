@@ -68,6 +68,14 @@ def make_agent(tmp_path: Path, **kwargs: object) -> DshMinimal:
     )
 
 
+def artifact_binding() -> dict[str, str]:
+    return {
+        "artifact_assignment_id": "a" * 32,
+        "artifact_run_id": "b" * 32,
+        "artifact_task_id": "httpx-streaming-json-iteration",
+    }
+
+
 def test_install_spec_is_fully_pinned(tmp_path: Path) -> None:
     agent = make_agent(tmp_path)
     spec = agent.install_spec()
@@ -168,6 +176,7 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
         tmp_path,
         model_name=model,
         reasoning_effort=effort,
+        **artifact_binding(),
     )
     environment = FakeEnvironment()
 
@@ -207,6 +216,8 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert 'schema: "dsh-provider-usage-v1"' in runner
     assert "writeFileSync(process.env.DSH_USAGE_FILE" in runner
     assert 'schema: "dradar-dsh-outcome-v1"' in runner
+    assert "assignmentId: process.env.DRADAR_ASSIGNMENT_ID" in runner
+    assert "artifactRunId: process.env.DRADAR_ARTIFACT_RUN_ID" in runner
     assert "writeFileSync(process.env.DSH_OUTCOME_FILE" in runner
 
     serialized_calls = repr(environment.calls)
@@ -238,6 +249,11 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     )
     assert (dsh_call.get("env") or {})["DSH_OUTCOME_FILE"] == (
         "/logs/agent/dsh-home/dsh-outcome.json"
+    )
+    assert (dsh_call.get("env") or {})["DRADAR_ASSIGNMENT_ID"] == "a" * 32
+    assert (dsh_call.get("env") or {})["DRADAR_ARTIFACT_RUN_ID"] == "b" * 32
+    assert (dsh_call.get("env") or {})["DRADAR_TASK_ID"] == (
+        "httpx-streaming-json-iteration"
     )
     assert (dsh_call.get("env") or {})["NODE_USE_ENV_PROXY"] == "1"
     assert agent.SUPPORTS_ATIF is False
