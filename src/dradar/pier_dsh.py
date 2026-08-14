@@ -332,6 +332,7 @@ class DshMinimal(BaseInstalledAgent):
             "DEEPSEEK_BASE_URL",
             "DEEPSEEK_SEARCH_BASE_URL",
             "NODE_OPTIONS",
+            "NODE_USE_ENV_PROXY",
         }
         forbidden = sorted(
             name
@@ -421,6 +422,9 @@ class DshMinimal(BaseInstalledAgent):
                 "DSH_TELEMETRY_MODE": "DISABLED",
                 "DSH_TOOLS_MODE": "native",
                 "DSH_CREDENTIALS_FILE": remote_credentials,
+                # Pier routes allowlisted task traffic through HTTP(S)_PROXY.
+                # Node 22 fetch only honors those variables when this is enabled.
+                "NODE_USE_ENV_PROXY": "1",
             }
         )
         runtime_dirs = (remote_home, remote_config_dir, remote_secret_dir)
