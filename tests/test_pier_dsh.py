@@ -202,6 +202,10 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert 'presets.resolve("minimal")' in runner
     assert "await presets.mount(agentCtx, preset.id)" in runner
     assert "agentPreset: preset.id" in runner
+    assert 'event.type === "assistant/chunk"' in runner
+    assert 'usageByStep.set(`${event.data.turn}:${event.data.step}`' in runner
+    assert 'schema: "dsh-provider-usage-v1"' in runner
+    assert "writeFileSync(process.env.DSH_USAGE_FILE" in runner
 
     serialized_calls = repr(environment.calls)
     assert secret not in serialized_calls
@@ -227,5 +231,8 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert dsh_call["cwd"] == "/app"
     assert (dsh_call.get("env") or {})["DSH_MODEL"] == RUNTIME_MODELS[model]
     assert (dsh_call.get("env") or {})["DSH_REASONING_EFFORT"] == effort
+    assert (dsh_call.get("env") or {})["DSH_USAGE_FILE"] == (
+        "/logs/agent/dsh-home/dsh-usage.json"
+    )
     assert (dsh_call.get("env") or {})["NODE_USE_ENV_PROXY"] == "1"
     assert agent.SUPPORTS_ATIF is False

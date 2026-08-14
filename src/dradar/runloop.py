@@ -599,8 +599,8 @@ def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) 
 _artifacts_from_trial_dir = trial_artifact_paths
 
 
-def _apply_codex_usage_to_result(result_path: Path, usage: dict) -> None:
-    """Replace Pier's arbitrary single-session totals in an upload copy.
+def _apply_usage_to_result(result_path: Path, usage: dict) -> None:
+    """Replace Pier's missing/arbitrary token totals in an upload copy.
 
     The raw result remains untouched for retry/debugging.  Clearing cost_usd
     is intentional: the server owns the model price table and recomputes the
@@ -628,8 +628,59 @@ def _apply_codex_usage_to_result(result_path: Path, usage: dict) -> None:
     if not isinstance(metadata, dict):
         metadata = {}
         agent_result["metadata"] = metadata
-    metadata["codex_session_usage"] = usage
+    metadata["provider_usage"] = usage
+    if "codex" in str(usage.get("schema", "")):
+        metadata["codex_session_usage"] = usage
     result_path.write_text(json.dumps(payload, ensure_ascii=False))
+
+
+# Kept for compatibility with callers/tests that used the earlier narrow name.
+_apply_codex_usage_to_result = _apply_usage_to_result
+
+
+def _dsh_trial_usage(trial_dir: Path) -> dict | None:
+    """Read DSH's provider-reported, per-request de-duplicated usage sidecar.
+
+    DSH defines ``inputTokens`` as uncached input and exposes cache reads and
+    writes as disjoint buckets. DRadar's upload contract uses total prompt
+    tokens plus the cache-read subset, so cache writes remain billed as normal
+    input while cache reads receive the server's cached-input price.
+    """
+    path = trial_dir / "agent" / "dsh-home" / "dsh-usage.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("schema") != "dsh-provider-usage-v1":
+        return None
+    names = (
+        "uncachedInputTokens", "cacheReadTokens", "cacheWriteTokens",
+        "outputTokens", "requestCount",
+    )
+    if any(
+        not isinstance(value.get(name), int)
+        or isinstance(value.get(name), bool)
+        or value[name] < 0
+        for name in names
+    ) or value["requestCount"] < 1:
+        return None
+    n_input = (
+        value["uncachedInputTokens"]
+        + value["cacheReadTokens"]
+        + value["cacheWriteTokens"]
+    )
+    return {
+        "schema": value["schema"],
+        "complete": True,
+        "model": value.get("model"),
+        "request_count": value["requestCount"],
+        "uncached_input_tokens": value["uncachedInputTokens"],
+        "cache_read_tokens": value["cacheReadTokens"],
+        "cache_write_tokens": value["cacheWriteTokens"],
+        "n_input_tokens": n_input,
+        "n_cache_tokens": value["cacheReadTokens"],
+        "n_output_tokens": value["outputTokens"],
+    }
 
 
 def _upload_trial(
@@ -740,10 +791,12 @@ def _upload_trial(
               f"({', '.join(redacted_labels)}); uploading a structurally validated "
               "redacted copy. The raw patch stays local.")
 
+    upload_meta = dict(entry.get("meta") or {})
     trajectory_bundle = build_codex_trajectory_bundle(Path(entry["trial_dir"]))
     usage = (codex_trajectory_bundle_usage(trajectory_bundle)
              if trajectory_bundle is not None else None)
-    upload_meta = dict(entry.get("meta") or {})
+    if upload_meta.get("dsh_version") and usage is None:
+        usage = _dsh_trial_usage(Path(entry["trial_dir"]))
     if entry.get("artifact_staging_recovery"):
         upload_meta["artifact_staging_recovery"] = entry["artifact_staging_recovery"]
     if redacted_patch is not None:
@@ -753,10 +806,14 @@ def _upload_trial(
         upload_meta["cost_usd"] = None
         upload_meta["usage_aggregation"] = usage["schema"]
         upload_meta["usage_aggregation_complete"] = usage["complete"]
-        upload_meta["agent_session_count"] = usage["agent_session_count"]
-        upload_meta["root_session_count"] = usage["root_session_count"]
-        upload_meta["subagent_session_count"] = usage["subagent_session_count"]
-        upload_meta["agent_session_usage"] = usage["sessions"]
+        for key in (
+            "agent_session_count", "root_session_count",
+            "subagent_session_count", "agent_session_usage", "request_count",
+            "uncached_input_tokens", "cache_read_tokens", "cache_write_tokens",
+        ):
+            source_key = "sessions" if key == "agent_session_usage" else key
+            if source_key in usage:
+                upload_meta[key] = usage[source_key]
         for key in ("n_input_tokens", "n_cache_tokens", "n_output_tokens"):
             upload_meta[key] = usage[key] if usage["complete"] else None
 
@@ -804,7 +861,7 @@ def _upload_trial(
             result_scrubbed = scrubbed / "result.json"
             result_scrubbed.write_bytes(scrub_json_bytes(result.read_bytes()))
             if usage is not None:
-                _apply_codex_usage_to_result(result_scrubbed, usage)
+                _apply_usage_to_result(result_scrubbed, usage)
         # Refresh before submitting: from here on an unacked completed trial
         # has the canonical paths + digest in its ledger entry. The server
         # dedupes replays (409 "already submitted"), so duplicates are safe.

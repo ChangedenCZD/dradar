@@ -138,6 +138,7 @@ _MINIMAL_PATCH = """\
 
 _MINIMAL_HEADLESS_RUNNER = """\
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import z from "/opt/dsh-runtime/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery/lib/index.mjs";
 import { installModelSelection } from "/opt/dsh-runtime/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent/lib/index.js";
 import { createUserMessage } from "/opt/dsh-runtime/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm/lib/index.js";
@@ -156,6 +157,7 @@ function summarize(events, firstSeq) {
   let started = false;
   let text = "";
   let reason;
+  const usageByStep = new Map();
   for (const event of events) {
     if (event.seq < firstSeq) continue;
     if (event.type === "turn/start") {
@@ -163,6 +165,17 @@ function summarize(events, firstSeq) {
       continue;
     }
     if (!started) continue;
+    let usage;
+    if (event.type === "assistant/chunk" && event.data.chunk.type === "usage") {
+      usage = event.data.chunk.usage;
+    } else if (event.type === "assistant/message") {
+      usage = event.data.usage;
+    }
+    if (usage !== undefined) {
+      // A finalized assistant message repeats the usage chunk for the same
+      // request. Last-wins by (turn, step), matching DSH token-meter's fold.
+      usageByStep.set(`${event.data.turn}:${event.data.step}`, usage);
+    }
     if (event.type === "assistant/message") {
       const joined = event.data.message.content
         .filter((block) => block.type === "text")
@@ -172,7 +185,19 @@ function summarize(events, firstSeq) {
     }
     if (event.type === "turn/end") reason = event.data.reason;
   }
-  return { text, reason };
+  const totals = {
+    uncachedInputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+  };
+  for (const usage of usageByStep.values()) {
+    totals.uncachedInputTokens += usage.inputTokens;
+    totals.cacheReadTokens += usage.cacheReadTokens ?? 0;
+    totals.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
+    totals.outputTokens += usage.outputTokens;
+  }
+  return { text, reason, usage: { ...totals, requestCount: usageByStep.size } };
 }
 
 async function run(ctx, task, io) {
@@ -210,6 +235,13 @@ async function run(ctx, task, io) {
   await agent.whenIdle();
   await sessions.flush(agent.session);
   const outcome = summarize(agent.session.events, firstSeq);
+  if (outcome.usage.requestCount > 0) {
+    writeFileSync(process.env.DSH_USAGE_FILE, JSON.stringify({
+      schema: "dsh-provider-usage-v1",
+      model: selection.model,
+      ...outcome.usage,
+    }), { encoding: "utf8", mode: 0o600 });
+  }
   io.stdout.write(`${outcome.text}\n`);
   if (outcome.reason?.kind === "error") {
     io.stderr.write(`dsh: ${outcome.reason.error.code}: ${outcome.reason.error.message}\n`);
@@ -283,6 +315,7 @@ class DshMinimal(BaseInstalledAgent):
     _REMOTE_RUNNER = _REMOTE_CONFIG_DIR / "minimal-headless-runner.mjs"
     _REMOTE_SECRET_ROOT = PurePosixPath("/tmp/dsh-secrets")
     _STREAM_FILE = "dsh-headless.txt"
+    _USAGE_FILE = "dsh-usage.json"
 
     @staticmethod
     def name() -> str:
@@ -411,6 +444,7 @@ class DshMinimal(BaseInstalledAgent):
         remote_api_key = self._remote_api_key.as_posix()
         remote_credentials = self._remote_credentials.as_posix()
         stream = f"{remote_home}/{self._STREAM_FILE}"
+        usage_file = f"{remote_home}/{self._USAGE_FILE}"
 
         env = self.build_process_env(
             {
@@ -422,6 +456,7 @@ class DshMinimal(BaseInstalledAgent):
                 "DSH_TELEMETRY_MODE": "DISABLED",
                 "DSH_TOOLS_MODE": "native",
                 "DSH_CREDENTIALS_FILE": remote_credentials,
+                "DSH_USAGE_FILE": usage_file,
                 # Pier routes allowlisted task traffic through HTTP(S)_PROXY.
                 # Node 22 fetch only honors those variables when this is enabled.
                 "NODE_USE_ENV_PROXY": "1",
