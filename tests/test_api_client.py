@@ -278,6 +278,18 @@ def test_mark_stopped_requests_cross_session_cooldown():
     assert b"defer_seconds=300" in seen["body"]
 
 
+def test_mark_stopped_can_allow_immediate_user_resume():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, json={"ok": True, "retry_after": None})
+
+    _client(handler).mark_stopped("a1", defer_seconds=0)
+    assert b"assignment_id=a1" in seen["body"]
+    assert b"defer_seconds=0" in seen["body"]
+
+
 def test_checkpoint_protocol_sends_id_generation_and_runner_session():
     seen = []
 

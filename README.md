@@ -177,8 +177,9 @@ dradar go --pick TASK_ID:deepseek-v4-pro:high
 key 保存在 `~/.dradar/secrets/deepseek_api_key`，POSIX 系统权限固定为 `0600`，
 不会进入 `config.json`、命令参数、复制提示词或 DRadar 服务端。运行时 CLI 生成短期
 Codex `auth.json`，通过公开 Pier 的 `CODEX_AUTH_JSON_PATH` 文件上传机制送入容器；
-Pier 退出后立即删除。自动化环境也可临时设置 `DEEPSEEK_API_KEY`，CLI 会先写入短期
-auth 文件，再从 Pier 的继承环境中移除该变量。
+Pier 退出后立即删除。该本地文件存在时优先使用，避免桌面应用或 shell 遗留的旧
+`DEEPSEEK_API_KEY` 静默覆盖用户刚配置的新 key；没有本地文件的自动化环境仍可临时
+设置 `DEEPSEEK_API_KEY`，CLI 会先写入短期 auth 文件，再从 Pier 的继承环境中移除该变量。
 
 运行前 CLI 会校验随包发布的 DeepSeek 官方 Codex `models.json` 的 SHA-256，并由一个
 很窄的公开 Pier 子类把它上传到任务容器隔离的 `/tmp/codex-home/models.json`。文件缺失、

@@ -229,7 +229,45 @@ def test_failed_trial_reports_stopped_to_server(monkeypatch, tmp_path):
     monkeypatch.setattr(runloop, "run_trial", always_fails)
     stopped = []
     client = SubmitClient({})
-    client.mark_stopped = lambda aid: stopped.append(aid)
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
     tag = runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
     assert tag == "failed"
-    assert stopped == [ASSIGNMENT["assignment_id"]]
+    assert stopped == [(ASSIGNMENT["assignment_id"], {"defer_seconds": 300})]
+
+
+def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    monkeypatch.setattr(
+        runloop, "run_trial",
+        lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(runloop, "_pause_checkpoint_quietly", lambda *a, **kw: None)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
+
+    with pytest.raises(KeyboardInterrupt):
+        runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
+
+    assert stopped == [(ASSIGNMENT["assignment_id"], {"defer_seconds": 0})]
+
+
+def test_user_interrupt_with_checkpoint_keeps_server_paused(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    monkeypatch.setattr(
+        runloop, "run_trial",
+        lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    checkpoint = object()
+    monkeypatch.setattr(
+        runloop, "_pause_checkpoint_quietly", lambda *a, **kw: checkpoint)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
+
+    with pytest.raises(KeyboardInterrupt):
+        runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
+
+    assert stopped == []

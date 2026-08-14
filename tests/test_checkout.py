@@ -31,7 +31,7 @@ class CheckoutClient(FakeClient):
             raise result
         return result
 
-    def mark_stopped(self, assignment_id):
+    def mark_stopped(self, assignment_id, **_kwargs):
         self.stopped.append(assignment_id)
         return {"ok": True}
 
