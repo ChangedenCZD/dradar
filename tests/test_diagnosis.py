@@ -10,6 +10,7 @@ import pytest
 
 import dradar.runloop as runloop
 import dradar.runner as runner_mod
+from dradar.api_client import ApiError
 from dradar.runner import RunnerError, build_pier_command, diagnose_exception
 
 from test_go_menu import ASSIGNMENT, SubmitClient, _args, _fake_art
@@ -271,3 +272,37 @@ def test_user_interrupt_with_checkpoint_keeps_server_paused(
         runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
 
     assert stopped == []
+
+
+def test_mark_stopped_retries_transient_cleanup_failure(monkeypatch, capsys):
+    attempts = []
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            attempts.append((assignment_id, kwargs))
+            if len(attempts) < 3:
+                raise ApiError("temporary outage", status_code=503)
+            return {"ok": True}
+
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    assert runloop._mark_stopped_quietly(
+        Client(), "assignment-1", defer_seconds=0
+    ) is True
+    assert len(attempts) == 3
+    assert capsys.readouterr().out == ""
+
+
+def test_mark_stopped_surfaces_nonretryable_cleanup_failure(capsys):
+    attempts = []
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            attempts.append((assignment_id, kwargs))
+            raise ApiError("upgrade required", status_code=426)
+
+    assert runloop._mark_stopped_quietly(Client(), "assignment-2") is False
+    assert len(attempts) == 1
+    out = capsys.readouterr().out
+    assert "could not confirm checkout cleanup" in out
+    assert "assignment-2" in out
+    assert "retry `dradar resume`" in out

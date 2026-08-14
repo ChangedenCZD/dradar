@@ -89,4 +89,4 @@ def test_cmd_status_uses_live_runner_health_not_historical_started_at(
 
     identity.cmd_status(SimpleNamespace())
 
-    assert "1 running, 1 resumable" in capsys.readouterr().out
+    assert "1 running, 1 stale" in capsys.readouterr().out

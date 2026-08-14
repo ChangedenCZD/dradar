@@ -1113,14 +1113,37 @@ def _mark_stopped_quietly(
     assignment: dict | str,
     *,
     defer_seconds: int = 300,
-) -> None:
-    try:
-        assignment_id = (
-            assignment if isinstance(assignment, str) else assignment["assignment_id"]
-        )
-        client.mark_stopped(assignment_id, defer_seconds=defer_seconds)
-    except Exception:
-        pass
+) -> bool:
+    """Best-effort checkout cleanup with bounded retry and visible failure.
+
+    The endpoint is idempotent, so retrying transport/5xx failures is safe.
+    Client errors are not retried because they need a refresh or upgrade, but
+    they are still surfaced: silently losing this transition can strand a
+    lease as apparently resumable with no checkpoint behind it.
+    """
+    assignment_id = (
+        assignment if isinstance(assignment, str) else assignment["assignment_id"]
+    )
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            client.mark_stopped(assignment_id, defer_seconds=defer_seconds)
+            return True
+        except ApiError as exc:
+            last_error = exc
+            if exc.status_code is not None and exc.status_code < 500:
+                break
+        except Exception as exc:
+            last_error = exc
+        if attempt < 2:
+            time.sleep(0.25 * (attempt + 1))
+    print(
+        f"warning: could not confirm checkout cleanup for {assignment_id} "
+        f"after {attempt + 1} attempt(s): {last_error}. The lease may appear "
+        "stuck until the server detects the stale runner; keep this message "
+        "and retry `dradar resume` after connectivity or the CLI upgrade is fixed."
+    )
+    return False
 
 
 def _discard_checkpoint_quietly(
@@ -2519,7 +2542,8 @@ def _run_worker_pool(args) -> int:
                             break
             time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
     except (KeyboardInterrupt, EOFError):
-        print("\nstopping workers safely; active tasks remain resumable...")
+        print("\nstopping workers safely; each active task is recoverable only after "
+              "a checkpoint is saved or the server confirms checkout cleanup...")
         _signal_workers(processes)
         _maintain_image_cache(client, cfg, phase="after interrupted worker pool")
         cleanup_abort_file()

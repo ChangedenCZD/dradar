@@ -308,9 +308,10 @@ class ApiClient:
     ) -> dict[str, Any]:
         """The counterpart of mark_started: this trial died client-side
         (build flake, agent crash, abandonment) with nothing uploaded, so the
-        server should stop showing the cell as 解题中. Same best-effort
-        contract — callers swallow ApiError; a stale 'running' badge also
-        self-heals server-side after est x3 with no submission."""
+        server should stop showing the cell as 解题中. Callers use bounded
+        best-effort retries and surface a final failure; current servers also
+        reopen session-bound, uncheckpointed work after its exact runner is
+        stale."""
         return self._post(
             "/api/v1/assignment/stopped",
             # A cross-session cooldown keeps a second `--parallel` process
