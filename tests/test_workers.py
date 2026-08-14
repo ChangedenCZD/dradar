@@ -502,6 +502,58 @@ def test_pool_restores_vacant_slot_when_fresh_held_work_is_waiting(
     assert "restoring worker slot 2/2" in capsys.readouterr().out
 
 
+def test_pool_child_failure_drains_sibling_without_backfill_or_signal(
+        monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=3)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client: pytest.fail("failed pool must not inspect or backfill"),
+    )
+    monkeypatch.setattr(
+        runloop, "_signal_workers",
+        lambda _processes: pytest.fail("failed pool must not signal siblings"),
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        polls = [1] if not calls else [None, 0]
+        process = _ScriptedProcess(command, env, polls, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 1
+    assert len(calls) == 2
+    assert calls[1].polls == []
+    output = capsys.readouterr().out
+    assert "disabling automatic backfill" in output
+    assert "draining workers already in flight" in output
+
+
+def test_explicit_resume_can_start_fresh_pool_after_failure_drain(
+        monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=1)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        process = _Process(command, env, returncode=1, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=1)) == 1
+    first_abort_file = runloop.Path(calls[-1].env["DRADAR_POOL_ABORT_FILE"])
+    assert not first_abort_file.exists()
+    assert runloop._run_worker_pool(_args(workers=1)) == 1
+    second_abort_file = runloop.Path(calls[-1].env["DRADAR_POOL_ABORT_FILE"])
+    assert len(calls) == 2
+    assert second_abort_file != first_abort_file
+    assert not second_abort_file.exists()
+
+
 def test_pool_does_not_restore_slot_for_future_retry(monkeypatch):
     _patch_pool_setup(monkeypatch, active_count=2)
     retry_after = datetime.now(timezone.utc) + timedelta(hours=1)

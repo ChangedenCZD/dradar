@@ -120,6 +120,33 @@ def test_checkout_loop_never_retries_a_cell_that_failed_this_session(
     assert rc == 1                            # the failure still fails the run
 
 
+def test_supervised_worker_stops_checkout_after_any_failed_outcome(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        return "failed"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    client = CheckoutClient(
+        {"active": [_cell("bad")], "free_pick": True},
+        [{"assignment": _cell("bad"), "held": 2, "unstarted": 1},
+         {"assignment": _cell("must-not-run"), "held": 2, "unstarted": 0}],
+    )
+
+    args = _args()
+    args.worker_child = True
+    rc = runloop._go_menu(args, {}, client, tmp_path)
+
+    assert rc == 1
+    assert attempts == ["bad"]
+    assert client.checkout_exclusions == [set()]
+    assert len(client._checkouts) == 1
+    assert "before resuming" in capsys.readouterr().out
+
+
 def test_checkout_loop_fuses_after_environment_build_failure(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
