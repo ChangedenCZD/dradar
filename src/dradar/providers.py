@@ -208,15 +208,24 @@ def deepseek_api_key(
     *,
     home: Path | None = None,
 ) -> str | None:
-    """Resolve the key from the environment first, then the private file."""
+    """Resolve the private file first, then fall back to the environment.
+
+    ``provider setup deepseek`` is an explicit local credential selection. A
+    stale environment variable inherited from the desktop app or shell must
+    not silently shadow the key the user just configured. Callers that pass
+    an explicit ``environ`` without ``home`` still get a hermetic,
+    environment-only lookup for tests and automation probes.
+    """
 
     env = os.environ if environ is None else environ
+    if environ is None or home is not None:
+        value = _deepseek_key_from_file(deepseek_secret_path(home))
+        if value:
+            return value
     value = env.get(DEEPSEEK_API_KEY_ENV)
     if isinstance(value, str) and value.strip():
         return value.strip()
-    if environ is not None and home is None:
-        return None
-    return _deepseek_key_from_file(deepseek_secret_path(home))
+    return None
 
 
 def deepseek_credential_source(
@@ -227,12 +236,13 @@ def deepseek_credential_source(
     """Return the active credential source without exposing its value."""
 
     env = os.environ if environ is None else environ
+    if environ is None or home is not None:
+        if _deepseek_key_from_file(deepseek_secret_path(home)):
+            return "file"
     value = env.get(DEEPSEEK_API_KEY_ENV)
     if isinstance(value, str) and value.strip():
         return "environment"
-    if environ is not None and home is None:
-        return None
-    return "file" if _deepseek_key_from_file(deepseek_secret_path(home)) else None
+    return None
 
 
 def deepseek_opted_in(environ: Mapping[str, str] | None = None) -> bool:

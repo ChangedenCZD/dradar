@@ -88,7 +88,7 @@ class FakeClient:
                            resume_generation, reason):
         self.discarded = (assignment_id, checkpoint_id, resume_generation, reason)
 
-    def mark_stopped(self, assignment_id):
+    def mark_stopped(self, assignment_id, **_kwargs):
         self.stopped.append(assignment_id)
 
 

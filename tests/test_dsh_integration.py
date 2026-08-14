@@ -80,6 +80,10 @@ def test_dsh_temporary_key_file_is_private_and_rejects_whitespace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The product deliberately prefers an explicitly configured private file
+    # over a stale environment variable. Keep this env-fallback test hermetic
+    # so a developer's real ~/.dradar credential cannot shadow its sentinel.
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "dradar-home"))
     monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "one-line-key")
     key_file = runner.create_deepseek_api_key_file(tmp_path)
     assert key_file.read_text(encoding="utf-8") == "one-line-key\n"

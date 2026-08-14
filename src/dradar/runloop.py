@@ -953,12 +953,17 @@ def _upload_trial(
     return "interrupted" if outcome == "interrupted" else "submitted"
 
 
-def _mark_stopped_quietly(client: ApiClient, assignment: dict | str) -> None:
+def _mark_stopped_quietly(
+    client: ApiClient,
+    assignment: dict | str,
+    *,
+    defer_seconds: int = 300,
+) -> None:
     try:
         assignment_id = (
             assignment if isinstance(assignment, str) else assignment["assignment_id"]
         )
-        client.mark_stopped(assignment_id)
+        client.mark_stopped(assignment_id, defer_seconds=defer_seconds)
     except Exception:
         pass
 
@@ -1120,7 +1125,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             _mark_stopped_quietly(client, assignment)
             return terminal_outcome or "failed"
         except (KeyboardInterrupt, EOFError):
-            _pause_checkpoint_quietly(client, assignment)
+            # A user can interrupt before an agent has produced a resumable
+            # checkpoint (notably DSH minimal mode). In that case there is no
+            # local recovery path, so undo the checkout stamp before bubbling
+            # the interrupt up. Otherwise the UI reports a resumable lease
+            # while every later ``dradar resume`` sees it as already checked
+            # out and has nothing it can start.
+            if _pause_checkpoint_quietly(client, assignment) is None:
+                _mark_stopped_quietly(client, assignment, defer_seconds=0)
             raise
 
     # Make the authoritative source copy immediately after Pier returns,
