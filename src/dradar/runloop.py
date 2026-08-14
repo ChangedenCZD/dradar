@@ -1194,6 +1194,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "dsh_version": art.dsh_version,
         **stats,
     }
+    if failure_kind:
+        # Keep Pier's raw exception_type for debugging, but also upload the
+        # recovery-oriented cause that the CLI already derived from the
+        # provider error.  The authenticated status view can then say
+        # "insufficient-balance" instead of the opaque wrapper exception.
+        meta["failure_kind"] = failure_kind
     if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
         # Server-side audit/gating can distinguish corrected official-catalog
         # runs from the earlier fallback-metadata benchmark without deleting
