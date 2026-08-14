@@ -4,6 +4,7 @@ import json
 import os
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from dradar import provider_config
@@ -141,3 +142,66 @@ def test_status_reports_source_without_secret(tmp_path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert str(deepseek_secret_path()) in output
     assert "sentinel-provider-secret" not in output
+
+
+def test_live_status_verifies_auth_and_required_models(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    store_deepseek_api_key("sentinel-provider-secret")
+    seen = {}
+
+    def get(url, *, headers, timeout, follow_redirects):
+        seen.update(
+            url=url, authorization=headers["Authorization"],
+            timeout=timeout, follow_redirects=follow_redirects,
+        )
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {"data": [
+                {"id": "deepseek-v4-flash"}, {"id": "deepseek-v4-pro"},
+            ]},
+        )
+
+    monkeypatch.setattr(provider_config.httpx, "get", get)
+    rc = provider_config.cmd_provider_status(
+        SimpleNamespace(provider="deepseek", live=True))
+
+    assert rc == 0
+    assert seen == {
+        "url": "https://api.deepseek.com/models",
+        "authorization": "Bearer sentinel-provider-secret",
+        "timeout": 10.0,
+        "follow_redirects": False,
+    }
+    output = capsys.readouterr().out
+    assert "verified live" in output
+    assert "sentinel-provider-secret" not in output
+
+
+def test_live_status_distinguishes_rejected_key_from_transport_failure(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    store_deepseek_api_key("sentinel-provider-secret")
+    monkeypatch.setattr(
+        provider_config.httpx, "get",
+        lambda *args, **kwargs: SimpleNamespace(status_code=401),
+    )
+    assert provider_config.cmd_provider_status(
+        SimpleNamespace(provider="deepseek", live=True)) == 1
+    rejected = capsys.readouterr().out
+    assert "HTTP 401" in rejected
+    assert "provider setup deepseek" in rejected
+    assert "sentinel-provider-secret" not in rejected
+
+    def fail(*args, **kwargs):
+        raise httpx.ConnectError("sentinel-provider-secret")
+
+    monkeypatch.setattr(provider_config.httpx, "get", fail)
+    assert provider_config.cmd_provider_status(
+        SimpleNamespace(provider="deepseek", live=True)) == 1
+    transport = capsys.readouterr().out
+    assert "network/proxy" in transport
+    assert "ConnectError" in transport
+    assert "sentinel-provider-secret" not in transport

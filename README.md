@@ -168,7 +168,7 @@ DeepSeek 格子时才会使用按量计费的 DeepSeek API。
 
 ```bash
 dradar provider setup deepseek
-dradar provider status deepseek
+dradar provider status deepseek --live
 dradar doctor
 dradar go --pick TASK_ID:deepseek-v4-flash:max
 dradar go --pick TASK_ID:deepseek-v4-pro:high
@@ -216,7 +216,7 @@ DSH Minimal 是与 Codex 分开的实验 Harness。它复用同一份本地 Deep
 
 ```bash
 dradar provider setup deepseek
-dradar provider status deepseek
+dradar provider status deepseek --live
 dradar doctor --agent dsh-minimal
 # 回到网页认领 DSH 格子后：
 dradar resume -y
