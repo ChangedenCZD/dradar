@@ -827,7 +827,7 @@ def _upload_trial(
 
     def settle_terminal_local_failure() -> None:
         """Keep evidence but make a non-retryable local result runnable again."""
-        _mark_stopped_quietly(client, assignment_id)
+        _mark_stopped_quietly(client, entry)
         item = checkpoints.find_latest(HOME, assignment_id)
         if item is not None:
             checkpoints.mark_terminal(HOME, item)
@@ -1124,10 +1124,16 @@ def _mark_stopped_quietly(
     assignment_id = (
         assignment if isinstance(assignment, str) else assignment["assignment_id"]
     )
+    resume_generation = (
+        None if isinstance(assignment, str) else assignment.get("resume_generation")
+    )
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            client.mark_stopped(assignment_id, defer_seconds=defer_seconds)
+            stop_kwargs = {"defer_seconds": defer_seconds}
+            if resume_generation is not None:
+                stop_kwargs["resume_generation"] = resume_generation
+            client.mark_stopped(assignment_id, **stop_kwargs)
             return True
         except ApiError as exc:
             last_error = exc

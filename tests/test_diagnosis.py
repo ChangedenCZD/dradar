@@ -286,9 +286,12 @@ def test_mark_stopped_retries_transient_cleanup_failure(monkeypatch, capsys):
 
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
     assert runloop._mark_stopped_quietly(
-        Client(), "assignment-1", defer_seconds=0
+        Client(),
+        {"assignment_id": "assignment-1", "resume_generation": 4},
+        defer_seconds=0,
     ) is True
     assert len(attempts) == 3
+    assert all(kwargs["resume_generation"] == 4 for _, kwargs in attempts)
     assert capsys.readouterr().out == ""
 
 
