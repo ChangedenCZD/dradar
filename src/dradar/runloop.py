@@ -735,6 +735,52 @@ def _dsh_completed_outcome(
     }
 
 
+def _bundled_completed_outcome(
+    assignment: dict, trial_dir: Path, patch: Path, result: Path | None,
+) -> dict | None:
+    """Return independent completion evidence for a Codex-family rc failure."""
+    if assignment.get("agent") in {DSH_AGENT, GROK_AGENT}:
+        return None
+    try:
+        result_value = json.loads(result.read_text(encoding="utf-8")) if result else None
+        patch_bytes = patch.read_bytes()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(result_value, dict):
+        return None
+    phases = (
+        result_value.get("environment_setup"),
+        result_value.get("agent_setup"),
+        result_value.get("agent_execution"),
+    )
+    if (
+        result_value.get("exception_info")
+        or not result_value.get("started_at")
+        or not result_value.get("finished_at")
+        or not isinstance(result_value.get("agent_result"), dict)
+        or not all(
+            isinstance(phase, dict)
+            and phase.get("started_at")
+            and phase.get("finished_at")
+            for phase in phases
+        )
+        or not patch_bytes
+        or not patch_structure_is_valid(patch_bytes)
+    ):
+        return None
+    bundle = build_codex_trajectory_bundle(trial_dir)
+    usage = codex_trajectory_bundle_usage(bundle) if bundle is not None else None
+    if usage is None or usage.get("complete") is not True:
+        return None
+    return {
+        "schema": "dradar-bundled-completion-v1",
+        "usage_schema": usage.get("schema"),
+        "agent_session_count": usage.get("agent_session_count"),
+        "root_session_count": usage.get("root_session_count"),
+        "subagent_session_count": usage.get("subagent_session_count"),
+    }
+
+
 def _upload_trial(
     client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
 ) -> str:
@@ -1267,12 +1313,10 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     )
 
     stats = summarize_result(art.result)
-    # A recorded agent exception is always interrupted.  For pinned DSH only,
-    # a nonzero outer Pier rc may happen after the agent completed and the task
-    # hook harvested its patch.  Accept that paid work only with the independent
-    # terminal sidecar + result timestamps + structurally valid patch added by
-    # this CLI version; older opaque rc=1 runs remain invalid and require an
-    # audited operator recovery.
+    # A recorded agent exception is always interrupted. A nonzero outer Pier
+    # rc may happen after the agent completed and the task hook harvested its
+    # patch. Accept that paid work only with independent DSH terminal evidence
+    # or a complete server-verifiable Codex trajectory bundle.
     dsh_completion = None
     if (
         assignment.get("agent") == DSH_AGENT
@@ -1282,8 +1326,18 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         dsh_completion = _dsh_completed_outcome(
             art.trial_dir, art.patch, art.result,
         )
+    bundled_completion = None
+    if (
+        art.returncode != 0
+        and not stats.get("exception_info")
+        and dsh_completion is None
+    ):
+        bundled_completion = _bundled_completed_outcome(
+            assignment, art.trial_dir, art.patch, art.result,
+        )
+    postrun_completion = dsh_completion or bundled_completion
     interrupted = bool(stats.get("exception_info")) or (
-        art.returncode != 0 and dsh_completion is None
+        art.returncode != 0 and postrun_completion is None
     )
     diag = diagnose_exception(art.result) if interrupted else {}
     failure_kind = diag.get("kind")
@@ -1303,9 +1357,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         )
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
           f"outcome={outcome}); uploading...")
-    if dsh_completion is not None:
+    if postrun_completion is not None:
         print(
-            "DSH agent completed and produced a verified patch; treating the "
+            "agent completed and produced independently verified artifacts; treating the "
             "nonzero Pier return code as a post-run infrastructure warning"
         )
     if interrupted:
@@ -1370,6 +1424,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 "pier_postrun_warning": True,
                 "pier_failure_phase": "post_agent",
             })
+    elif bundled_completion is not None:
+        meta.update({
+            "bundled_completion_evidence": bundled_completion,
+            "pier_postrun_warning": True,
+            "pier_failure_phase": "post_agent",
+        })
 
     if item is not None and item.job_dir == art.job_dir:
         checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)

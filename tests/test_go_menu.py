@@ -535,7 +535,7 @@ class SubmitClient(FakeClient):
         self.submissions = []
 
     def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
-               outcome="completed", resume_generation=None):
+               outcome="completed", resume_generation=None, **_kwargs):
         self.submissions.append(
             {"assignment_id": assignment_id, "outcome": outcome, "meta": meta})
         return {"submission_id": f"s-{assignment_id}", "grade_status": "pending"}
@@ -639,6 +639,68 @@ def test_nonzero_pier_rc_submits_outcome_interrupted_with_meta(monkeypatch, tmp_
     assert sub["meta"]["pier_returncode"] == 1
     assert sub["meta"]["duration_sec"] == 61.0
     assert sub["meta"]["n_input_tokens"] == 10  # token stats still reported
+
+
+def test_complete_bundle_survives_nonzero_pier_postrun_rc(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    phases = {
+        name: {
+            "started_at": "2026-08-14T00:00:01Z",
+            "finished_at": "2026-08-14T00:00:02Z",
+        }
+        for name in ("environment_setup", "agent_setup", "agent_execution")
+    }
+    art = _fake_art(tmp_path, rc=1, result_data={
+        "started_at": "2026-08-14T00:00:00Z",
+        "finished_at": "2026-08-14T00:10:00Z",
+        "exception_info": None,
+        "agent_result": {"n_agent_steps": 4},
+        **phases,
+    })
+    art.patch.write_text(
+        "diff --git a/result.txt b/result.txt\n"
+        "new file mode 100644\n--- /dev/null\n+++ b/result.txt\n"
+        "@@ -0,0 +1 @@\n+done\n",
+        encoding="utf-8",
+    )
+    bundle = {"schema_version": "test", "sessions": []}
+    usage = {
+        "schema": "dradar-codex-trajectory-bundle-v1",
+        "complete": True,
+        "agent_session_count": 2,
+        "root_session_count": 1,
+        "subagent_session_count": 1,
+        "sessions": [],
+        "n_input_tokens": 100,
+        "n_cache_tokens": 20,
+        "n_output_tokens": 5,
+    }
+    monkeypatch.setattr(
+        runloop, "build_codex_trajectory_bundle", lambda _trial_dir: bundle,
+    )
+    monkeypatch.setattr(
+        runloop, "codex_trajectory_bundle_usage", lambda _bundle: usage,
+    )
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+
+    tag = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "submitted"
+    sub = client.submissions[0]
+    assert sub["outcome"] == "completed"
+    assert sub["meta"]["pier_returncode"] == 1
+    assert sub["meta"]["pier_postrun_warning"] is True
+    assert sub["meta"]["pier_failure_phase"] == "post_agent"
+    assert sub["meta"]["bundled_completion_evidence"] == {
+        "schema": "dradar-bundled-completion-v1",
+        "usage_schema": "dradar-codex-trajectory-bundle-v1",
+        "agent_session_count": 2,
+        "root_session_count": 1,
+        "subagent_session_count": 1,
+    }
 
 
 def test_dsh_completed_agent_survives_nonzero_pier_postrun_rc(
