@@ -2846,7 +2846,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             "1", "true", "yes", "on",
         }
         if getattr(args, "refill", False):
-            if outcome != "submitted":
+            if outcome not in ("submitted", "interrupted"):
                 refill_plan.stop(HOME, f"task outcome={outcome}")
                 print(f"continuous refill stopped after outcome={outcome}; no new tasks "
                       "will be claimed, and existing leases/checkpoints stay untouched")
@@ -2898,15 +2898,20 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             getattr(args, "worker_child", False)
             and outcome not in ("submitted", "interrupted")
         )
+        continuous_claim_failure = (
+            (getattr(args, "auto", None) is not None or len(active) > 1)
+            and outcome not in ("submitted", "interrupted")
+        )
         configured_failure = configured_fail_fast and outcome != "submitted"
-        if worker_failure or configured_failure:
+        if worker_failure or continuous_claim_failure or configured_failure:
             # Large operator-managed batches should fail closed: continuing to
             # drain the queue turned one shared proxy incident into 27 invalid
             # submissions on 2026-07-16. Supervised children also fail closed
             # so their parent can drain healthy siblings without respawning a
             # worker onto the same cooled-down assignment.
-            print(f"stopping this batch runner after outcome={outcome} — fix "
-                  "the shared agent/network issue before resuming")
+            print(f"stopping this automatic batch runner after outcome={outcome} — "
+                  "fix the agent/network issue before resuming; no later task "
+                  "will be checked out")
             results.append(outcome)
             break
         if outcome == "failed" or outcome in _TERMINAL_LOCAL_OUTCOMES:

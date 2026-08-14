@@ -455,7 +455,7 @@ def test_get_assignment_403_passes_server_detail_through(monkeypatch, tmp_path: 
     assert "login --github" not in msg
 
 
-def test_terminal_local_upload_rejection_is_excluded_while_other_work_drains(
+def test_terminal_local_upload_rejection_stops_multi_cell_checkout(
         monkeypatch, tmp_path: Path):
     first = dict(ASSIGNMENT)
     second = {**ASSIGNMENT, "assignment_id": "a2", "task_id": "t2", "nonce": "n2"}
@@ -487,8 +487,8 @@ def test_terminal_local_upload_rejection_is_excluded_while_other_work_drains(
     assert runloop._run_checkout_loop(
         args, AtomicClient(), tmp_path, [first, second],
     ) == 1
-    assert ran == ["a1", "a2"]
-    assert checkout_calls[1] == {"a1"}
+    assert ran == ["a1"]
+    assert checkout_calls == [set()]
 
 
 def test_choose_menu_entry_numeric_pick(monkeypatch):
