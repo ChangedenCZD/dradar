@@ -134,6 +134,7 @@ def test_rejects_unsupported_model_or_version(tmp_path: Path) -> None:
         {"DSH_MODEL": "unexpected"},
         {"DEEPSEEK_BASE_URL": "https://unexpected.invalid"},
         {"NODE_OPTIONS": "--require=/tmp/untrusted.js"},
+        {"NODE_USE_ENV_PROXY": "0"},
     ],
 )
 def test_rejects_reserved_extra_env(tmp_path: Path, extra_env: dict[str, str]) -> None:
@@ -226,5 +227,5 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert dsh_call["cwd"] == "/app"
     assert (dsh_call.get("env") or {})["DSH_MODEL"] == RUNTIME_MODELS[model]
     assert (dsh_call.get("env") or {})["DSH_REASONING_EFFORT"] == effort
-    assert "NODE_USE_ENV_PROXY" not in (dsh_call.get("env") or {})
+    assert (dsh_call.get("env") or {})["NODE_USE_ENV_PROXY"] == "1"
     assert agent.SUPPORTS_ATIF is False
