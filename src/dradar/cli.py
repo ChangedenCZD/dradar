@@ -30,6 +30,7 @@ from .runloop import (
     cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
     cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
 )
+from .session_archive import cmd_sessions_prune
 
 __all__ = ["main"]
 
@@ -269,6 +270,18 @@ def main(argv: list[str] | None = None) -> int:
     p_cp_discard.add_argument("checkpoint_id", metavar="ID")
     p_cp_discard.set_defaults(func=cmd_checkpoint_discard, lease_hint=True)
 
+    p_sessions = sub.add_parser(
+        "sessions", help="manage opt-in local Codex session archives")
+    sessions_sub = p_sessions.add_subparsers(
+        dest="sessions_command", required=True)
+    p_sessions_prune = sessions_sub.add_parser(
+        "prune", help="show or delete archived Codex sessions")
+    p_sessions_prune.add_argument(
+        "-y", "--yes", action="store_true",
+        help="delete the archives (default: report disk usage only)",
+    )
+    p_sessions_prune.set_defaults(func=cmd_sessions_prune)
+
     for name, help_, is_resume in (
         ("go", "fetch an assignment and run it", False),
         ("resume", "continue the active assignment (no-op if none)", True),
@@ -280,6 +293,11 @@ def main(argv: list[str] | None = None) -> int:
             help="benchmark channel (default: saved channel)",
         )
         p.add_argument("--keep", action="store_true", help="keep local job dir after upload")
+        p.add_argument(
+            "--archive-session", action="store_true",
+            help="after a successful upload, privately archive Codex session "
+                 "transcripts under ~/.dradar/history (off by default)",
+        )
         p.add_argument(
             "--allow-task-drift", action="store_true",
             help="run even if your deep-swe checkout differs from the server's pinned version",
