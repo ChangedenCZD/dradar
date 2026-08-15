@@ -1485,8 +1485,8 @@ def sync_deep_swe_commit(tasks_root: Path, pinned: str) -> bool:
 def check_task_content_hash(assignment: dict, tasks_root: Path) -> bool | None:
     """Compare the server's task_content_hash against this volunteer's local
     checkout. Returns None when the assignment carries no hash to compare
-    against (older server). A mismatch is a detection signal for the server,
-    not a client-side hard stop — the caller should warn but keep running."""
+    against (older server). Callers fail closed on a mismatch unless the user
+    explicitly selected the non-comparable ``--allow-task-drift`` path."""
     expected = assignment.get("task_content_hash")
     if not expected:
         return None

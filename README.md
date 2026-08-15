@@ -416,7 +416,7 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | `-y`, `--yes` | 跳过人工确认；适合自动化。不会取消服务端领取和额度上限检查 |
 | `--keep` | 成功上传后保留最终本地任务目录，供调试或审计 |
 | `--archive-session` | 显式选择：成功上传并清理任务目录前，把 Codex session 以私有权限归档到 `~/.dradar/history/codex-sessions/`；默认关闭 |
-| `--allow-task-drift` | 允许本地 benchmark 任务内容与服务端固定版本不一致；可能影响可复现性，谨慎使用 |
+| `--allow-task-drift` | 显式允许本地 benchmark 版本或任务内容与服务端不一致；这类运行不可可靠比较，默认会在消耗模型额度前停止 |
 | `--workers N` | 由一个父进程管理 N 个并发 worker，范围 1–32，默认 1 |
 | `--workers auto` | 检测 Docker、磁盘和账号限制后选择保守并发数 |
 | `--parallel` | 高级选项：允许手工启动另一个独立 DRadar 会话；隐含 `-y` |

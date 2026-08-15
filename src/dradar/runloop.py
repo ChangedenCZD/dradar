@@ -66,7 +66,9 @@ from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 # count ceiling as a last-resort guard against corrupt estimates or a logic
 # regression; normal quota-bounded plans should never reach it.
 DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
-_TERMINAL_LOCAL_OUTCOMES = {"not-uploaded", "rejected"}
+_TERMINAL_LOCAL_OUTCOMES = {
+    "not-uploaded", "rejected", "task-content-mismatch",
+}
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
     "recovery-exhausted", "runtime-incompatible",
@@ -1271,6 +1273,15 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             )
             return "busy"
     hash_match = check_task_content_hash(assignment, tasks_root)
+    if hash_match is False and not getattr(args, "allow_task_drift", False):
+        print(
+            "refusing to start: the selected benchmark task differs from the "
+            "server copy. Restore local task changes or refresh the task pack, "
+            "then run `dradar resume`; no model quota was consumed. Use "
+            "`--allow-task-drift` only for an intentional non-comparable run."
+        )
+        _mark_stopped_quietly(client, assignment)
+        return "task-content-mismatch"
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
     for attempt in (1, 2):
@@ -2731,6 +2742,12 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                 "stopping this batch after repeated environment setup failures; "
                 "no later cell will be started. Fix Docker/network/Pier, then run "
                 "`dradar resume`."
+            )
+            break
+        if outcome == "task-content-mismatch":
+            print(
+                "stopping this batch before later cells use the same mismatched "
+                "task checkout"
             )
             break
     ok = all(o in ("submitted", "interrupted") for o in results)
