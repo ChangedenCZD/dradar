@@ -118,6 +118,58 @@ def test_upload_success_clears_ledger(tmp_path: Path, monkeypatch):
     assert pending.load(tmp_path) == []
 
 
+def test_opted_in_session_archive_runs_after_ack_before_job_cleanup(
+    tmp_path: Path, monkeypatch,
+):
+    home = tmp_path / ".dradar"
+    job_dir = home / "work" / "jobs" / "job-a1"
+    trial_dir = _make_trial_dir(job_dir, "trial")
+    session = trial_dir / "agent" / "sessions" / "2026" / "08" / "16" / "root.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text("{}\n")
+    monkeypatch.setattr(runloop, "HOME", home)
+    monkeypatch.setattr(runloop, "build_codex_trajectory_bundle", lambda _path: None)
+    client = FakeClient(lambda _aid: {
+        "submission_id": "s1", "grade_status": "pending",
+    })
+
+    outcome = runloop._upload_trial(client, _entry(
+        trial_dir, job_dir=str(job_dir), keep=False, archive_session=True,
+    ))
+
+    archived = (
+        home / "history" / "codex-sessions" / "a1" /
+        "2026" / "08" / "16" / "root.jsonl"
+    )
+    assert outcome == "submitted"
+    assert archived.read_text() == "{}\n"
+    assert not job_dir.exists()
+
+
+def test_session_archive_opt_in_persists_across_retry_but_keep_takes_precedence(
+    tmp_path: Path, monkeypatch,
+):
+    home = tmp_path / ".dradar"
+    job_dir = home / "work" / "jobs" / "job-a1"
+    trial_dir = _make_trial_dir(job_dir, "trial")
+    session = trial_dir / "agent" / "sessions" / "root.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text("{}\n")
+    monkeypatch.setattr(runloop, "HOME", home)
+    monkeypatch.setattr(runloop, "build_codex_trajectory_bundle", lambda _path: None)
+    pending.record(home, _entry(
+        trial_dir, job_dir=str(job_dir), keep=True, archive_session=True,
+    ))
+    client = FakeClient(lambda _aid: {
+        "submission_id": "s1", "grade_status": "pending",
+    })
+
+    runloop._retry_pending_uploads(client)
+
+    assert job_dir.is_dir()
+    assert not (home / "history").exists()
+
+
 def _write_codex_session(path: Path, session_id: str, role: str,
                          input_tokens: int | None, cached: int = 0,
                          output: int = 0, parent: str | None = None):

@@ -15,7 +15,7 @@ def _args(**overrides):
         dev_agent=None, refill=False, refill_to=None, max_tasks=None,
         max_estimated_quota_pct=None, quota_tier="plus", auto=5, pick=None,
         assignment=None, parallel=False, worker_child=False, resume=False,
-        worker_target_file=None,
+        worker_target_file=None, archive_session=False,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -34,6 +34,13 @@ def test_cli_accepts_auto_workers(monkeypatch):
     monkeypatch.setattr(cli, "cmd_go", lambda args: seen.append(args) or 0)
     assert cli.main(["resume", "--workers", "auto", "-y"]) == 0
     assert seen[0].workers == "auto"
+
+
+def test_cli_parses_archive_session_as_explicit_opt_in(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "cmd_go", lambda args: seen.append(args) or 0)
+    assert cli.main(["go", "--archive-session", "-y"]) == 0
+    assert seen[0].archive_session is True
 
 
 @pytest.mark.parametrize("workers", [0, 41])
@@ -120,6 +127,12 @@ def test_worker_command_never_forwards_auto_selection():
     assert "--worker-child" in command
     assert "--auto" not in command
     assert "go" not in command
+
+
+def test_worker_command_forwards_archive_opt_in_only():
+    assert "--archive-session" not in runloop._worker_command(_args())
+    assert "--archive-session" in runloop._worker_command(
+        _args(archive_session=True))
 
 
 class _Telemetry:

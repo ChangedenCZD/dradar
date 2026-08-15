@@ -57,6 +57,7 @@ from .scrub import (
     patch_structure_is_valid, redact_patch_secrets, scan_secrets,
     scrub_json_bytes,
 )
+from .session_archive import archive_after_submit
 from .telemetry import RunnerTelemetry
 from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
@@ -1039,6 +1040,8 @@ def _upload_trial(
                     # Some earlier attempt actually landed server-side even
                     # though THIS process never saw the response — good news.
                     print(f"  {task_id}: already submitted (an earlier attempt landed) — clearing it")
+                    if not ask_cleanup:
+                        archive_after_submit(HOME, entry)
                     pending.remove(HOME, assignment_id)
                     cleanup_settled()
                     return "submitted"
@@ -1069,6 +1072,8 @@ def _upload_trial(
                       "(`dradar retry-upload`)")
                 return "upload-failed"
 
+    if not ask_cleanup:
+        archive_after_submit(HOME, entry)
     pending.remove(HOME, assignment_id)
     cleanup_settled()
     if ack.get("grade_status") == "invalid":
@@ -1095,6 +1100,7 @@ def _upload_trial(
         elif ask_cleanup and Path(job_dir).is_dir():
             answer = input("  delete this task's local files now? [Y/n] ").strip().lower()
             if answer in ("", "y", "yes"):
+                archive_after_submit(HOME, entry)
                 shutil.rmtree(job_dir, ignore_errors=True)
                 print("  local task files cleaned")
             else:
@@ -1483,6 +1489,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "task_id": assignment["task_id"], "trial_dir": str(art.trial_dir),
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
+        "archive_session": getattr(args, "archive_session", False),
         "resume_generation": assignment.get("resume_generation", 0),
     }, ask_cleanup=(
         outcome == "completed"
@@ -1570,6 +1577,7 @@ def _checkpoint_upload_entry(
         "outcome": "completed",
         "job_dir": str(item.job_dir),
         "keep": args.keep,
+        "archive_session": getattr(args, "archive_session", False),
         "resume_generation": assignment.get(
             "resume_generation", item.resume_generation),
     }
@@ -2222,6 +2230,8 @@ def _worker_command(args) -> list[str]:
     ]
     if args.keep:
         command.append("--keep")
+    if getattr(args, "archive_session", False):
+        command.append("--archive-session")
     if args.allow_task_drift:
         command.append("--allow-task-drift")
     if args.dev_agent:

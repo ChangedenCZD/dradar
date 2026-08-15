@@ -415,6 +415,7 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | --- | --- |
 | `-y`, `--yes` | 跳过人工确认；适合自动化。不会取消服务端领取和额度上限检查 |
 | `--keep` | 成功上传后保留最终本地任务目录，供调试或审计 |
+| `--archive-session` | 显式选择：成功上传并清理任务目录前，把 Codex session 以私有权限归档到 `~/.dradar/history/codex-sessions/`；默认关闭 |
 | `--allow-task-drift` | 允许本地 benchmark 任务内容与服务端固定版本不一致；可能影响可复现性，谨慎使用 |
 | `--workers N` | 由一个父进程管理 N 个并发 worker，范围 1–32，默认 1 |
 | `--workers auto` | 检测 Docker、磁盘和账号限制后选择保守并发数 |
@@ -424,6 +425,9 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | `--max-estimated-quota-pct PCT` | 预计 7 天模型额度占用上限 |
 | `--quota-tier TIER` | 额度换算档位：`plus`、`pro-5x`、`pro-20x`，默认 `plus` |
 | `--max-tasks N` | 高级题数硬上限；可以低于默认内部安全上限 |
+
+归档不会写入 Codex 自己的 `~/.codex/sessions`，因此不会混入 Codex 的会话索引。
+可先用 `dradar sessions prune` 查看占用，再用 `dradar sessions prune --yes` 明确删除。
 
 `--workers` 已经负责启动和监管子进程，不能和 `--parallel` 同时使用。父进程先统一认领，
 子进程再通过服务端原子 checkout 分题，因此不会让同一 assignment 在同一批次重复运行。
