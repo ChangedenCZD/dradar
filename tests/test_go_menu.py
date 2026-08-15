@@ -570,6 +570,52 @@ def test_clean_run_submits_outcome_completed(monkeypatch, tmp_path: Path):
     assert client.submissions[0]["meta"]["codex_cli_version"] == "0.145.0"
 
 
+def test_task_content_mismatch_stops_before_model_run(
+    monkeypatch, tmp_path: Path, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    monkeypatch.setattr(runloop, "check_task_content_hash", lambda *_args: False)
+    monkeypatch.setattr(
+        runloop, "run_trial",
+        lambda *_args, **_kwargs: pytest.fail("model runner must not start"),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        runloop, "_mark_stopped_quietly",
+        lambda _client, assignment, **_kwargs: stopped.append(
+            assignment["assignment_id"]),
+    )
+    client = SubmitClient({})
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "task-content-mismatch"
+    assert stopped == ["a1"]
+    assert client.submissions == []
+    assert "no model quota was consumed" in capsys.readouterr().out
+
+
+def test_explicit_task_drift_override_keeps_existing_audited_behavior(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    monkeypatch.setattr(runloop, "check_task_content_hash", lambda *_args: False)
+    art = _fake_art(tmp_path, rc=0)
+    monkeypatch.setattr(runloop, "run_trial", lambda *_args, **_kwargs: art)
+    client = SubmitClient({})
+    args = _args()
+    args.allow_task_drift = True
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, args, "abc123",
+    )
+
+    assert outcome == "submitted"
+    assert client.submissions[0]["meta"]["task_content_hash_match"] is False
+
+
 def test_deepseek_submission_attests_catalog_and_runtime_profile(
     monkeypatch, tmp_path: Path,
 ):
@@ -873,3 +919,27 @@ def test_serial_batch_stops_before_second_cell_on_insufficient_balance(
     out = capsys.readouterr().out
     assert "stopping this worker before the next task" in out
     assert "siblings with model runs already in flight are allowed to finish" in out
+
+
+def test_serial_batch_stops_before_second_cell_on_task_content_mismatch(
+    monkeypatch, capsys, tmp_path: Path,
+):
+    attempts = []
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runloop, "_run_and_submit",
+        lambda _client, assignment, *_args, **_kwargs: (
+            attempts.append(assignment["assignment_id"])
+            or "task-content-mismatch"
+        ),
+    )
+    batch = [
+        {**ASSIGNMENT, "assignment_id": "a1", "task_id": "t1"},
+        {**ASSIGNMENT, "assignment_id": "a2", "task_id": "t2"},
+    ]
+
+    rc = runloop._run_batch(_args(), SubmitClient({}), tmp_path, batch)
+
+    assert rc == 1
+    assert attempts == ["a1"]
+    assert "same mismatched task checkout" in capsys.readouterr().out
