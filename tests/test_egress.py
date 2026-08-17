@@ -11,6 +11,7 @@ from dradar import egress, pier_sitecustomize
 
 
 _REAL_ENSURE_IMAGE = egress.ensure_egress_proxy_image
+_REAL_PREPARE_RUNTIME = egress.prepare_egress_proxy_runtime
 _TEST_IMAGE = "sha256:" + "a" * 64
 
 
@@ -116,6 +117,68 @@ def test_container_no_proxy_override_is_isolated(monkeypatch):
     runtime = egress.pier_egress_environment(_TEST_IMAGE)
 
     assert runtime["DRADAR_EGRESS_BUILD_NO_PROXY"] == "container-only.example"
+
+
+def test_prepare_rejects_loopback_proxy_with_container_buildx(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV,
+        "http://127.0.0.1:43128",
+    )
+    monkeypatch.setattr(
+        egress, "ensure_egress_proxy_image", lambda *_args, **_kwargs: _TEST_IMAGE,
+    )
+    monkeypatch.setattr(
+        egress,
+        "_active_buildx_driver",
+        lambda _docker: "docker-container",
+    )
+
+    with pytest.raises(egress.EgressProxyError) as caught:
+        _REAL_PREPARE_RUNTIME("docker")
+
+    hint = str(caught.value)
+    assert "buildx docker-container" in hint
+    assert egress.DRADAR_CONTAINER_HTTP_PROXY_ENV in hint
+    assert "<docker-reachable-host>:<port>" in hint
+
+
+def test_prepare_accepts_explicit_docker_reachable_proxy(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV,
+        "http://127.0.0.1:43128",
+    )
+    monkeypatch.setenv(
+        egress.DRADAR_CONTAINER_HTTP_PROXY_ENV,
+        "http://docker-proxy.example:18080",
+    )
+    monkeypatch.setattr(
+        egress, "ensure_egress_proxy_image", lambda *_args, **_kwargs: _TEST_IMAGE,
+    )
+    monkeypatch.setattr(
+        egress,
+        "_active_buildx_driver",
+        lambda _docker: "docker-container",
+    )
+
+    runtime = _REAL_PREPARE_RUNTIME("docker")
+
+    assert runtime["DRADAR_EGRESS_UPSTREAM_HOST"] == "docker-proxy.example"
+
+
+def test_active_buildx_driver_reads_selected_json_record(monkeypatch):
+    output = (
+        '{"Current":false,"Driver":"docker","Name":"default"}\n'
+        '{"Current":true,"Driver":"docker-container","Name":"selected"}'
+    )
+    monkeypatch.setattr(
+        egress.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=output, stderr="",
+        ),
+    )
+
+    assert egress._active_buildx_driver("docker") == "docker-container"
 
 
 def test_usable_standard_http_proxy_wins_over_unrelated_socks_proxy(monkeypatch):
