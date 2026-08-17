@@ -213,7 +213,8 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert "agentPreset: preset.id" in runner
     assert 'event.type === "assistant/chunk"' in runner
     assert 'usageByStep.set(`${event.data.turn}:${event.data.step}`' in runner
-    assert 'schema: "dsh-provider-usage-v1"' in runner
+    assert 'schema: "dsh-provider-usage-v2"' in runner
+    assert "occurredAt: usageTimestamp(event)" in runner
     assert "writeFileSync(process.env.DSH_USAGE_FILE" in runner
     assert 'schema: "dradar-dsh-outcome-v1"' in runner
     assert "assignmentId: process.env.DRADAR_ASSIGNMENT_ID" in runner

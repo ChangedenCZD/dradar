@@ -24,15 +24,17 @@ def _session(path: Path, session_id: str, role: str, usages: list[dict],
             {"type": "event_msg", "payload": {
                 "type": "token_count", "info": {
                     "total_token_usage": inherited},
-            }},
+            }, "timestamp": "2026-08-17T00:59:58Z"},
         ]
     events += [
         {"type": "event_msg", "payload": {"type": "task_started"}},
         {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}},
     ]
-    events += [{"type": "event_msg", "payload": {
+    events += [{"type": "event_msg", "timestamp": (
+        f"2026-08-17T01:00:{index:02d}Z"
+    ), "payload": {
         "type": "token_count", "info": {"total_token_usage": usage},
-    }} for usage in usages]
+    }} for index, usage in enumerate(usages)]
     path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
 
 
@@ -62,6 +64,8 @@ def test_aggregates_final_root_and_subagent_counters(tmp_path: Path):
     assert usage["n_output_tokens"] == 15
     assert usage["n_reasoning_output_tokens"] == 7
     assert usage["sessions"][1]["parent_session_id"] == "root-1"
+    assert usage["timed_usage_complete"] is True
+    assert len(usage["token_usage_events"]) == 3
 
 
 def test_duplicate_session_id_uses_largest_cumulative_record(tmp_path: Path):

@@ -21,6 +21,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -1063,6 +1064,17 @@ def _codex_usage(value) -> dict | None:
     return counters
 
 
+def _codex_event_timestamp(event: dict) -> str | None:
+    value = event.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if instant.tzinfo is not None else None
+
+
 def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
     """Describe one Codex JSONL file and isolate this agent's own usage.
 
@@ -1103,7 +1115,8 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
                 usage = _codex_usage(
                     info.get("total_token_usage") if isinstance(info, dict) else None)
                 if usage is not None:
-                    usage_events.append((index, usage))
+                    usage_events.append(
+                        (index, usage, _codex_event_timestamp(event)))
 
     # Root files start at zero.  Child files containing an inherited prefix
     # have multiple session_meta/task_started events; their last task_started
@@ -1117,7 +1130,7 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
     )}
     baseline_found = not inherited_prefix
     if inherited_prefix:
-        for index, usage in usage_events:
+        for index, usage, _timestamp in usage_events:
             if index >= boundary:
                 break
             baseline = usage
@@ -1131,6 +1144,37 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
         if (all(value >= 0 for value in candidate.values())
                 and candidate["cached_input_tokens"] <= candidate["input_tokens"]):
             own_usage = candidate
+
+    timed_usage = []
+    timed_usage_complete = baseline_found
+    previous = baseline
+    for index, cumulative, occurred_at in usage_events:
+        if index < boundary:
+            continue
+        delta = {name: cumulative[name] - previous[name] for name in previous}
+        if (occurred_at is None or any(value < 0 for value in delta.values())
+                or delta["cached_input_tokens"] > delta["input_tokens"]):
+            timed_usage_complete = False
+            break
+        if any(delta.values()):
+            timed_usage.append({
+                "occurred_at": occurred_at,
+                "n_input_tokens": delta["input_tokens"],
+                "n_cache_tokens": delta["cached_input_tokens"],
+                "n_output_tokens": delta["output_tokens"],
+            })
+        previous = cumulative
+    if own_usage is None or not timed_usage:
+        timed_usage_complete = False
+    if timed_usage_complete:
+        timed_totals = {
+            "input_tokens": sum(item["n_input_tokens"] for item in timed_usage),
+            "cached_input_tokens": sum(
+                item["n_cache_tokens"] for item in timed_usage),
+            "output_tokens": sum(item["n_output_tokens"] for item in timed_usage),
+        }
+        if any(timed_totals[name] != own_usage[name] for name in timed_totals):
+            timed_usage_complete = False
 
     model_name = None
     for event in events[boundary:]:
@@ -1149,6 +1193,8 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
         "inherited_usage": baseline if baseline_found else None,
         "total_usage": final_usage,
         "usage": own_usage,
+        "token_usage_events": timed_usage if timed_usage_complete else [],
+        "timed_usage_complete": timed_usage_complete,
         "complete": (
             role != "unknown" and model_name is not None and own_usage is not None
         ),
@@ -1269,6 +1315,16 @@ def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
         "n_reasoning_output_tokens": sum(
             item["n_reasoning_output_tokens"] for item in usage_sessions),
     }
+    token_usage_events = [
+        event
+        for item in representatives.values()
+        for event in item["token_usage_events"]
+    ]
+    token_usage_events.sort(key=lambda item: item["occurred_at"])
+    timed_usage_complete = (
+        complete
+        and all(item["timed_usage_complete"] for item in representatives.values())
+    )
     return {
         "schema_version": CODEX_TRAJECTORY_BUNDLE_SCHEMA,
         "complete": complete,
@@ -1278,6 +1334,8 @@ def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
         "subagent_session_count": sum(1 for item in representatives.values()
                                       if item["role"] == "subagent"),
         "aggregate_usage": aggregate,
+        "token_usage_events": token_usage_events if timed_usage_complete else [],
+        "timed_usage_complete": timed_usage_complete,
         "usage_sessions": usage_sessions,
         "sessions": sessions,
     }
@@ -1293,6 +1351,8 @@ def codex_trajectory_bundle_usage(bundle: dict) -> dict:
         "root_session_count": bundle["root_session_count"],
         "subagent_session_count": bundle["subagent_session_count"],
         **bundle["aggregate_usage"],
+        "token_usage_events": bundle.get("token_usage_events", []),
+        "timed_usage_complete": bool(bundle.get("timed_usage_complete")),
         "sessions": bundle["usage_sessions"],
     }
 
