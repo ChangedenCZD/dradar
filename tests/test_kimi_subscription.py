@@ -229,6 +229,10 @@ def test_pier_command_uses_private_kimi_adapter_without_secrets(
     assert "must-not-leak" not in joined
     adapter = home / runner.KIMI_AGENT_MODULE_FILENAME
     assert adapter.read_bytes() == Path(runner.__file__).with_name("pier_kimi.py").read_bytes()
+    recovery = home / runner.KIMI_RECOVERY_MODULE_FILENAME
+    assert recovery.read_bytes() == (
+        Path(runner.__file__).with_name("kimi_recovery.py").read_bytes()
+    )
 
     env = runner._pier_process_env(assignment, kimi_module_dir=home)
     assert all(name not in env for name in KIMI_API_KEY_ENVS)
@@ -302,6 +306,9 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert 'kwargs.setdefault("trust_env", True)' in source
     assert "aiohttp.ClientSession = _proxy_aware_client_session" in source
     assert '"--print"' in source
+    assert "run_with_kimi_resume" in source
+    assert '"--session", session_id' in source
+    assert 'tee = "tee -a" if append else "tee"' in source
     assert '"--config-file", remote_config' in source
     assert '"--agent-file", remote_agent_spec' in source
     assert "provider.with_thinking(effort).with_generation_kwargs" in source
