@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -604,11 +605,60 @@ def pier_egress_environment(image: str | None = None) -> dict[str, str]:
     }
 
 
+def _active_buildx_driver(docker: str) -> str | None:
+    """Return the selected buildx driver without changing Docker state."""
+
+    try:
+        proc = subprocess.run(
+            [docker, "buildx", "ls", "--format", "{{json .}}"],
+            capture_output=True,
+            text=True,
+            timeout=_IMAGE_INSPECT_TIMEOUT_SEC,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if item.get("Current") is True:
+            driver = item.get("Driver")
+            return driver.strip().lower() if isinstance(driver, str) else None
+    return None
+
+
+def _validate_build_proxy_compatibility(
+    docker: str, runtime: dict[str, str],
+) -> None:
+    """Reject a known build-stage proxy mapping that BuildKit cannot resolve."""
+
+    if runtime.get("DRADAR_EGRESS_UPSTREAM_HOST") != "host.docker.internal":
+        return
+    if _active_buildx_driver(docker) != "docker-container":
+        return
+    raise EgressProxyError(
+        "the active Docker buildx docker-container driver cannot resolve the "
+        "host-gateway mapping required by a loopback proxy during the agent "
+        "image build; set "
+        f"{DRADAR_CONTAINER_HTTP_PROXY_ENV}="
+        "http://<docker-reachable-host>:<port> to an HTTP proxy address that "
+        "a Docker bridge container can reach, then rerun doctor"
+    )
+
+
 def prepare_egress_proxy_runtime(
     docker: str | None = None, *, announce: bool = False,
 ) -> dict[str, str]:
-    image = ensure_egress_proxy_image(docker, announce=announce)
-    return pier_egress_environment(image)
+    resolved_docker = docker or shutil.which("docker")
+    image = ensure_egress_proxy_image(resolved_docker, announce=announce)
+    runtime = pier_egress_environment(image)
+    if resolved_docker:
+        _validate_build_proxy_compatibility(resolved_docker, runtime)
+    return runtime
 
 
 def _runtime_proxy_container_env(runtime: dict[str, str], token: str) -> dict[str, str]:

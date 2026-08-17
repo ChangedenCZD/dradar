@@ -855,6 +855,8 @@ def _run_grok_live_probe(cli: str, credential: Path, root: Path) -> str | None:
         if grok_auth_error(native_auth) is None:
             _replace_private_file(native_auth, credential)
     output = f"{proc.stdout}\n{proc.stderr}"
+    if "settings fetch failed" in output.lower():
+        return "Grok live model check failed; check this machine's network/proxy"
     if "not authenticated" in output.lower():
         return (
             "Grok OAuth session is not authenticated; run "

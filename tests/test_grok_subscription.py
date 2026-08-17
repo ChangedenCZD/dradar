@@ -301,3 +301,24 @@ def test_grok_live_probe_rejects_unauthenticated_fallback(
     issue = providers.grok_live_error("/usr/bin/grok", auth) or ""
     assert "not authenticated" in issue
     assert "dradar provider setup grok" in issue
+
+
+def test_grok_live_probe_rejects_offline_builtin_catalog_as_network_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    monkeypatch.setattr(
+        providers.subprocess, "run",
+        lambda cmd, **kwargs: providers.subprocess.CompletedProcess(
+            cmd,
+            0,
+            "You are logged in with grok.com.\n"
+            "Settings fetch failed max_attempts=3\n"
+            "Default model: grok-4.5\nAvailable models:\n  * grok-4.5\n",
+            "",
+        ),
+    )
+
+    issue = providers.grok_live_error("/usr/bin/grok", auth) or ""
+    assert "network/proxy" in issue
+    assert "cannot access" not in issue
