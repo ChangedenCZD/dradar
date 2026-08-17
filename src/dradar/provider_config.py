@@ -507,7 +507,11 @@ def _setup_grok_subscription() -> int:
             prefix=".grok-login-", dir=home.parent,
         ) as name:
             native_home = Path(name)
-            env = dict(os.environ)
+            # Grok is a Rust binary and does not read macOS System
+            # Configuration proxies itself.  Preserve explicit shell proxy
+            # variables and fill otherwise-missing values from the OS proxy
+            # settings, just as the installer and live probe do.
+            env = provider_subprocess_env()
             env["HOME"] = str(native_home)
             env.pop("GROK_HOME", None)
             env.pop(GROK_API_KEY_ENV, None)
