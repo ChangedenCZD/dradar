@@ -320,7 +320,9 @@ def cmd_doctor(args) -> int:
                 egress_ready, egress_hint = egress.egress_proxy_preflight(
                     docker, plat,
                 )
-                egress_label = "pinned Pier egress image (amd64/arm64)"
+                egress_label = (
+                    "container network for Pier — pinned egress image (amd64/arm64)"
+                )
             all_ok &= _check(
                 egress_label,
                 egress_ready,

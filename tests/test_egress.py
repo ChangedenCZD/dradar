@@ -82,6 +82,42 @@ def test_remote_proxy_keeps_the_users_own_host_and_port(monkeypatch):
     )
 
 
+def test_container_proxy_override_does_not_change_host_proxy(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV,
+        "http://127.0.0.1:43128",
+    )
+    monkeypatch.setenv(
+        egress.DRADAR_CONTAINER_HTTP_PROXY_ENV,
+        "http://docker-proxy.example:18080",
+    )
+
+    runtime = egress.pier_egress_environment(_TEST_IMAGE)
+    download_proxy = egress._download_proxy_settings(
+        "https://github.com/example", dict(egress.os.environ),
+    )
+
+    assert runtime["DRADAR_EGRESS_UPSTREAM_HOST"] == "docker-proxy.example"
+    assert runtime["DRADAR_EGRESS_UPSTREAM_PORT"] == "18080"
+    assert download_proxy == ("http://127.0.0.1:43128", False)
+
+
+def test_container_no_proxy_override_is_isolated(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_CONTAINER_HTTP_PROXY_ENV,
+        "http://docker-proxy.example:18080",
+    )
+    monkeypatch.setenv(egress.DRADAR_NO_PROXY_ENV, "host-only.example")
+    monkeypatch.setenv(
+        egress.DRADAR_CONTAINER_NO_PROXY_ENV,
+        "container-only.example",
+    )
+
+    runtime = egress.pier_egress_environment(_TEST_IMAGE)
+
+    assert runtime["DRADAR_EGRESS_BUILD_NO_PROXY"] == "container-only.example"
+
+
 def test_usable_standard_http_proxy_wins_over_unrelated_socks_proxy(monkeypatch):
     monkeypatch.delenv(egress.DRADAR_HTTP_PROXY_ENV, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:39081")
@@ -321,3 +357,47 @@ def test_runtime_probe_keeps_credentials_out_of_process_arguments(monkeypatch):
     assert "UPSTREAM_PROXY_PASSWORD" in run_command
     assert "do-not-leak" not in " ".join(run_command)
     assert calls[-1][0][0:3] == ["docker", "rm", "--force"]
+
+
+def test_runtime_failure_explains_host_container_proxy_split(monkeypatch):
+    monkeypatch.setattr(
+        egress,
+        "provider_subprocess_env",
+        lambda: {"HTTPS_PROXY": "http://127.0.0.1:43128"},
+    )
+
+    hint = egress._runtime_proxy_failure_hint({})
+
+    assert "host-side proxy is available" in hint
+    assert egress.DRADAR_HTTP_PROXY_ENV in hint
+    assert egress.DRADAR_CONTAINER_HTTP_PROXY_ENV in hint
+    assert "relay" not in hint
+
+
+def test_runtime_failure_rejects_guessed_hostnames_and_relays(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV,
+        "http://127.0.0.1:43128",
+    )
+    runtime = {
+        "DRADAR_EGRESS_UPSTREAM_HOST": "host.docker.internal",
+        "DRADAR_EGRESS_UPSTREAM_PORT": "43128",
+    }
+
+    hint = egress._runtime_proxy_failure_hint(runtime)
+
+    assert egress.DRADAR_CONTAINER_HTTP_PROXY_ENV in hint
+    assert "do not guess Docker hostnames" in hint
+    assert "do not guess" in hint and "relay containers" in hint
+
+
+def test_runtime_failure_names_explicit_container_override(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_CONTAINER_HTTP_PROXY_ENV,
+        "http://docker-proxy.example:18080",
+    )
+
+    hint = egress._runtime_proxy_failure_hint({})
+
+    assert egress.DRADAR_CONTAINER_HTTP_PROXY_ENV in hint
+    assert "Docker bridge container" in hint
