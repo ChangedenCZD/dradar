@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import os
 import shutil
 import subprocess
@@ -37,9 +38,12 @@ from .providers import (
     kimi_auth_path,
     kimi_cli_path,
     kimi_home,
+    managed_grok_cli_path,
+    managed_kimi_cli_path,
     parse_kimi_cli_version,
     parse_grok_cli_version,
     parse_zcode_cli_version,
+    provider_subprocess_env,
     store_grok_auth,
     store_deepseek_api_key,
     store_zcode_cli,
@@ -54,6 +58,171 @@ from .providers import (
 
 _DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
 _ZCODE_MODELS_URL = "https://open.bigmodel.cn/api/coding/paas/v4/models"
+_GROK_INSTALLER_URL = "https://x.ai/cli/install.sh"
+_GROK_INSTALLER_SHA256 = (
+    "43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
+)
+
+
+def _private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(path, 0o700)
+
+
+def _grok_cli_version(executable: str | Path) -> str | None:
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_grok_cli_version(result.stdout + "\n" + result.stderr)
+
+
+def _kimi_cli_version(executable: str | Path) -> str | None:
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_kimi_cli_version(result.stdout + "\n" + result.stderr)
+
+
+def _install_managed_grok_cli() -> str | None:
+    """Install the current stable Grok release into DRadar's private slot."""
+
+    bash = shutil.which("bash")
+    if not bash:
+        print(
+            "Could not auto-install Grok: bash is unavailable. Install Git Bash "
+            "on Windows, or bash on Linux/macOS, then retry."
+        )
+        return None
+    target = managed_grok_cli_path()
+    runtime = target.parent.parent
+    _private_directory(runtime)
+    _private_directory(target.parent)
+    try:
+        response = httpx.get(
+            _GROK_INSTALLER_URL, timeout=30.0, follow_redirects=True,
+        )
+    except httpx.HTTPError as exc:
+        print(f"Could not download the official Grok installer: {type(exc).__name__}.")
+        return None
+    if response.status_code != 200 or not response.content.startswith(b"#!"):
+        print(
+            "Could not download the official Grok installer "
+            f"(HTTP {response.status_code})."
+        )
+        return None
+    if hashlib.sha256(response.content).hexdigest() != _GROK_INSTALLER_SHA256:
+        print(
+            "The official Grok installer changed since this DRadar release; "
+            "refusing to execute it until the new script is reviewed."
+        )
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix=".install-", dir=runtime) as name:
+            script = Path(name) / "install.sh"
+            script.write_bytes(response.content)
+            if os.name != "nt":
+                script.chmod(0o700)
+            installer_home = runtime / "installer-home"
+            _private_directory(installer_home)
+            env = provider_subprocess_env()
+            env["HOME"] = str(installer_home)
+            env["GROK_BIN_DIR"] = str(target.parent)
+            env["GROK_CHANNEL"] = "stable"
+            for key in ("GROK_DEPLOYMENT_KEY", GROK_API_KEY_ENV):
+                env.pop(key, None)
+            print(f"Installing official Grok CLI {GROK_CLI_VERSION} for DRadar...")
+            result = subprocess.run(
+                [bash, str(script), GROK_CLI_VERSION], env=env, check=False,
+            )
+    except OSError as exc:
+        print(f"Could not install Grok CLI: {exc}")
+        return None
+    if result.returncode != 0 or _grok_cli_version(target) != GROK_CLI_VERSION:
+        print("The official Grok installer completed without a usable DRadar runtime.")
+        return None
+    return str(target)
+
+
+def _install_managed_kimi_cli() -> str | None:
+    """Install the current stable Kimi release into DRadar's private slot."""
+
+    uv = shutil.which("uv")
+    if not uv:
+        print(
+            "Could not auto-install Kimi Code because uv is unavailable. "
+            "Install uv, then retry."
+        )
+        return None
+    target = managed_kimi_cli_path()
+    runtime = target.parent.parent
+    _private_directory(runtime)
+    _private_directory(target.parent)
+    env = dict(os.environ)
+    env["UV_TOOL_DIR"] = str(runtime / "tools")
+    env["UV_TOOL_BIN_DIR"] = str(target.parent)
+    env["UV_PYTHON_INSTALL_DIR"] = str(runtime / "python")
+    print(f"Installing official Kimi Code CLI {KIMI_CLI_VERSION} for DRadar...")
+    try:
+        result = subprocess.run(
+            [
+                uv, "tool", "install", "--force", "--refresh", "--python", "3.13",
+                f"kimi-cli=={KIMI_CLI_VERSION}",
+            ],
+            env=env,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"Could not install Kimi Code CLI: {exc}")
+        return None
+    if result.returncode != 0 or _kimi_cli_version(target) != KIMI_CLI_VERSION:
+        print("The official Kimi installer completed without a usable DRadar runtime.")
+        return None
+    return str(target)
+
+
+def _ensure_grok_cli() -> str | None:
+    executable = grok_cli_path()
+    found = _grok_cli_version(executable) if executable else None
+    if found == GROK_CLI_VERSION:
+        return executable
+    if executable:
+        print(
+            f"Found Grok CLI {found or 'unknown'}; preparing current DRadar "
+            f"runtime {GROK_CLI_VERSION} without changing the global install."
+        )
+    return _install_managed_grok_cli()
+
+
+def _ensure_kimi_cli() -> str | None:
+    executable = kimi_cli_path()
+    found = _kimi_cli_version(executable) if executable else None
+    if found == KIMI_CLI_VERSION:
+        return executable
+    if executable:
+        print(
+            f"Found Kimi Code CLI {found or 'unknown'}; preparing current DRadar "
+            f"runtime {KIMI_CLI_VERSION} without changing the global install."
+        )
+    return _install_managed_kimi_cli()
 
 
 def cmd_provider_setup(args) -> int:
@@ -312,34 +481,25 @@ def _live_zcode_status(key: str) -> int:
 def _setup_grok_subscription() -> int:
     """Launch official device OAuth in a DRadar-owned GROK_HOME."""
 
+    executable = _ensure_grok_cli()
+    if not executable:
+        return 1
+    if grok_auth_error() is None:
+        live_issue = grok_live_error(executable, grok_auth_path())
+        if live_issue is None:
+            print(
+                f"Grok subscription provider is already ready (CLI "
+                f"{GROK_CLI_VERSION}, {GROK_MODEL} verified)."
+            )
+            return 0
     if not sys.stdin.isatty():
         print(
-            "Grok subscription setup needs an interactive terminal. Run:\n"
+            f"Grok CLI {GROK_CLI_VERSION} is ready. OAuth setup needs an "
+            "interactive terminal. Run:\n"
             "  dradar provider setup grok\n"
             "This opens the official xAI device OAuth flow; no API key is accepted."
         )
         return 2
-    executable = grok_cli_path()
-    if not executable:
-        print(
-            "Official Grok CLI was not found. Install version "
-            f"{GROK_CLI_VERSION}, then run `dradar provider setup grok` again."
-        )
-        return 1
-    try:
-        version = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"could not verify Grok CLI: {exc}")
-        return 1
-    found_version = parse_grok_cli_version(version.stdout)
-    if version.returncode != 0 or found_version != GROK_CLI_VERSION:
-        print(
-            f"Grok CLI {GROK_CLI_VERSION} is required; found "
-            f"{found_version or 'unknown'}."
-        )
-        return 1
     home = grok_home()
     home.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -382,18 +542,12 @@ def _status_grok_subscription() -> int:
     if not executable:
         print("Grok subscription provider not ready: official Grok CLI not found.")
         return 1
-    try:
-        proc = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Grok subscription provider not ready: {exc}")
-        return 1
-    found_version = parse_grok_cli_version(proc.stdout)
-    if proc.returncode != 0 or found_version != GROK_CLI_VERSION:
+    found_version = _grok_cli_version(executable)
+    if found_version != GROK_CLI_VERSION:
         print(
             f"Grok subscription provider not ready: CLI {GROK_CLI_VERSION} "
-            f"required, found {found_version or 'unknown'}."
+            f"required, found {found_version or 'unknown'}. Run "
+            "`dradar provider setup grok` to prepare it automatically."
         )
         return 1
     issue = grok_auth_error()
@@ -415,40 +569,32 @@ def _status_grok_subscription() -> int:
 def _setup_kimi_subscription() -> int:
     """Launch Kimi's device OAuth in a dedicated DRadar data root."""
 
+    executable = _ensure_kimi_cli()
+    if not executable:
+        return 1
+    if kimi_auth_error() is None:
+        print(
+            f"Kimi subscription provider is already ready "
+            f"(CLI {KIMI_CLI_VERSION})."
+        )
+        return 0
     if not sys.stdin.isatty():
         print(
-            "Kimi Code subscription setup needs an interactive terminal. Run:\n"
+            f"Kimi Code CLI {KIMI_CLI_VERSION} is ready. OAuth setup needs an "
+            "interactive terminal. Run:\n"
             "  dradar provider setup kimi\n"
             "This opens the official Kimi device OAuth flow; no API key is accepted."
         )
         return 2
-    executable = kimi_cli_path()
-    if not executable:
-        print(
-            "Official Kimi Code CLI was not found. Install version "
-            f"{KIMI_CLI_VERSION}, then run `dradar provider setup kimi` again."
-        )
-        return 1
-    try:
-        version = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"could not verify Kimi Code CLI: {exc}")
-        return 1
-    found_version = parse_kimi_cli_version(version.stdout)
-    if version.returncode != 0 or found_version != KIMI_CLI_VERSION:
-        print(
-            f"Kimi Code CLI {KIMI_CLI_VERSION} is required; found "
-            f"{found_version or 'unknown'}."
-        )
-        return 1
     home = kimi_home()
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
         os.chmod(home, 0o700)
     env = dict(os.environ)
-    env["KIMI_CODE_HOME"] = str(home)
+    # Kimi CLI 1.x stores both config and OAuth state under KIMI_SHARE_DIR.
+    # KIMI_CODE_HOME was the pre-1.x setting and is ignored by current builds.
+    env["KIMI_SHARE_DIR"] = str(home)
+    env.pop("KIMI_CODE_HOME", None)
     env["KIMI_DISABLE_TELEMETRY"] = "1"
     env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
     env["KIMI_CLI_NO_AUTO_UPDATE"] = "1"
@@ -485,18 +631,12 @@ def _status_kimi_subscription() -> int:
     if not executable:
         print("Kimi subscription provider not ready: official Kimi CLI not found.")
         return 1
-    try:
-        proc = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Kimi subscription provider not ready: {exc}")
-        return 1
-    found_version = parse_kimi_cli_version(proc.stdout)
-    if proc.returncode != 0 or found_version != KIMI_CLI_VERSION:
+    found_version = _kimi_cli_version(executable)
+    if found_version != KIMI_CLI_VERSION:
         print(
             f"Kimi subscription provider not ready: CLI {KIMI_CLI_VERSION} "
-            f"required, found {found_version or 'unknown'}."
+            f"required, found {found_version or 'unknown'}. Run "
+            "`dradar provider setup kimi` to prepare it automatically."
         )
         return 1
     issue = kimi_auth_error()
