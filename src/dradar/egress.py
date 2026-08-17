@@ -45,6 +45,8 @@ EGRESS_PROXY_IMAGE_OVERRIDE_ENV = "DRADAR_EGRESS_PROXY_IMAGE_OVERRIDE"
 EGRESS_PROXY_LEGACY_MODE = "legacy-build"
 DRADAR_HTTP_PROXY_ENV = "DRADAR_HTTP_PROXY"
 DRADAR_NO_PROXY_ENV = "DRADAR_NO_PROXY"
+DRADAR_CONTAINER_HTTP_PROXY_ENV = "DRADAR_CONTAINER_HTTP_PROXY"
+DRADAR_CONTAINER_NO_PROXY_ENV = "DRADAR_CONTAINER_NO_PROXY"
 _IMAGE_PULL_TIMEOUT_SEC = 300
 _IMAGE_INSPECT_TIMEOUT_SEC = 15
 _RUNTIME_PROBE_TIMEOUT_SEC = 20
@@ -515,6 +517,14 @@ def _proxy_value(env: dict[str, str]) -> str | None:
     return first_standard_value
 
 
+def _container_proxy_value(env: dict[str, str]) -> str | None:
+    """Return the explicit Docker/Pier override, or the host-side default."""
+
+    if value := env.get(DRADAR_CONTAINER_HTTP_PROXY_ENV, "").strip():
+        return value
+    return _proxy_value(env)
+
+
 def _validate_proxy_credential(value: str, label: str) -> str:
     decoded = urllib.parse.unquote(value)
     if any(character.isspace() for character in decoded) or "#" in decoded:
@@ -532,7 +542,7 @@ def _upstream_proxy_environment(
     # developer's macOS/OrbStack setup. provider_subprocess_env still handles
     # OS proxy discovery for host-side OAuth, independently.
     env = source_env if source_env is not None else dict(os.environ)
-    raw = _proxy_value(env)
+    raw = _container_proxy_value(env)
     if not raw:
         return {}
     parsed = urllib.parse.urlsplit(raw)
@@ -572,7 +582,8 @@ def _upstream_proxy_environment(
         result["DRADAR_EGRESS_UPSTREAM_USERNAME"] = username
         result["DRADAR_EGRESS_UPSTREAM_PASSWORD"] = password
     no_proxy = (
-        env.get(DRADAR_NO_PROXY_ENV)
+        env.get(DRADAR_CONTAINER_NO_PROXY_ENV)
+        or env.get(DRADAR_NO_PROXY_ENV)
         or env.get("NO_PROXY")
         or env.get("no_proxy")
     )
@@ -639,6 +650,44 @@ def _published_host_port(docker: str, container_name: str) -> int | None:
     return None
 
 
+def _runtime_proxy_failure_hint(
+    runtime: dict[str, str], source_env: dict[str, str] | None = None,
+) -> str:
+    """Explain the host/container boundary without guessing local topology."""
+
+    env = dict(os.environ) if source_env is None else source_env
+    if env.get(DRADAR_CONTAINER_HTTP_PROXY_ENV, "").strip():
+        return (
+            "the Pier container cannot reach registry.npmjs.org through "
+            f"{DRADAR_CONTAINER_HTTP_PROXY_ENV}; verify that URL from a Docker "
+            "bridge container and retry"
+        )
+    if runtime.get("DRADAR_EGRESS_UPSTREAM_HOST"):
+        return (
+            "the host proxy is configured, but the Pier container cannot reach "
+            "it; if Docker needs a different address, set "
+            f"{DRADAR_CONTAINER_HTTP_PROXY_ENV}=http://<docker-reachable-host>:<port> "
+            "and retry; do not guess Docker hostnames or start relay containers"
+        )
+    host_env = provider_subprocess_env() if source_env is None else source_env
+    if _proxy_value(host_env):
+        return (
+            "a host-side proxy is available, but the Pier container is trying "
+            "direct networking; set "
+            f"{DRADAR_HTTP_PROXY_ENV}=http://<host>:<port> when one URL works on "
+            "both sides, or set "
+            f"{DRADAR_CONTAINER_HTTP_PROXY_ENV}=http://<docker-reachable-host>:<port> "
+            "for Docker only"
+        )
+    return (
+        "the Pier container cannot reach registry.npmjs.org directly; set "
+        f"{DRADAR_HTTP_PROXY_ENV}=http://<host>:<port> when one URL works on both "
+        "sides, or set "
+        f"{DRADAR_CONTAINER_HTTP_PROXY_ENV}=http://<docker-reachable-host>:<port> "
+        "for Docker only"
+    )
+
+
 def _probe_runtime_egress(
     docker: str, image: str, runtime: dict[str, str],
 ) -> None:
@@ -693,15 +742,12 @@ def _probe_runtime_egress(
                     last_error = exc
                     time.sleep(0.2)
         if response is None:
-            raise EgressProxyError(
-                "the Pier container cannot reach registry.npmjs.org; set "
-                f"{DRADAR_HTTP_PROXY_ENV}=http://host:port (and optionally "
-                f"{DRADAR_NO_PROXY_ENV}), then retry"
-            ) from last_error
+            raise EgressProxyError(_runtime_proxy_failure_hint(runtime)) from last_error
         if response.status_code != 200:
             raise EgressProxyError(
-                "the Pier container egress probe was rejected; verify "
-                f"{DRADAR_HTTP_PROXY_ENV} and the upstream proxy policy"
+                "the Pier container egress probe was rejected; verify the "
+                "container network policy and the configured "
+                f"{DRADAR_CONTAINER_HTTP_PROXY_ENV}/{DRADAR_HTTP_PROXY_ENV} interface"
             )
     except subprocess.TimeoutExpired as exc:
         raise EgressProxyError("the Pier egress preflight timed out") from exc
@@ -747,6 +793,7 @@ __all__ = [
     "EGRESS_PROXY_ASSETS", "EGRESS_PROXY_IMAGE_REPOSITORY",
     "EGRESS_PROXY_IMAGE_OVERRIDE_ENV", "EGRESS_PROXY_LEGACY_MODE",
     "EGRESS_PROXY_MODE_ENV", "EGRESS_PROXY_RELEASE_COMMIT",
+    "DRADAR_CONTAINER_HTTP_PROXY_ENV", "DRADAR_CONTAINER_NO_PROXY_ENV",
     "DRADAR_HTTP_PROXY_ENV", "DRADAR_NO_PROXY_ENV",
     "EgressProxyError", "egress_proxy_image",
     "egress_proxy_mode", "egress_proxy_preflight",

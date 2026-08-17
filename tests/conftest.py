@@ -33,6 +33,8 @@ def _disable_live_egress_image_pull(monkeypatch):
     monkeypatch.delenv(egress.EGRESS_PROXY_IMAGE_OVERRIDE_ENV, raising=False)
     monkeypatch.delenv(egress.DRADAR_HTTP_PROXY_ENV, raising=False)
     monkeypatch.delenv(egress.DRADAR_NO_PROXY_ENV, raising=False)
+    monkeypatch.delenv(egress.DRADAR_CONTAINER_HTTP_PROXY_ENV, raising=False)
+    monkeypatch.delenv(egress.DRADAR_CONTAINER_NO_PROXY_ENV, raising=False)
     runtime = {"DRADAR_EGRESS_PROXY_IMAGE": "sha256:" + "a" * 64}
     monkeypatch.setattr(
         egress,

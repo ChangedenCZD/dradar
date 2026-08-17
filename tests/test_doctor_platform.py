@@ -319,7 +319,10 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
         ("C:/Program Files/Docker/docker.exe", "windows"),
     ]
     assert "[ok ] docker daemon" in out
-    assert "[ok ] pinned Pier egress image (amd64/arm64)" in out
+    assert (
+        "[ok ] container network for Pier — pinned egress image (amd64/arm64)"
+        in out
+    )
     assert "[ok ] docker resources (8 CPU / 16.0 GiB memory)" in out
     assert "[ok ] pier" in out
     assert "[ok ] tasks_root" in out

@@ -160,8 +160,8 @@ dradar doctor
 ```
 
 DRadar 不假设代理软件、端口或 Docker 实现。无代理配置时按直连检查；需要代理时可使用
-跨平台的 DRadar 专用接口（它同时作用于 OAuth/模型访问检查、Docker 构建和 Pier 运行时
-egress）：
+跨平台的 DRadar 专用接口。多数情况下只需配置一个地址，它会同时用于宿主机上的
+OAuth/模型访问检查、Docker 构建和 Pier 容器联网：
 
 ```bash
 export DRADAR_HTTP_PROXY=http://127.0.0.1:<PORT>
@@ -170,10 +170,21 @@ dradar doctor
 ```
 
 标准 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 也受支持；显式设置的
-`DRADAR_HTTP_PROXY` / `DRADAR_NO_PROXY` 优先。回环地址只会在传给容器时转换成
-`host.docker.internal`，主机和端口始终来自用户自己的配置。凭据不会进入命令参数、镜像
-层或 DRadar 服务端。若代理协议、容器路由或官方镜像下载不可用，`doctor` 会在领题前
-失败并给出这个接口的修复命令，而不会修改用户的系统代理或 Docker 设置。
+`DRADAR_HTTP_PROXY` / `DRADAR_NO_PROXY` 优先。如果宿主机和 Docker 不能使用同一个
+代理地址，再明确提供 Docker/Pier 专用地址：
+
+```bash
+export DRADAR_CONTAINER_HTTP_PROXY=http://<DOCKER_REACHABLE_HOST>:<PORT>
+export DRADAR_CONTAINER_NO_PROXY=localhost,127.0.0.1
+dradar doctor
+```
+
+`DRADAR_CONTAINER_HTTP_PROXY` 只影响 Docker 构建和 Pier 容器，不改变宿主机 OAuth、模型
+检查或下载使用的代理。主机和端口始终来自用户自己的配置；DRadar 不猜测本机代理端口，
+也不会创建中继容器或修改 OrbStack、Docker Desktop、Docker daemon、DNS 与系统代理。
+回环地址只会在传给容器时转换成 Docker 的宿主机入口。凭据不会进入命令参数、镜像层或
+DRadar 服务端。若代理协议、容器路由或官方镜像下载不可用，`doctor` 会在领题前区分
+“宿主机可用但容器不可达”和“容器直连失败”，并给出应修复的标准接口。
 
 官方 egress 镜像通过普通 HTTPS 下载并校验归档 SHA-256，随后使用 `docker load` 本地
 载入；普通用户不需要登录 GHCR，也不需要为 Docker daemon 单独配置代理。只有显式设置
