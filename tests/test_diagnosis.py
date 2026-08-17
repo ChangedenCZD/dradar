@@ -95,6 +95,22 @@ def test_diagnose_classifies_model_capacity(tmp_path):
     assert d["kind"] == "model-capacity"
 
 
+def test_diagnose_classifies_provider_declared_temporary_exit(tmp_path):
+    d = diagnose_exception(_result(
+        tmp_path,
+        "Command failed (exit 75): kimi --print\nstdout: Connection error.",
+    ))
+    assert d["kind"] == "provider-temporary"
+
+
+def test_diagnose_does_not_infer_temporary_failure_from_model_text(tmp_path):
+    d = diagnose_exception(_result(
+        tmp_path,
+        "agent response mentioned Command failed (exit 75): as an example",
+    ))
+    assert d["kind"] is None
+
+
 def test_diagnose_unrecognized_has_no_kind(tmp_path):
     d = diagnose_exception(_result(tmp_path, "segfault in libfoo"))
     assert d["kind"] is None and d["tail"]

@@ -163,6 +163,7 @@ GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
 GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
 KIMI_AGENT_IMPORT_PATH = "_dradar_pier_kimi:KimiCode"
 KIMI_AGENT_MODULE_FILENAME = "_dradar_pier_kimi.py"
+KIMI_RECOVERY_MODULE_FILENAME = "_dradar_kimi_recovery.py"
 ZCODE_AGENT_IMPORT_PATH = "_dradar_pier_zcode:ZCodeBigModel"
 ZCODE_AGENT_MODULE_FILENAME = "_dradar_pier_zcode.py"
 DSH_AGENT_IMPORT_PATH = "_dradar_pier_dsh:DshMinimal"
@@ -478,10 +479,14 @@ def _ensure_grok_agent_module(home: Path) -> Path:
 
 def _ensure_kimi_agent_module(home: Path) -> Path:
     source = Path(__file__).with_name("pier_kimi.py")
-    if not source.is_file():
+    recovery_source = Path(__file__).with_name("kimi_recovery.py")
+    if not source.is_file() or not recovery_source.is_file():
         raise RunnerError(
             "Kimi Code Pier adapter is missing; reinstall or upgrade dradar"
         )
+    _materialize_shared_file(
+        home / KIMI_RECOVERY_MODULE_FILENAME, recovery_source.read_bytes()
+    )
     return _materialize_shared_file(
         home / KIMI_AGENT_MODULE_FILENAME, source.read_bytes()
     )
@@ -2469,6 +2474,8 @@ def classify_exception_message(message: str) -> str | None:
         return "rate-limit"
     if "at capacity" in low:
         return "model-capacity"
+    if re.search(r"^command failed \(exit 75\):", low):
+        return "provider-temporary"
     return None
 
 
@@ -2476,7 +2483,7 @@ def diagnose_exception(result_path: Path | None) -> dict:
     """Classify a trial's recorded exception for honest console reporting:
     {} when there is none, else {type, tail, kind} where kind is one of
     stale-agent | insufficient-balance | quota-limit | rate-limit | auth |
-    model-capacity | None
+    model-capacity | provider-temporary | None
     (unrecognized). The message tail
     matters most: pier's exception_message embeds the agent's actual output,
     which for codex includes the API error JSON naming the real cause."""
@@ -2540,4 +2547,9 @@ DIAG_ADVICE = {
         "session with bounded backoff. This is not a problem with your setup "
         "or work; the automatic recovery was attempted but could not finish "
         "within its retry budget. Claim the cell again later."),
+    "provider-temporary": (
+        "the provider declared a temporary network or service failure. DRadar "
+        "already exhausted its bounded same-session recovery budget, so the "
+        "workspace and failure artifacts were preserved for diagnosis; retry "
+        "the cell later rather than changing credentials or reinstalling."),
 }

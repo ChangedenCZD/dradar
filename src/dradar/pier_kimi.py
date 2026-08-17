@@ -23,6 +23,8 @@ from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
+from _dradar_kimi_recovery import run_with_kimi_resume, validated_session_id
+
 
 KIMI_CONFIG = """\
 default_model = "kimi-code/k3"
@@ -253,6 +255,8 @@ class KimiCode(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._credential_values = secrets
         self._instruction = ""
+        self._resume_attempts = 0
+        self._session_id: str | None = None
         super().__init__(*args, **kwargs)
 
     def get_version_command(self) -> str:
@@ -390,37 +394,84 @@ class KimiCode(BaseInstalledAgent):
             ),
             env=env,
         )
-        flags = [
+        common_flags = [
             "--print",
             "--yolo",
             "--model", "kimi-code/k3",
-            "--prompt", instruction,
             "--output-format", "stream-json",
             "--config-file", remote_config,
             "--work-dir", "/app",
             "--agent-file", remote_agent_spec,
             "--skills-dir", remote_skills,
         ]
-        cli = " ".join(shlex.quote(part) for part in flags)
-        command = (
-            f"bash -o pipefail -c "
-            f"{shlex.quote(f'{remote_python} {remote_launcher} {cli} 2>&1 | tee {stream}')}"
-        )
+
+        def command_for(extra_flags: list[str], *, append: bool) -> str:
+            flags = [*common_flags, *extra_flags]
+            cli = " ".join(shlex.quote(part) for part in flags)
+            tee = "tee -a" if append else "tee"
+            return (
+                "bash -o pipefail -c "
+                + shlex.quote(
+                    f"{remote_python} {remote_launcher} {cli} 2>&1 "
+                    f"| {tee} {stream}"
+                )
+            )
+
+        async def remote_session_id(*, copy_log: bool = False) -> str | None:
+            copy = (
+                f"cp \"$candidate\" {shlex.quote(session_log)}; "
+                if copy_log else ""
+            )
+            result = await self.exec_as_agent(
+                environment,
+                command=(
+                    "candidate=$(find " + shlex.quote(remote_home + "/sessions")
+                    + " -type f -name 'wire.jsonl' -print 2>/dev/null "
+                    "| tail -n 1); "
+                    f"if [ -n \"$candidate\" ]; then {copy}"
+                    "basename \"$(dirname \"$candidate\")\"; fi"
+                ),
+                env=env,
+            )
+            return validated_session_id(result.stdout)
+
+        async def run_initial() -> None:
+            await self.exec_as_agent(
+                environment,
+                command=command_for(["--prompt", instruction], append=False),
+                env=env,
+            )
+
+        async def run_resume(session_id: str, prompt: str) -> None:
+            await self.exec_as_agent(
+                environment,
+                command=command_for(
+                    ["--session", session_id, "--prompt", prompt], append=True,
+                ),
+                env=env,
+            )
+
+        def announce_retry(attempt: int, delay: float, session_id: str) -> None:
+            self.logger.warning(
+                "Kimi temporary provider failure; resuming session %s in %ss "
+                "(attempt %s/2)",
+                session_id,
+                int(delay),
+                attempt,
+            )
+
         try:
-            await self.exec_as_agent(environment, command=command, env=env)
+            self._resume_attempts, self._session_id = await run_with_kimi_resume(
+                run_initial=run_initial,
+                find_session_id=remote_session_id,
+                run_resume=run_resume,
+                on_retry=announce_retry,
+            )
         finally:
             try:
-                await self.exec_as_agent(
-                    environment,
-                    command=(
-                        "candidate=$(find " + shlex.quote(remote_home + "/sessions")
-                        + " -type f -name 'wire.jsonl' -print 2>/dev/null "
-                        "| tail -n 1); "
-                        f"if [ -n \"$candidate\" ]; then cp \"$candidate\" "
-                        f"{shlex.quote(session_log)}; fi"
-                    ),
-                    env=env,
-                )
+                recovered_session_id = await remote_session_id(copy_log=True)
+                if recovered_session_id is not None:
+                    self._session_id = recovered_session_id
             except Exception as exc:
                 self.logger.warning("Could not recover Kimi session log: %s", exc)
             try:
@@ -543,11 +594,12 @@ class KimiCode(BaseInstalledAgent):
                 "billing_basis": "subscription",
                 "cost_not_reported": True,
                 "prompt_tokens_not_reported": True,
+                "resume_attempts": self._resume_attempts,
             },
         )
         trajectory = Trajectory(
             schema_version="ATIF-v1.7",
-            session_id=session_id or str(uuid.uuid4()),
+            session_id=session_id or self._session_id or str(uuid.uuid4()),
             agent=Agent(
                 name=self.name(),
                 version=self._version or "unknown",
