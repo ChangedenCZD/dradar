@@ -102,7 +102,9 @@ jobs:
               > "dist/dradar-egress-proxy-linux-${arch}.image-id"
             docker save "${portable_ref}" \
               | gzip -9 > "dist/dradar-egress-proxy-linux-${arch}.tar.gz"
-            docker image rm "${portable_ref}" "${source_ref}"
+            # Removing the portable tag also removes the digest-only reference
+            # when both are the last references to the same platform image.
+            docker image rm "${portable_ref}"
           done
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
 
