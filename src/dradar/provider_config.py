@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -38,6 +40,7 @@ from .providers import (
     kimi_auth_path,
     kimi_cli_path,
     kimi_home,
+    kimi_live_error,
     managed_grok_cli_path,
     managed_kimi_cli_path,
     parse_kimi_cli_version,
@@ -62,12 +65,63 @@ _GROK_INSTALLER_URL = "https://x.ai/cli/install.sh"
 _GROK_INSTALLER_SHA256 = (
     "43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
 )
+_KIMI_AIOHTTP_PROXY_BOOTSTRAP = """\
+import aiohttp
+
+_dradar_original_client_session = aiohttp.ClientSession
+
+
+def _dradar_proxy_aware_client_session(*args, **kwargs):
+    kwargs.setdefault("trust_env", True)
+    return _dradar_original_client_session(*args, **kwargs)
+
+
+aiohttp.ClientSession = _dradar_proxy_aware_client_session
+"""
 
 
 def _private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
         os.chmod(path, 0o700)
+
+
+def _provider_proxy_for_url(url: str, env: dict[str, str]) -> str | None:
+    """Resolve shell/macOS proxy settings while respecting NO_PROXY."""
+
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    no_proxy = env.get("NO_PROXY") or env.get("no_proxy")
+    if no_proxy and urllib.request.proxy_bypass_environment(
+        host, {"no": no_proxy},
+    ):
+        return None
+    prefix = parsed.scheme.upper()
+    value = (
+        env.get(f"{prefix}_PROXY")
+        or env.get(f"{prefix.lower()}_proxy")
+        or env.get("ALL_PROXY")
+        or env.get("all_proxy")
+    )
+    if isinstance(value, str) and value.lower().startswith("socks://"):
+        value = "socks5://" + value[len("socks://"):]
+    return value or None
+
+
+def _provider_httpx_get(url: str, **kwargs):
+    """GET through the same explicit/OS proxy contract as provider CLIs."""
+
+    env = provider_subprocess_env()
+    proxy = _provider_proxy_for_url(url, env)
+    timeout = kwargs.pop("timeout", 10.0)
+    follow_redirects = kwargs.pop("follow_redirects", False)
+    with httpx.Client(
+        proxy=proxy,
+        trust_env=False,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+    ) as client:
+        return client.get(url, **kwargs)
 
 
 def _grok_cli_version(executable: str | Path) -> str | None:
@@ -117,7 +171,7 @@ def _install_managed_grok_cli() -> str | None:
     _private_directory(runtime)
     _private_directory(target.parent)
     try:
-        response = httpx.get(
+        response = _provider_httpx_get(
             _GROK_INSTALLER_URL, timeout=30.0, follow_redirects=True,
         )
     except httpx.HTTPError as exc:
@@ -176,7 +230,7 @@ def _install_managed_kimi_cli() -> str | None:
     runtime = target.parent.parent
     _private_directory(runtime)
     _private_directory(target.parent)
-    env = dict(os.environ)
+    env = provider_subprocess_env()
     env["UV_TOOL_DIR"] = str(runtime / "tools")
     env["UV_TOOL_BIN_DIR"] = str(target.parent)
     env["UV_PYTHON_INSTALL_DIR"] = str(runtime / "python")
@@ -252,9 +306,15 @@ def cmd_provider_setup(args) -> int:
         return 1
     print(
         f"DeepSeek API key saved locally at {path} (value hidden).\n"
-        "It is not stored in config.json and is never sent to the DRadar server.\n"
-        "Next, verify it with: dradar provider status deepseek --live"
+        "It is not stored in config.json and is never sent to the DRadar server."
     )
+    if _live_deepseek_status(key) != 0:
+        print(
+            "The credential remains saved, but it is not ready for a task yet. "
+            "Fix the reported account/network issue, then run: "
+            "dradar provider status deepseek --live"
+        )
+        return 1
     return 0
 
 
@@ -265,10 +325,7 @@ def cmd_provider_status(args) -> int:
     if args.provider == "grok":
         return _status_grok_subscription()
     if args.provider == "kimi":
-        if live:
-            print("--live is currently supported only for the DeepSeek provider.")
-            return 2
-        return _status_kimi_subscription()
+        return _status_kimi_subscription(live=live)
     if args.provider == "zcode":
         return _status_zcode(live=live)
     if args.provider != "deepseek":
@@ -297,7 +354,7 @@ def _live_deepseek_status(key: str) -> int:
     """Verify auth and reachability without making a billable model request."""
 
     try:
-        response = httpx.get(
+        response = _provider_httpx_get(
             _DEEPSEEK_MODELS_URL,
             headers={"Authorization": f"Bearer {key}"},
             timeout=10.0,
@@ -377,9 +434,15 @@ def _setup_zcode() -> int:
     print(
         f"ZCode Coding Plan API key saved locally at {path} (value hidden).\n"
         f"Verified ZCode runtime imported to {imported_cli}.\n"
-        "It is never sent to the DRadar server. Verify the pinned runtime and "
-        "model access with: dradar provider status zcode --live"
+        "It is never sent to the DRadar server."
     )
+    if _live_zcode_status(key) != 0:
+        print(
+            "The credential remains saved, but it is not ready for a task yet. "
+            "Fix the reported account/network issue, then run: "
+            "dradar provider status zcode --live"
+        )
+        return 1
     return 0
 
 
@@ -434,7 +497,7 @@ def _live_zcode_status(key: str) -> int:
     """Check the domestic Coding Plan catalog without starting a paid turn."""
 
     try:
-        response = httpx.get(
+        response = _provider_httpx_get(
             _ZCODE_MODELS_URL,
             headers={"Authorization": f"Bearer {key}"},
             timeout=10.0,
@@ -485,7 +548,7 @@ def _setup_grok_subscription() -> int:
     if not executable:
         return 1
     if grok_auth_error() is None:
-        live_issue = grok_live_error(executable, grok_auth_path())
+        live_issue = grok_live_error(executable)
         if live_issue is None:
             print(
                 f"Grok subscription provider is already ready (CLI "
@@ -534,6 +597,14 @@ def _setup_grok_subscription() -> int:
     except OSError as exc:
         print(f"could not start Grok login: {exc}")
         return 1
+    live_issue = grok_live_error(executable)
+    if live_issue is not None:
+        print(
+            "Grok login completed, but the live subscription check failed: "
+            f"{live_issue}. Run `dradar provider setup grok` again after fixing "
+            "the account/network issue."
+        )
+        return 1
     print(
         f"Grok subscription OAuth is ready at {grok_auth_path()} (tokens hidden).\n"
         "The credential stays local and API-key authentication is disabled."
@@ -558,7 +629,7 @@ def _status_grok_subscription() -> int:
     if issue is not None:
         print(f"Grok subscription provider not ready: {issue}")
         return 1
-    live_issue = grok_live_error(executable, grok_auth_path())
+    live_issue = grok_live_error(executable)
     if live_issue is not None:
         print(f"Grok subscription provider not ready: {live_issue}.")
         return 1
@@ -577,11 +648,13 @@ def _setup_kimi_subscription() -> int:
     if not executable:
         return 1
     if kimi_auth_error() is None:
-        print(
-            f"Kimi subscription provider is already ready "
-            f"(CLI {KIMI_CLI_VERSION})."
-        )
-        return 0
+        live_issue = kimi_live_error(executable)
+        if live_issue is None:
+            print(
+                f"Kimi subscription provider is already ready "
+                f"(CLI {KIMI_CLI_VERSION}, K3 verified)."
+            )
+            return 0
     if not sys.stdin.isatty():
         print(
             f"Kimi Code CLI {KIMI_CLI_VERSION} is ready. OAuth setup needs an "
@@ -594,22 +667,33 @@ def _setup_kimi_subscription() -> int:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
         os.chmod(home, 0o700)
-    env = dict(os.environ)
-    # Kimi CLI 1.x stores both config and OAuth state under KIMI_SHARE_DIR.
-    # KIMI_CODE_HOME was the pre-1.x setting and is ignored by current builds.
-    env["KIMI_SHARE_DIR"] = str(home)
-    env.pop("KIMI_CODE_HOME", None)
-    env["KIMI_DISABLE_TELEMETRY"] = "1"
-    env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
-    env["KIMI_CLI_NO_AUTO_UPDATE"] = "1"
-    for name in KIMI_API_KEY_ENVS:
-        env.pop(name, None)
-    print(
-        "Starting official Kimi device OAuth for the dedicated DRadar slot. "
-        "Complete the browser/device prompt shown by Kimi."
-    )
     try:
-        proc = subprocess.run([executable, "login"], env=env)
+        with tempfile.TemporaryDirectory(
+            prefix=".kimi-login-bootstrap-", dir=home,
+        ) as name:
+            bootstrap = Path(name)
+            (bootstrap / "sitecustomize.py").write_text(
+                _KIMI_AIOHTTP_PROXY_BOOTSTRAP,
+                encoding="utf-8",
+            )
+            env = provider_subprocess_env()
+            # Kimi CLI 1.x stores both config and OAuth state under
+            # KIMI_SHARE_DIR. Its OAuth helper uses aiohttp with trust_env off,
+            # so the private sitecustomize shim enables only standard proxy
+            # discovery for this login process.
+            env["PYTHONPATH"] = str(bootstrap)
+            env["KIMI_SHARE_DIR"] = str(home)
+            env.pop("KIMI_CODE_HOME", None)
+            env["KIMI_DISABLE_TELEMETRY"] = "1"
+            env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
+            env["KIMI_CLI_NO_AUTO_UPDATE"] = "1"
+            for name in KIMI_API_KEY_ENVS:
+                env.pop(name, None)
+            print(
+                "Starting official Kimi device OAuth for the dedicated DRadar slot. "
+                "Complete the browser/device prompt shown by Kimi."
+            )
+            proc = subprocess.run([executable, "login"], env=env)
     except OSError as exc:
         print(f"could not start Kimi login: {exc}")
         return 1
@@ -623,6 +707,14 @@ def _setup_kimi_subscription() -> int:
     if issue is not None:
         print(f"Kimi login returned but the credential is not ready: {issue}")
         return 1
+    live_issue = kimi_live_error(executable)
+    if live_issue is not None:
+        print(
+            "Kimi login completed, but the live K3 subscription check failed: "
+            f"{live_issue}. Run `dradar provider setup kimi` again after fixing "
+            "the account/network issue."
+        )
+        return 1
     print(
         f"Kimi subscription OAuth is ready at {path} (tokens hidden).\n"
         "The credential stays local and API-key authentication is disabled."
@@ -630,7 +722,7 @@ def _setup_kimi_subscription() -> int:
     return 0
 
 
-def _status_kimi_subscription() -> int:
+def _status_kimi_subscription(*, live: bool = True) -> int:
     executable = kimi_cli_path()
     if not executable:
         print("Kimi subscription provider not ready: official Kimi CLI not found.")
@@ -647,9 +739,18 @@ def _status_kimi_subscription() -> int:
     if issue is not None:
         print(f"Kimi subscription provider not ready: {issue}")
         return 1
+    # Keep the default status strict, matching Grok: a structurally valid but
+    # revoked refresh token must not be reported as ready. `live` is accepted
+    # for CLI symmetry and future callers; both paths are intentionally live.
+    del live
+    live_issue = kimi_live_error(executable)
+    if live_issue is not None:
+        print(f"Kimi subscription provider not ready: {live_issue}.")
+        return 1
     print(
         f"Kimi subscription provider ready via {kimi_auth_path()} "
-        f"(OAuth tokens hidden, CLI {KIMI_CLI_VERSION}, API keys disabled)."
+        f"(OAuth tokens hidden, CLI {KIMI_CLI_VERSION}, K3 verified, "
+        "API keys disabled)."
     )
     return 0
 

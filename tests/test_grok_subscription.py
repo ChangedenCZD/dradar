@@ -223,6 +223,26 @@ def test_grok_live_probe_uses_native_private_home(
     assert GROK_API_KEY_ENV not in seen["env"]
 
 
+def test_grok_live_probe_writes_back_rotated_refresh_token(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
+
+    def fake_run(cmd, **kwargs):
+        native = Path(kwargs["env"]["HOME"]) / ".grok" / "auth.json"
+        _write_auth(native, _oauth("new", "new-refresh"))
+        return providers.subprocess.CompletedProcess(
+            cmd, 0, "* grok-4.6 (default)\n", "",
+        )
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+
+    assert providers.grok_live_error("/usr/bin/grok", auth) is None
+    assert next(iter(json.loads(auth.read_text()).values()))["refresh_token"] == (
+        "new-refresh"
+    )
+
+
 def test_provider_subprocess_env_adds_os_proxy_without_overriding_shell(
     monkeypatch,
 ) -> None:

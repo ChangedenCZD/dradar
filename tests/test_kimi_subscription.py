@@ -20,6 +20,7 @@ from dradar.providers import (
     advertised_capabilities,
     kimi_auth_error,
     kimi_auth_path,
+    kimi_live_error,
     kimi_subscription_session,
     parse_kimi_cli_version,
 )
@@ -99,6 +100,87 @@ def test_kimi_subscription_session_is_private_and_writes_back_refresh(
     assert not run_copy.exists()
     payload = json.loads(canonical.read_text())
     assert payload["refresh_token"] == "new-refresh"
+
+
+def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
+    python = tmp_path / "python"
+    python.write_text("runtime")
+    python.chmod(0o700)
+    seen = {}
+    monkeypatch.setattr(providers, "_kimi_runtime_python", lambda _cli: python)
+    monkeypatch.setattr(
+        providers,
+        "provider_subprocess_env",
+        lambda: {
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "KIMI_API_KEY": "must-not-leak",
+        },
+    )
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, env=kwargs["env"])
+        native = (
+            Path(kwargs["env"]["KIMI_SHARE_DIR"])
+            / "credentials" / "kimi-code.json"
+        )
+        _write_auth(native, _oauth("new", "new-refresh"))
+        return providers.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+
+    assert kimi_live_error("/managed/kimi", auth) is None
+    assert json.loads(auth.read_text())["refresh_token"] == "new-refresh"
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert "KIMI_API_KEY" not in seen["env"]
+    assert "old-refresh" not in " ".join(seen["cmd"])
+    assert "new-refresh" not in " ".join(seen["cmd"])
+
+
+def test_kimi_live_probe_rejects_missing_k3_without_losing_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
+    python = tmp_path / "python"
+    python.write_text("runtime")
+    python.chmod(0o700)
+    monkeypatch.setattr(providers, "_kimi_runtime_python", lambda _cli: python)
+
+    def fake_run(cmd, **kwargs):
+        native = (
+            Path(kwargs["env"]["KIMI_SHARE_DIR"])
+            / "credentials" / "kimi-code.json"
+        )
+        _write_auth(native, _oauth("new", "new-refresh"))
+        return providers.subprocess.CompletedProcess(cmd, 5, "", "")
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+
+    assert "cannot access k3" in (kimi_live_error("/managed/kimi", auth) or "")
+    assert json.loads(auth.read_text())["refresh_token"] == "new-refresh"
+
+
+def test_kimi_live_probe_distinguishes_revoked_oauth_from_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    python = tmp_path / "python"
+    python.write_text("runtime")
+    python.chmod(0o700)
+    monkeypatch.setattr(providers, "_kimi_runtime_python", lambda _cli: python)
+    monkeypatch.setattr(
+        providers.subprocess,
+        "run",
+        lambda cmd, **kwargs: providers.subprocess.CompletedProcess(
+            cmd, 6, "", "",
+        ),
+    )
+
+    issue = kimi_live_error("/managed/kimi", auth) or ""
+    assert "OAuth session was rejected" in issue
+    assert "provider setup kimi" in issue
 
 
 def test_kimi_capability_requires_cli_and_safe_oauth(

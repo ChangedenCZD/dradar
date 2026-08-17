@@ -142,6 +142,58 @@ KIMI_API_KEY_ENVS = frozenset({
     "MOONSHOT_API_KEY",
 })
 _KIMI_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
+_KIMI_LIVE_PROBE = r"""
+import asyncio
+import sys
+
+import aiohttp
+
+_original_client_session = aiohttp.ClientSession
+
+
+def _proxy_aware_client_session(*args, **kwargs):
+    kwargs.setdefault("trust_env", True)
+    return _original_client_session(*args, **kwargs)
+
+
+aiohttp.ClientSession = _proxy_aware_client_session
+
+from kimi_cli.auth import KIMI_CODE_PLATFORM_ID
+from kimi_cli.auth.oauth import (
+    KIMI_CODE_OAUTH_KEY,
+    load_tokens,
+    refresh_token,
+    save_tokens,
+)
+from kimi_cli.auth.platforms import get_platform_by_id, list_models
+from kimi_cli.config import OAuthRef
+
+
+async def _main():
+    ref = OAuthRef(storage="file", key=KIMI_CODE_OAUTH_KEY)
+    token = load_tokens(ref)
+    if token is None or not token.refresh_token:
+        return 3
+    try:
+        refreshed = await refresh_token(token.refresh_token)
+    except Exception as exc:
+        message = str(exc).lower()
+        if any(marker in message for marker in ("invalid", "unauthorized", "rejected")):
+            return 6
+        return 7
+    save_tokens(ref, refreshed)
+    platform = get_platform_by_id(KIMI_CODE_PLATFORM_ID)
+    if platform is None:
+        return 4
+    try:
+        models = await list_models(platform, refreshed.access_token)
+    except Exception:
+        return 8
+    return 0 if any(model.id == "k3" for model in models) else 5
+
+
+sys.exit(asyncio.run(_main()))
+"""
 
 # ZCode is driven through the official desktop bundle's headless protocol.  A
 # fixed CLI digest and the domestic Coding Plan endpoint keep this preview lane
@@ -766,6 +818,43 @@ def grok_auth_error(path: Path | None = None) -> str | None:
     return None
 
 
+def _run_grok_live_probe(cli: str, credential: Path, root: Path) -> str | None:
+    native_user_home = root / "native-home"
+    native_home = native_user_home / ".grok"
+    native_home.mkdir(parents=True, mode=0o700)
+    native_auth = native_home / GROK_AUTH_FILENAME
+    _replace_private_file(credential, native_auth)
+    env = provider_subprocess_env()
+    env["HOME"] = str(native_user_home)
+    env.pop("GROK_HOME", None)
+    env.pop(GROK_API_KEY_ENV, None)
+    env["GROK_TELEMETRY_ENABLED"] = "0"
+    env["GROK_TELEMETRY_MIXPANEL_ENABLED"] = "0"
+    env["GROK_TELEMETRY_TRACE_UPLOAD"] = "0"
+    try:
+        proc = subprocess.run(
+            [cli, "models"], capture_output=True, text=True,
+            timeout=30, check=False, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"Grok live model check failed: {type(exc).__name__}"
+    finally:
+        # `grok models` may silently rotate the refresh token. Preserve any
+        # structurally valid update even when the catalog request itself
+        # fails, otherwise a harmless readiness check can invalidate the
+        # canonical OAuth slot.
+        if grok_auth_error(native_auth) is None:
+            _replace_private_file(native_auth, credential)
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if "not authenticated" in output.lower():
+        return "Grok OAuth session is not authenticated"
+    if proc.returncode != 0:
+        return "Grok live model check failed; check this machine's network/proxy"
+    if GROK_MODEL not in output:
+        return f"Grok OAuth account cannot access {GROK_MODEL}"
+    return None
+
+
 def grok_live_error(
     executable: str | Path | None = None,
     auth_path: Path | None = None,
@@ -784,32 +873,14 @@ def grok_live_error(
     issue = grok_auth_error(canonical)
     if issue is not None:
         return issue
-    try:
-        with tempfile.TemporaryDirectory(prefix="dradar-grok-probe-") as name:
-            native_home = Path(name) / ".grok"
-            native_home.mkdir(mode=0o700)
-            _replace_private_file(canonical, native_home / GROK_AUTH_FILENAME)
-            env = provider_subprocess_env()
-            env["HOME"] = name
-            env.pop("GROK_HOME", None)
-            env.pop(GROK_API_KEY_ENV, None)
-            env["GROK_TELEMETRY_ENABLED"] = "0"
-            env["GROK_TELEMETRY_MIXPANEL_ENABLED"] = "0"
-            env["GROK_TELEMETRY_TRACE_UPLOAD"] = "0"
-            proc = subprocess.run(
-                [cli, "models"], capture_output=True, text=True,
-                timeout=30, check=False, env=env,
-            )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"Grok live model check failed: {type(exc).__name__}"
-    output = f"{proc.stdout}\n{proc.stderr}"
-    if proc.returncode != 0:
-        return "Grok live model check failed"
-    if "not authenticated" in output.lower():
-        return "Grok OAuth session is not authenticated"
-    if GROK_MODEL not in output:
-        return f"Grok OAuth account cannot access {GROK_MODEL}"
-    return None
+    with tempfile.TemporaryDirectory(prefix="dradar-grok-probe-") as name:
+        root = Path(name)
+        if auth_path is None:
+            # The readiness probe shares the same lock and refresh writeback
+            # contract as a paid run.
+            with grok_subscription_session(root / "slot") as run_copy:
+                return _run_grok_live_probe(cli, run_copy, root)
+        return _run_grok_live_probe(cli, canonical, root)
 
 
 def store_grok_auth(source: Path, *, home: Path | None = None) -> Path:
@@ -902,6 +973,101 @@ def kimi_auth_error(path: Path | None = None) -> str | None:
     if not _valid_kimi_auth_payload(payload):
         return "Kimi credential is not a refreshable subscription OAuth session"
     return None
+
+
+def _kimi_runtime_python(executable: str | Path) -> Path | None:
+    """Resolve the Python interpreter behind the pinned Kimi console script."""
+
+    try:
+        cli = Path(executable).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    candidates = (
+        cli.parent / ("python.exe" if os.name == "nt" else "python"),
+        cli.parent / "python3",
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    if os.name != "nt":
+        try:
+            first_line = cli.open("rb").readline(4096).decode("utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if first_line.startswith("#!"):
+            candidate = Path(first_line[2:]).expanduser()
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def _run_kimi_live_probe(
+    executable: str | Path,
+    credential: Path,
+    root: Path,
+) -> str | None:
+    python = _kimi_runtime_python(executable)
+    if python is None:
+        return "Kimi managed runtime Python is unavailable"
+    share = root / "share"
+    native_auth = share / KIMI_AUTH_RELATIVE_PATH
+    _replace_private_file(credential, native_auth)
+    env = provider_subprocess_env()
+    env["KIMI_SHARE_DIR"] = str(share)
+    env.pop("KIMI_CODE_HOME", None)
+    env["KIMI_DISABLE_TELEMETRY"] = "1"
+    env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
+    env["KIMI_CLI_NO_AUTO_UPDATE"] = "1"
+    for name in KIMI_API_KEY_ENVS:
+        env.pop(name, None)
+    try:
+        proc = subprocess.run(
+            [str(python), "-c", _KIMI_LIVE_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"Kimi live OAuth check failed: {type(exc).__name__}"
+    finally:
+        # The official refresh endpoint rotates tokens. Retain a valid new
+        # credential even if the following model-catalog check failed.
+        if kimi_auth_error(native_auth) is None:
+            _replace_private_file(native_auth, credential)
+    if proc.returncode == 5:
+        return f"Kimi subscription account cannot access {KIMI_MODEL}"
+    if proc.returncode == 6:
+        return "Kimi OAuth session was rejected; run `dradar provider setup kimi`"
+    if proc.returncode == 7:
+        return "Kimi OAuth refresh failed; check this machine's network/proxy"
+    if proc.returncode == 8:
+        return "Kimi K3 catalog check failed; check this machine's network/proxy"
+    if proc.returncode != 0:
+        return "Kimi live OAuth check failed"
+    return None
+
+
+def kimi_live_error(
+    executable: str | Path | None = None,
+    auth_path: Path | None = None,
+) -> str | None:
+    """Refresh the isolated OAuth token and verify K3 without a paid turn."""
+
+    cli = str(executable or kimi_cli_path() or "")
+    if not cli:
+        return f"official Kimi Code CLI {KIMI_CLI_VERSION} is not installed"
+    canonical = kimi_auth_path() if auth_path is None else auth_path
+    issue = kimi_auth_error(canonical)
+    if issue is not None:
+        return issue
+    with tempfile.TemporaryDirectory(prefix="dradar-kimi-probe-") as name:
+        root = Path(name)
+        if auth_path is None:
+            with kimi_subscription_session(root / "slot") as run_copy:
+                return _run_kimi_live_probe(cli, run_copy, root)
+        return _run_kimi_live_probe(cli, canonical, root)
 
 
 def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:

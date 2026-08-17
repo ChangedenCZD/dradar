@@ -123,6 +123,7 @@ def test_zcode_setup_imports_official_runtime_before_reading_key(
         provider_config.getpass, "getpass", lambda _prompt: "super-secret-value",
     )
     monkeypatch.setattr(provider_config, "store_zcode_api_key", lambda _key: secret)
+    monkeypatch.setattr(provider_config, "_live_zcode_status", lambda _key: 0)
 
     rc = provider_config.cmd_provider_setup(SimpleNamespace(provider="zcode"))
     output = capsys.readouterr().out
