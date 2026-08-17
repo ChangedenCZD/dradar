@@ -12,6 +12,8 @@ import os
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from collections.abc import Iterable, Mapping
@@ -75,16 +77,58 @@ DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-v1"
 # benchmark credential separate from the user's everyday Grok CLI session.
 GROK_PROVIDER = "xai-subscription"
 GROK_AGENT = "grok-build"
-GROK_MODEL = "grok-4.5"
+GROK_MODEL = "grok-4.6"
 GROK_CLI_VERSION = "1.0.0"
-GROK_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high"})
-GROK_CAPABILITY = "grok-build-subscription-oauth-v1"
-GROK_RUN_CONFIG_VERSION = "grok-subscription-oauth-isolated-v1"
-GROK_RUNTIME_PROFILE = "pier-grok-build-single-slot-v1"
+GROK_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+GROK_CAPABILITY = "grok-build-4.6-subscription-oauth-v2"
+GROK_RUN_CONFIG_VERSION = "grok-4.6-subscription-oauth-isolated-v2"
+GROK_RUNTIME_PROFILE = "pier-grok-build-4.6-single-slot-v2"
 GROK_HOME_RELATIVE_PATH = Path("providers") / "grok"
 GROK_AUTH_FILENAME = "auth.json"
 GROK_API_KEY_ENV = "XAI_API_KEY"
 _GROK_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
+
+# Kimi Code is also subscription/OAuth-only.  Keep a dedicated DRadar data
+# root instead of borrowing the user's everyday ~/.kimi-code session: OAuth
+# refresh mutates the credential file and therefore needs a serialized slot.
+KIMI_PROVIDER = "kimi-subscription"
+KIMI_AGENT = "kimi-code"
+KIMI_MODEL = "k3"
+KIMI_CLI_VERSION = "0.36.0"
+KIMI_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
+KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-v1"
+KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-isolated-v1"
+KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-single-slot-v1"
+KIMI_HOME_RELATIVE_PATH = Path("providers") / "kimi"
+KIMI_AUTH_RELATIVE_PATH = Path("credentials") / "kimi-code.json"
+KIMI_API_KEY_ENVS = frozenset({
+    "KIMI_API_KEY",
+    "KIMI_MODEL_API_KEY",
+    "MOONSHOT_API_KEY",
+})
+_KIMI_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
+
+# ZCode is driven through the official desktop bundle's headless protocol.  A
+# fixed CLI digest and the domestic Coding Plan endpoint keep this preview lane
+# reproducible; only GLM-5.3's native low/high/max thought levels are exposed.
+ZCODE_PROVIDER = "bigmodel-coding-plan"
+ZCODE_AGENT = "zcode"
+ZCODE_MODEL = "glm-5.3"
+ZCODE_APP_VERSION = "3.7.7"
+ZCODE_CLI_VERSION = "0.16.3"
+ZCODE_CLI_SHA256 = (
+    "4130592942dcaa070f898c2c0152a8345dbfacbf6efb6422b2753c626e756bf5"
+)
+ZCODE_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
+ZCODE_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
+ZCODE_RUN_CONFIG_VERSION = "zcode-protocol-glm-5.3-v1"
+ZCODE_RUNTIME_PROFILE = "pier-zcode-glm-5.3-api-key-v1"
+ZCODE_HOME_RELATIVE_PATH = Path("providers") / "zcode"
+ZCODE_CLI_RELATIVE_PATH = ZCODE_HOME_RELATIVE_PATH / "current" / "zcode.cjs"
+ZCODE_SECRET_RELATIVE_PATH = Path("secrets") / "zcode_coding_plan_api_key"
+ZCODE_API_KEY_ENV = "ZCODE_API_KEY"
+ZCODE_OFFICIAL_DOWNLOAD_PAGE = "https://zcode.z.ai/cn"
+_ZCODE_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -361,6 +405,278 @@ def create_deepseek_api_key_file(directory: Path) -> Path:
     return path
 
 
+def zcode_secret_path(home: Path | None = None) -> Path:
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    return Path(home) / ZCODE_SECRET_RELATIVE_PATH
+
+
+def zcode_secret_error(path: Path | None = None) -> str | None:
+    """Fail closed for symlinked or broadly readable Coding Plan keys."""
+
+    path = zcode_secret_path() if path is None else path
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"cannot inspect {path}: {exc}"
+    if stat.S_ISLNK(info.st_mode):
+        return f"{path} must be a regular file, not a symlink"
+    if not stat.S_ISREG(info.st_mode):
+        return f"{path} must be a regular file"
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+        return f"{path} is too broadly readable; run: chmod 600 {path}"
+    return None
+
+
+def _zcode_key_from_file(path: Path) -> str | None:
+    if zcode_secret_error(path) is not None:
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = handle.read().strip()
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return value or None
+
+
+def zcode_api_key(
+    environ: Mapping[str, str] | None = None,
+    *,
+    home: Path | None = None,
+) -> str | None:
+    env = os.environ if environ is None else environ
+    if environ is None or home is not None:
+        value = _zcode_key_from_file(zcode_secret_path(home))
+        if value:
+            return value
+    value = env.get(ZCODE_API_KEY_ENV)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def zcode_credential_source(
+    environ: Mapping[str, str] | None = None,
+    *,
+    home: Path | None = None,
+) -> str | None:
+    env = os.environ if environ is None else environ
+    if environ is None or home is not None:
+        if _zcode_key_from_file(zcode_secret_path(home)):
+            return "file"
+    value = env.get(ZCODE_API_KEY_ENV)
+    if isinstance(value, str) and value.strip():
+        return "environment"
+    return None
+
+
+def store_zcode_api_key(value: str, *, home: Path | None = None) -> Path:
+    key = value.strip()
+    if not key or any(character.isspace() for character in key):
+        raise ValueError("ZCode Coding Plan API key must be one non-empty line")
+    path = zcode_secret_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(key + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def create_zcode_api_key_file(directory: Path) -> Path:
+    """Materialize one owner-only run copy; callers must unlink it."""
+
+    key = zcode_api_key()
+    if key is None:
+        raise ValueError(
+            "ZCode Coding Plan API key is not configured; run "
+            "`dradar provider setup zcode` in your own interactive Terminal"
+        )
+    if any(character.isspace() for character in key):
+        raise ValueError("ZCode Coding Plan API key must be one non-empty line")
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=".zcode-coding-plan-key.", suffix=".txt", dir=directory,
+    )
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(key + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def zcode_cli_candidates(
+    environ: Mapping[str, str] | None = None,
+    *,
+    user_home: Path | None = None,
+) -> tuple[Path, ...]:
+    """Return explicit, imported, and official desktop ZCode CLI locations.
+
+    DRadar never downloads or redistributes ZCode.  Setup imports the
+    digest-pinned CLI from the user's official desktop installation (or from
+    an explicit ``ZCODE_CLI_PATH``) into DRadar's owner-only provider slot.
+    """
+
+    env = os.environ if environ is None else environ
+    home = Path(user_home) if user_home is not None else Path.home()
+    dradar_home = Path(env.get("DRADAR_HOME", home / ".dradar"))
+    candidates: list[Path] = []
+    explicit = env.get("ZCODE_CLI_PATH")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.append(dradar_home / ZCODE_CLI_RELATIVE_PATH)
+
+    if sys.platform == "darwin":
+        candidates.extend((
+            Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"),
+            home / "Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+        ))
+    elif os.name == "nt":  # pragma: no cover - exercised via candidate tests
+        for variable in ("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"):
+            root = env.get(variable)
+            if not root:
+                continue
+            base = Path(root)
+            candidates.extend((
+                base / "Programs/ZCode/resources/glm/zcode.cjs",
+                base / "ZCode/resources/glm/zcode.cjs",
+            ))
+    else:
+        appdir = env.get("APPDIR")
+        if appdir:
+            app_root = Path(appdir)
+            candidates.extend((
+                app_root / "resources/glm/zcode.cjs",
+                app_root / "usr/lib/zcode/resources/glm/zcode.cjs",
+            ))
+        candidates.extend((
+            Path("/opt/ZCode/resources/glm/zcode.cjs"),
+            Path("/opt/zcode/resources/glm/zcode.cjs"),
+            Path("/usr/lib/ZCode/resources/glm/zcode.cjs"),
+            Path("/usr/lib/zcode/resources/glm/zcode.cjs"),
+        ))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def zcode_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
+    candidates = zcode_cli_candidates(environ)
+    if not candidates:
+        return None
+    env = os.environ if environ is None else environ
+    # Preserve an explicit path even when it is invalid so status/doctor can
+    # report the integrity error instead of a misleading "not installed".
+    if env.get("ZCODE_CLI_PATH"):
+        return str(candidates[0])
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def parse_zcode_cli_version(output: str) -> str | None:
+    match = _ZCODE_VERSION_RE.search(output.strip())
+    return match.group(1) if match else None
+
+
+def zcode_cli_error(
+    path: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    candidate = path if path is not None else zcode_cli_path(environ)
+    if not candidate:
+        return f"official ZCode CLI {ZCODE_CLI_VERSION} is not installed"
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+        info = resolved.stat()
+        payload = resolved.read_bytes()
+    except OSError as exc:
+        return f"cannot inspect pinned ZCode CLI: {exc}"
+    if not stat.S_ISREG(info.st_mode):
+        return "pinned ZCode CLI must resolve to a regular file"
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != ZCODE_CLI_SHA256:
+        return (
+            "ZCode CLI integrity check failed; reinstall the tested "
+            f"ZCode {ZCODE_APP_VERSION} runtime"
+        )
+    return None
+
+
+def store_zcode_cli(
+    source: str | Path,
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Import a verified official ZCode CLI into DRadar's local-only slot."""
+
+    issue = zcode_cli_error(source)
+    if issue is not None:
+        raise ValueError(issue)
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    target = Path(home) / ZCODE_CLI_RELATIVE_PATH
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(target.parent, 0o700)
+    source_path = Path(source).expanduser().resolve(strict=True)
+    if target.exists() and source_path == target.resolve(strict=True):
+        if os.name != "nt":
+            os.chmod(target, 0o600)
+        return target
+    _replace_private_file(source_path, target)
+    return target
+
+
 def grok_home(home: Path | None = None) -> Path:
     if home is None:
         home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
@@ -415,6 +731,65 @@ def grok_auth_error(path: Path | None = None) -> str | None:
     return None
 
 
+def grok_live_error(
+    executable: str | Path | None = None,
+    auth_path: Path | None = None,
+) -> str | None:
+    """Verify the saved OAuth session and Grok 4.6 catalog without a prompt.
+
+    Grok 1.0.0 reads OAuth from ``$HOME/.grok/auth.json``. DRadar keeps its
+    canonical slot at a provider-specific path, so the probe uses a private
+    temporary HOME matching Grok's native layout and never exposes tokens in
+    argv or output.
+    """
+    cli = str(executable or grok_cli_path() or "")
+    if not cli:
+        return f"official Grok CLI {GROK_CLI_VERSION} is not installed"
+    canonical = grok_auth_path() if auth_path is None else auth_path
+    issue = grok_auth_error(canonical)
+    if issue is not None:
+        return issue
+    try:
+        with tempfile.TemporaryDirectory(prefix="dradar-grok-probe-") as name:
+            native_home = Path(name) / ".grok"
+            native_home.mkdir(mode=0o700)
+            _replace_private_file(canonical, native_home / GROK_AUTH_FILENAME)
+            env = dict(os.environ)
+            env["HOME"] = name
+            env.pop("GROK_HOME", None)
+            env.pop(GROK_API_KEY_ENV, None)
+            env["GROK_TELEMETRY_ENABLED"] = "0"
+            env["GROK_TELEMETRY_MIXPANEL_ENABLED"] = "0"
+            env["GROK_TELEMETRY_TRACE_UPLOAD"] = "0"
+            proc = subprocess.run(
+                [cli, "models"], capture_output=True, text=True,
+                timeout=30, check=False, env=env,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"Grok live model check failed: {type(exc).__name__}"
+    output = f"{proc.stdout}\n{proc.stderr}"
+    if proc.returncode != 0:
+        return "Grok live model check failed"
+    if "not authenticated" in output.lower():
+        return "Grok OAuth session is not authenticated"
+    if GROK_MODEL not in output:
+        return f"Grok OAuth account cannot access {GROK_MODEL}"
+    return None
+
+
+def store_grok_auth(source: Path, *, home: Path | None = None) -> Path:
+    """Atomically install a native Grok OAuth file into DRadar's slot."""
+    issue = grok_auth_error(source)
+    if issue is not None:
+        raise ValueError(issue)
+    canonical = grok_auth_path(home)
+    canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(canonical.parent, 0o700)
+    _replace_private_file(source, canonical)
+    return canonical
+
+
 def grok_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     explicit = env.get("GROK_CLI_PATH")
@@ -434,6 +809,122 @@ def grok_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
 def parse_grok_cli_version(output: str) -> str | None:
     match = _GROK_VERSION_RE.search(output.strip())
     return match.group(1) if match else None
+
+
+def kimi_home(home: Path | None = None) -> Path:
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    return Path(home) / KIMI_HOME_RELATIVE_PATH
+
+
+def kimi_auth_path(home: Path | None = None) -> Path:
+    return kimi_home(home) / KIMI_AUTH_RELATIVE_PATH
+
+
+def _valid_kimi_auth_payload(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return all(
+        isinstance(payload.get(name), str) and bool(payload[name].strip())
+        for name in ("access_token", "refresh_token", "token_type")
+    )
+
+
+def kimi_auth_error(path: Path | None = None) -> str | None:
+    """Fail closed for unsafe or non-refreshable Kimi OAuth credentials."""
+
+    path = kimi_auth_path() if path is None else path
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return f"Kimi Code subscription OAuth is not configured at {path}"
+    except OSError as exc:
+        return f"cannot inspect {path}: {exc}"
+    if stat.S_ISLNK(info.st_mode):
+        return f"{path} must be a regular file, not a symlink"
+    if not stat.S_ISREG(info.st_mode):
+        return f"{path} must be a regular file"
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+        return f"{path} is too broadly readable; run: chmod 600 {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"Kimi credential is unreadable or invalid JSON: {exc}"
+    if not _valid_kimi_auth_payload(payload):
+        return "Kimi credential is not a refreshable subscription OAuth session"
+    return None
+
+
+def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    explicit = env.get("KIMI_CLI_PATH")
+    if explicit:
+        return explicit
+    if environ is None:
+        discovered = shutil.which("kimi")
+        if discovered:
+            return discovered
+        official = Path.home() / ".kimi-code" / "bin" / "kimi"
+        return (
+            str(official)
+            if official.is_file() and os.access(official, os.X_OK)
+            else None
+        )
+    return shutil.which("kimi", path=env.get("PATH"))
+
+
+def parse_kimi_cli_version(output: str) -> str | None:
+    match = _KIMI_VERSION_RE.search(output.strip())
+    return match.group(1) if match else None
+
+
+@contextmanager
+def kimi_subscription_session(directory: Path, *, home: Path | None = None):
+    """Yield a private Kimi credential copy and atomically retain refreshes."""
+
+    canonical = kimi_auth_path(home)
+    issue = kimi_auth_error(canonical)
+    if issue is not None:
+        raise ValueError(issue + "; run `dradar provider setup kimi` first")
+    canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = kimi_home(home) / "auth.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        if os.name == "nt":  # pragma: no cover - Windows runner
+            import msvcrt
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        fd, name = tempfile.mkstemp(
+            prefix=".kimi-oauth-run.", suffix=".json", dir=directory,
+        )
+        os.close(fd)
+        run_copy = Path(name)
+        try:
+            _replace_private_file(canonical, run_copy)
+            yield run_copy
+            issue = kimi_auth_error(run_copy)
+            if issue is not None:
+                raise ValueError(
+                    "Kimi returned an invalid refreshed OAuth credential: " + issue
+                )
+            _replace_private_file(run_copy, canonical)
+        finally:
+            try:
+                run_copy.unlink()
+            except FileNotFoundError:
+                pass
+            if os.name == "nt":  # pragma: no cover - Windows runner
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _replace_private_file(source: Path, target: Path) -> None:
@@ -546,6 +1037,14 @@ def advertised_capabilities(
     # are actually present, preventing the server from assigning unusable work.
     if grok_cli_path(environ) and grok_auth_error() is None:
         capabilities.append(GROK_CAPABILITY)
+    if kimi_cli_path(environ) and kimi_auth_error() is None:
+        capabilities.append(KIMI_CAPABILITY)
+    if (
+        zcode_api_key(environ) is not None
+        and zcode_cli_error(environ=environ) is None
+        and Path(__file__).with_name("pier_zcode.py").is_file()
+    ):
+        capabilities.append(ZCODE_CAPABILITY)
     return tuple(capabilities)
 
 

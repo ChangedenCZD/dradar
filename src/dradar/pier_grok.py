@@ -1,4 +1,4 @@
-"""Private Pier adapter for the official Grok Build subscription CLI.
+"""Credential-isolated Pier adapter for the official Grok Build CLI.
 
 This module deliberately supports only grok.com's OAuth subscription session.
 It never accepts an xAI API key.  DRadar exposes this single file to Pier's
@@ -27,7 +27,12 @@ class GrokBuild(BaseInstalledAgent):
     """Run the official Grok CLI headlessly with an isolated OAuth home."""
 
     SUPPORTS_ATIF = True
-    _REMOTE_HOME = PurePosixPath("/tmp/dradar-grok-home")
+    # Grok 1.0.0 resolves credentials from ``$HOME/.grok/auth.json``. Its
+    # GROK_HOME setting controls selected configuration paths but is not the
+    # credential-home override, so using it alone silently falls back to an
+    # unauthenticated 4.5 catalog.
+    _REMOTE_USER_HOME = PurePosixPath("/tmp/dradar-grok-user")
+    _REMOTE_HOME = _REMOTE_USER_HOME / ".grok"
     _REMOTE_AUTH = _REMOTE_HOME / "auth.json"
     _REMOTE_BIN_DIR = PurePosixPath("/tmp/dradar-grok-bin")
     _REMOTE_CLI = _REMOTE_BIN_DIR / "grok"
@@ -52,8 +57,10 @@ class GrokBuild(BaseInstalledAgent):
         cli = Path(grok_cli_file)
         if not cli.is_file():
             raise ValueError("Pinned Grok CLI executable is missing")
-        if reasoning_effort not in {"low", "medium", "high"}:
-            raise ValueError("Grok reasoning_effort must be low, medium, or high")
+        if reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+            raise ValueError(
+                "Grok reasoning_effort must be low, medium, high, or xhigh"
+            )
         self._auth_json_file = auth
         self._grok_cli_file = cli
         self._reasoning_effort = reasoning_effort
@@ -80,7 +87,18 @@ class GrokBuild(BaseInstalledAgent):
     def network_allowlist(self) -> NetworkAllowlist:
         # Runtime model traffic and silent OAuth refresh only.  Web search and
         # fetch are also removed at the CLI layer below.
-        return NetworkAllowlist(domains=["auth.x.ai", "cli-chat-proxy.grok.com"])
+        return NetworkAllowlist(
+            domains=[
+                "auth.x.ai",
+                "cli-chat-proxy.grok.com",
+                # Grok Build 1.0.0 loads the subscription settings and
+                # dynamic model catalog from the Code control plane before
+                # opening the chat stream.  The proxy treats allowlist hosts
+                # as exact names, so the apex entry does not cover this host.
+                "code.grok.com",
+                "grok.com",
+            ]
+        )
 
     @with_prompt_template
     async def run(
@@ -90,11 +108,18 @@ class GrokBuild(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         del context
+        remote_user_home = self._REMOTE_USER_HOME.as_posix()
         remote_home = self._REMOTE_HOME.as_posix()
         remote_auth = self._REMOTE_AUTH.as_posix()
         remote_bin = self._REMOTE_BIN_DIR.as_posix()
         remote_cli = self._REMOTE_CLI.as_posix()
-        env = self.build_process_env({"GROK_HOME": remote_home})
+        env = self.build_process_env({
+            "HOME": remote_user_home,
+            "GROK_TELEMETRY_ENABLED": "0",
+            "GROK_TELEMETRY_MIXPANEL_ENABLED": "0",
+            "GROK_TELEMETRY_TRACE_UPLOAD": "0",
+        })
+        env.pop("GROK_HOME", None)
         # API keys are intentionally unsupported, including accidental ambient
         # keys baked into a task image or injected by a caller.
         env.pop("XAI_API_KEY", None)
@@ -138,9 +163,21 @@ class GrokBuild(BaseInstalledAgent):
             ),
             env=env,
         )
+        # Grok 1.0.0 discovers subscription models dynamically.  A fresh,
+        # auth-only GROK_HOME otherwise retains the bundled 4.5 fallback and
+        # rejects 4.6 before making a model request.  Populate the isolated
+        # model cache and fail closed if this OAuth slot cannot see 4.6.
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"{shlex.quote(remote_cli)} models "
+                f"| grep -Fq {shlex.quote('grok-4.6')}"
+            ),
+            env=env,
+        )
 
         stream = f"/logs/agent/{self._STREAM_FILE}"
-        model = self.model_name or "grok-4.5"
+        model = self.model_name or "grok-4.6"
         # The path rules are defense in depth around the credential file.  The
         # Docker/Pier egress allowlist remains the primary data-exfiltration
         # boundary for untrusted benchmark instructions.
@@ -159,8 +196,9 @@ class GrokBuild(BaseInstalledAgent):
             "--deny", f"Edit({remote_home}/**)",
             "--deny", f"Write({remote_home}/**)",
             "--deny", "Bash(*auth.json*)",
+            "--deny", "Bash(*.grok*)",
             "--deny", "Bash(*GROK_HOME*)",
-            "--deny", f"Bash(*{remote_home}*)",
+            "--deny", f"Bash(*{remote_user_home}*)",
         ]
         cli = " ".join(shlex.quote(part) for part in flags)
         command = (

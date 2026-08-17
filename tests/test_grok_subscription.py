@@ -119,12 +119,30 @@ def test_pier_command_uses_private_adapter_without_key_in_argv(
     assert env["PYTHONPATH"] == str(home)
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+def test_all_grok_46_efforts_build_the_pinned_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, effort: str,
+) -> None:
+    monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
+    tasks = tmp_path / "tasks"
+    (tasks / "task-1").mkdir(parents=True)
+    auth = _write_auth(tmp_path / "auth.json")
+    cli = tmp_path / "grok"
+    cli.write_text("binary", encoding="utf-8")
+    cmd = runner.build_pier_command(
+        _assignment(effort=effort), tasks, tmp_path / "jobs", "job", tmp_path,
+        provider_auth_path=auth, provider_cli_path=cli,
+    )
+    assert f"reasoning_effort={effort}" in cmd
+    assert cmd[cmd.index("--model") + 1] == "grok-4.6"
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"provider": "xai-api"}, "explicitly use provider"),
         ({"model": "grok-other"}, "unsupported Grok subscription model"),
-        ({"effort": "max"}, "effort must be low, medium, or high"),
+        ({"effort": "max"}, "effort must be low, medium, high, or xhigh"),
         ({"agent_version": "9.9.9"}, "pinned to CLI"),
     ],
 )
@@ -160,3 +178,58 @@ def test_grok_checkpoint_resume_is_rejected(tmp_path: Path, monkeypatch):
             provider_auth_path=auth,
             provider_cli_path=cli,
         )
+
+
+def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
+    source = Path(providers.__file__).with_name("pier_grok.py").read_text()
+    assert '_REMOTE_HOME = _REMOTE_USER_HOME / ".grok"' in source
+    assert '"HOME": remote_user_home' in source
+    assert '"GROK_HOME": remote_home' not in source
+    assert 'f"{shlex.quote(remote_cli)} models "' in source
+    assert "grep -Fq" in source
+    assert "grok-4.6" in source
+    assert '"grok.com"' in source
+    assert '"code.grok.com"' in source
+    assert "GROK_TELEMETRY_ENABLED" in source
+
+
+def test_grok_live_probe_uses_native_private_home(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs["env"]
+        native = Path(kwargs["env"]["HOME"]) / ".grok" / "auth.json"
+        assert native.is_file()
+        assert native.stat().st_mode & 0o777 == 0o600
+        return providers.subprocess.CompletedProcess(
+            cmd, 0,
+            "You are logged in with grok.com.\n  * grok-4.6 (default)\n", "",
+        )
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+
+    assert providers.grok_live_error("/usr/bin/grok", auth) is None
+    assert seen["cmd"] == ["/usr/bin/grok", "models"]
+    assert "GROK_HOME" not in seen["env"]
+    assert GROK_API_KEY_ENV not in seen["env"]
+
+
+def test_grok_live_probe_rejects_unauthenticated_fallback(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    monkeypatch.setattr(
+        providers.subprocess, "run",
+        lambda cmd, **kwargs: providers.subprocess.CompletedProcess(
+            cmd, 0,
+            "You are not authenticated.\n  * grok-4.5 (default)\n", "",
+        ),
+    )
+
+    assert "not authenticated" in (
+        providers.grok_live_error("/usr/bin/grok", auth) or ""
+    )
