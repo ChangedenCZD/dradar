@@ -59,8 +59,8 @@ def _assignment(**overrides: object) -> dict:
 
 
 def test_official_kimi_version_banner_is_parsed() -> None:
-    assert parse_kimi_cli_version("0.36.0\n") == KIMI_CLI_VERSION
-    assert parse_kimi_cli_version("kimi version 0.36.0\n") == KIMI_CLI_VERSION
+    assert parse_kimi_cli_version("1.49.0\n") == KIMI_CLI_VERSION
+    assert parse_kimi_cli_version("kimi version 1.49.0\n") == KIMI_CLI_VERSION
     assert parse_kimi_cli_version("unexpected") is None
 
 
@@ -212,7 +212,16 @@ def test_kimi_checkpoint_resume_is_rejected(
 def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
     assert 'return NetworkAllowlist(domains=["auth.kimi.com", "api.kimi.com"])' in source
-    assert 'enabled = ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]' in source
+    assert '"kimi_cli.tools.shell:Shell"' in source
+    assert '"kimi_cli.tools.web:SearchWeb"' not in source
+    assert '"kimi_cli.tools.agent:Agent"' not in source
+    assert 'event = "PreToolUse"' in source
+    assert '"KIMI_SHARE_DIR": remote_home' in source
+    assert '"--print"' in source
+    assert '"--config-file", remote_config' in source
+    assert '"--agent-file", remote_agent_spec' in source
+    assert "provider.with_thinking(effort).with_generation_kwargs" in source
+    assert "kimi-cli=={KIMI_CLI_VERSION}" in source
     assert '"--auto"' not in source
     assert "KIMI_DISABLE_TELEMETRY" in source
     assert "KIMI_DISABLE_CRON" in source

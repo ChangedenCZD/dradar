@@ -242,3 +242,140 @@ def test_live_status_distinguishes_rejected_key_from_transport_failure(
     assert "network/proxy" in transport
     assert "ConnectError" in transport
     assert "sentinel-provider-secret" not in transport
+
+
+@pytest.mark.parametrize(
+    ("provider", "ensure_name", "auth_error_name", "version"),
+    [
+        ("grok", "_ensure_grok_cli", "grok_auth_error", "1.0.3"),
+        ("kimi", "_ensure_kimi_cli", "kimi_auth_error", "1.49.0"),
+    ],
+)
+def test_subscription_setup_prepares_runtime_before_requesting_interactive_oauth(
+    provider, ensure_name, auth_error_name, version, monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: False),
+    )
+    monkeypatch.setattr(provider_config, ensure_name, lambda: f"/managed/{provider}")
+    monkeypatch.setattr(
+        provider_config, auth_error_name, lambda *args, **kwargs: "missing OAuth",
+    )
+
+    rc = provider_config.cmd_provider_setup(SimpleNamespace(provider=provider))
+
+    assert rc == 2
+    output = capsys.readouterr().out
+    assert f"CLI {version} is ready" in output
+    assert f"provider setup {provider}" in output
+
+
+def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
+    target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    seen = {}
+    installer = b"#!/bin/bash\nexit 0\n"
+    monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
+    monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
+    monkeypatch.setattr(
+        provider_config,
+        "_GROK_INSTALLER_SHA256",
+        provider_config.hashlib.sha256(installer).hexdigest(),
+    )
+    monkeypatch.setattr(
+        provider_config.httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, content=installer,
+        ),
+    )
+
+    def run(cmd, *, env, check):
+        seen.update(cmd=cmd, env=env)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("managed-grok")
+        target.chmod(0o700)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(provider_config.subprocess, "run", run)
+    monkeypatch.setattr(
+        provider_config, "_grok_cli_version", lambda executable: "1.0.3",
+    )
+
+    assert provider_config._install_managed_grok_cli() == str(target)
+    assert seen["cmd"][-1] == "1.0.3"
+    assert seen["env"]["GROK_BIN_DIR"] == str(target.parent)
+    assert seen["env"]["HOME"].startswith(str(target.parent.parent))
+
+
+def test_grok_auto_install_rejects_changed_installer(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
+    monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
+    monkeypatch.setattr(
+        provider_config.httpx,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200, content=b"#!/bin/bash\necho changed\n",
+        ),
+    )
+    monkeypatch.setattr(
+        provider_config.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("unreviewed installer must not execute"),
+    )
+
+    assert provider_config._install_managed_grok_cli() is None
+    assert "refusing to execute" in capsys.readouterr().out
+
+
+def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatch):
+    target = tmp_path / "dradar/providers/kimi/runtime/1.49.0/bin/kimi"
+    seen = {}
+    monkeypatch.setattr(provider_config, "managed_kimi_cli_path", lambda: target)
+    monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/usr/bin/uv")
+
+    def run(cmd, *, env, check):
+        seen.update(cmd=cmd, env=env)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("managed-kimi")
+        target.chmod(0o700)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(provider_config.subprocess, "run", run)
+    monkeypatch.setattr(
+        provider_config, "_kimi_cli_version", lambda executable: "1.49.0",
+    )
+
+    assert provider_config._install_managed_kimi_cli() == str(target)
+    assert seen["cmd"][-1] == "kimi-cli==1.49.0"
+    assert seen["env"]["UV_TOOL_BIN_DIR"] == str(target.parent)
+    assert seen["env"]["UV_TOOL_DIR"].startswith(str(target.parent.parent))
+
+
+def test_kimi_login_uses_current_share_directory_contract(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "dradar"))
+    monkeypatch.setenv("KIMI_CODE_HOME", "/ambient/legacy-home")
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: True),
+    )
+    monkeypatch.setattr(provider_config, "_ensure_kimi_cli", lambda: "/managed/kimi")
+    issues = iter(["missing OAuth", None])
+    monkeypatch.setattr(
+        provider_config, "kimi_auth_error", lambda *args, **kwargs: next(issues),
+    )
+    seen = {}
+
+    def run(cmd, *, env):
+        seen.update(cmd=cmd, env=env)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(provider_config.subprocess, "run", run)
+
+    assert provider_config._setup_kimi_subscription() == 0
+    assert seen["cmd"] == ["/managed/kimi", "login"]
+    assert seen["env"]["KIMI_SHARE_DIR"] == str(
+        provider_config.kimi_home()
+    )
+    assert "KIMI_CODE_HOME" not in seen["env"]

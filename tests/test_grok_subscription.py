@@ -58,7 +58,7 @@ def _assignment(**overrides) -> dict:
 
 
 def test_official_grok_version_banner_is_parsed():
-    assert parse_grok_cli_version("grok 1.0.0 (3cd0d0cbcebe)\n") == "1.0.0"
+    assert parse_grok_cli_version("grok 1.0.3 (release)\n") == GROK_CLI_VERSION
     assert parse_grok_cli_version("unexpected") is None
 
 
@@ -191,6 +191,11 @@ def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
     assert '"grok.com"' in source
     assert '"code.grok.com"' in source
     assert "GROK_TELEMETRY_ENABLED" in source
+    assert "grok-1.0.3-linux-${grok_arch}" not in source
+    assert "grok-{GROK_CLI_VERSION}-linux-${{grok_arch}}" in source
+    assert "GROK_LINUX_SHA256" in source
+    assert "sha256sum --check --strict" in source
+    assert "await environment.upload_file(self._grok_cli_file" not in source
 
 
 def test_grok_live_probe_uses_native_private_home(
@@ -216,6 +221,34 @@ def test_grok_live_probe_uses_native_private_home(
     assert seen["cmd"] == ["/usr/bin/grok", "models"]
     assert "GROK_HOME" not in seen["env"]
     assert GROK_API_KEY_ENV not in seen["env"]
+
+
+def test_provider_subprocess_env_adds_os_proxy_without_overriding_shell(
+    monkeypatch,
+) -> None:
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        providers.urllib.request,
+        "getproxies",
+        lambda: {
+            "http": "http://127.0.0.1:7897",
+            "https": "http://127.0.0.1:7897",
+        },
+    )
+
+    env = providers.provider_subprocess_env()
+
+    assert env["HTTP_PROXY"] == "http://127.0.0.1:7897"
+    assert env["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://explicit.example:8080")
+    assert providers.provider_subprocess_env()["HTTPS_PROXY"] == (
+        "http://explicit.example:8080"
+    )
 
 
 def test_grok_live_probe_rejects_unauthenticated_fallback(

@@ -23,19 +23,57 @@ from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
 
+GROK_CLI_VERSION = "1.0.3"
+GROK_VERSION_PATTERN = GROK_CLI_VERSION.replace(".", r"\.")
+GROK_LINUX_SHA256 = {
+    "x86_64": "2a7d46dea3fbed067e4072258b835d401e017d6848dc996279f0fb3d668a0961",
+    "aarch64": "ed44950eab90573b6f475191f5791713a56943939b3b9a62e3f4e95edd14acd9",
+}
+
+
+def _install_command() -> str:
+    return (
+        "set -euo pipefail; "
+        "if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then "
+        "  echo 'Grok Build requires a glibc task image' >&2; exit 1; "
+        "elif command -v apt-get >/dev/null 2>&1; then "
+        "  apt-get update && DEBIAN_FRONTEND=noninteractive "
+        "  apt-get install -y --no-install-recommends ca-certificates curl; "
+        "elif command -v dnf >/dev/null 2>&1; then "
+        "  dnf install -y ca-certificates curl; "
+        "elif command -v yum >/dev/null 2>&1; then "
+        "  yum install -y ca-certificates curl; "
+        "else echo 'No supported package manager found' >&2; exit 1; fi; "
+        'case "$(uname -m)" in '
+        f"  x86_64) grok_arch=x86_64; grok_sha={GROK_LINUX_SHA256['x86_64']} ;; "
+        f"  aarch64|arm64) grok_arch=aarch64; grok_sha={GROK_LINUX_SHA256['aarch64']} ;; "
+        "  *) echo 'Unsupported CPU architecture' >&2; exit 1 ;; "
+        "esac; "
+        "mkdir -p /opt/grok-runtime/bin; "
+        f"grok_url=https://storage.googleapis.com/grok-build-public-artifacts/cli/"
+        f"grok-{GROK_CLI_VERSION}-linux-${{grok_arch}}; "
+        "curl --fail --silent --show-error --location "
+        "  --output /opt/grok-runtime/bin/grok \"${grok_url}\"; "
+        "printf '%s  %s\\n' \"${grok_sha}\" /opt/grok-runtime/bin/grok "
+        "  | sha256sum --check --strict -; "
+        "chmod 0755 /opt/grok-runtime/bin/grok; "
+        "/opt/grok-runtime/bin/grok --version "
+        f"  | grep -Eq '(^| ){GROK_VERSION_PATTERN}( |$)'"
+    )
+
+
 class GrokBuild(BaseInstalledAgent):
     """Run the official Grok CLI headlessly with an isolated OAuth home."""
 
     SUPPORTS_ATIF = True
-    # Grok 1.0.0 resolves credentials from ``$HOME/.grok/auth.json``. Its
+    # Grok resolves credentials from ``$HOME/.grok/auth.json``. Its
     # GROK_HOME setting controls selected configuration paths but is not the
     # credential-home override, so using it alone silently falls back to an
     # unauthenticated 4.5 catalog.
     _REMOTE_USER_HOME = PurePosixPath("/tmp/dradar-grok-user")
     _REMOTE_HOME = _REMOTE_USER_HOME / ".grok"
     _REMOTE_AUTH = _REMOTE_HOME / "auth.json"
-    _REMOTE_BIN_DIR = PurePosixPath("/tmp/dradar-grok-bin")
-    _REMOTE_CLI = _REMOTE_BIN_DIR / "grok"
+    _REMOTE_CLI = PurePosixPath("/opt/grok-runtime/bin/grok")
     _STREAM_FILE = "grok-build.jsonl"
     _TOOLS = "read_file,grep,list_dir,search_replace,run_terminal_cmd,todo_write"
 
@@ -56,32 +94,29 @@ class GrokBuild(BaseInstalledAgent):
             raise ValueError("Grok OAuth run credential is missing")
         cli = Path(grok_cli_file)
         if not cli.is_file():
-            raise ValueError("Pinned Grok CLI executable is missing")
+            raise ValueError("Verified host Grok CLI executable is missing")
         if reasoning_effort not in {"low", "medium", "high", "xhigh"}:
             raise ValueError(
                 "Grok reasoning_effort must be low, medium, high, or xhigh"
             )
         self._auth_json_file = auth
-        self._grok_cli_file = cli
         self._reasoning_effort = reasoning_effort
         super().__init__(*args, **kwargs)
 
     def get_version_command(self) -> str:
-        # The pinned host binary is uploaded only after the task container is
-        # running.  The exact version is verified immediately after upload.
-        return "true"
+        return f"{self._REMOTE_CLI.as_posix()} --version"
 
     def install_spec(self) -> AgentInstallSpec:
-        version = self._version or "1.0.0"
+        version = self._version or GROK_CLI_VERSION
         return AgentInstallSpec(
             agent_name=self.name(),
             version=version,
-            # Docker build networking happens before Pier's runtime egress
-            # proxy exists.  Keep the image layer offline and inject the
-            # already verified standalone CLI binary at runtime instead.
-            steps=[InstallStep(user="root", run="true")],
-            verification_command="true",
-            cache_key=f"dradar-grok-subscription-{version}-host-binary-v2",
+            steps=[InstallStep(user="root", run=_install_command())],
+            verification_command=(
+                f"{self._REMOTE_CLI.as_posix()} --version "
+                f"| grep -Eq '(^| ){GROK_VERSION_PATTERN}( |$)'"
+            ),
+            cache_key=f"dradar-grok-subscription-{version}-linux-runtime-v3",
         )
 
     def network_allowlist(self) -> NetworkAllowlist:
@@ -91,7 +126,7 @@ class GrokBuild(BaseInstalledAgent):
             domains=[
                 "auth.x.ai",
                 "cli-chat-proxy.grok.com",
-                # Grok Build 1.0.0 loads the subscription settings and
+                # Grok Build loads the subscription settings and
                 # dynamic model catalog from the Code control plane before
                 # opening the chat stream.  The proxy treats allowlist hosts
                 # as exact names, so the apex entry does not cover this host.
@@ -111,7 +146,6 @@ class GrokBuild(BaseInstalledAgent):
         remote_user_home = self._REMOTE_USER_HOME.as_posix()
         remote_home = self._REMOTE_HOME.as_posix()
         remote_auth = self._REMOTE_AUTH.as_posix()
-        remote_bin = self._REMOTE_BIN_DIR.as_posix()
         remote_cli = self._REMOTE_CLI.as_posix()
         env = self.build_process_env({
             "HOME": remote_user_home,
@@ -126,20 +160,18 @@ class GrokBuild(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=(
-                f"mkdir -p {shlex.quote(remote_home)} {shlex.quote(remote_bin)} "
-                f"&& chmod 700 {shlex.quote(remote_home)} {shlex.quote(remote_bin)}"
+                f"mkdir -p {shlex.quote(remote_home)} "
+                f"&& chmod 700 {shlex.quote(remote_home)}"
             ),
             env=env,
         )
-        await environment.upload_file(self._grok_cli_file, remote_cli)
         await environment.upload_file(self._auth_json_file, remote_auth)
         if environment.default_user is not None:
             await self.exec_as_root(
                 environment,
                 command=(
                     f"chown {shlex.quote(str(environment.default_user))} "
-                    f"{shlex.quote(remote_cli)} {shlex.quote(remote_auth)} "
-                    f"&& chmod 700 {shlex.quote(remote_cli)} "
+                    f"{shlex.quote(remote_auth)} "
                     f"&& chmod 600 {shlex.quote(remote_auth)}"
                 ),
                 env=env,
@@ -147,13 +179,10 @@ class GrokBuild(BaseInstalledAgent):
         else:
             await self.exec_as_agent(
                 environment,
-                command=(
-                    f"chmod 700 {shlex.quote(remote_cli)} "
-                    f"&& chmod 600 {shlex.quote(remote_auth)}"
-                ),
+                command=f"chmod 600 {shlex.quote(remote_auth)}",
                 env=env,
             )
-        version = self._version or "1.0.0"
+        version = self._version or GROK_CLI_VERSION
         version_pattern = version.replace(".", r"\.")
         await self.exec_as_agent(
             environment,
@@ -163,7 +192,7 @@ class GrokBuild(BaseInstalledAgent):
             ),
             env=env,
         )
-        # Grok 1.0.0 discovers subscription models dynamically.  A fresh,
+        # Grok discovers subscription models dynamically.  A fresh,
         # auth-only GROK_HOME otherwise retains the bundled 4.5 fallback and
         # rejects 4.6 before making a model request.  Populate the isolated
         # model cache and fail closed if this OAuth slot cannot see 4.6.

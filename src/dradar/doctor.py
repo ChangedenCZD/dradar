@@ -330,7 +330,7 @@ def cmd_doctor(args) -> int:
             all_ok &= _check(
                 f"Grok CLI {GROK_CLI_VERSION} — subscription runner",
                 grok_cli_ready,
-                f"install official Grok CLI {GROK_CLI_VERSION}",
+                "run `dradar provider setup grok` to prepare it automatically",
             )
             all_ok &= _check(
                 "Grok subscription OAuth — dedicated DRadar slot",
@@ -349,7 +349,7 @@ def cmd_doctor(args) -> int:
             all_ok &= _check(
                 f"Kimi Code CLI {KIMI_CLI_VERSION} — subscription runner",
                 kimi_cli_ready,
-                f"install official Kimi Code CLI {KIMI_CLI_VERSION}",
+                "run `dradar provider setup kimi` to prepare it automatically",
             )
             all_ok &= _check(
                 "Kimi subscription OAuth — dedicated DRadar slot",

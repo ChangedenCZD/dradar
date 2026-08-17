@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from contextlib import contextmanager
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -78,13 +79,44 @@ DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-v1"
 GROK_PROVIDER = "xai-subscription"
 GROK_AGENT = "grok-build"
 GROK_MODEL = "grok-4.6"
-GROK_CLI_VERSION = "1.0.0"
+GROK_CLI_VERSION = "1.0.3"
 GROK_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
-GROK_CAPABILITY = "grok-build-4.6-subscription-oauth-v2"
-GROK_RUN_CONFIG_VERSION = "grok-4.6-subscription-oauth-isolated-v2"
-GROK_RUNTIME_PROFILE = "pier-grok-build-4.6-single-slot-v2"
+GROK_CAPABILITY = "grok-build-4.6-subscription-oauth-v3"
+GROK_RUN_CONFIG_VERSION = "grok-4.6-subscription-oauth-isolated-v3"
+GROK_RUNTIME_PROFILE = "pier-grok-build-4.6-single-slot-v3"
 GROK_HOME_RELATIVE_PATH = Path("providers") / "grok"
+GROK_RUNTIME_RELATIVE_PATH = (
+    GROK_HOME_RELATIVE_PATH / "runtime" / GROK_CLI_VERSION
+)
 GROK_AUTH_FILENAME = "auth.json"
+
+
+def provider_subprocess_env() -> dict[str, str]:
+    """Return an environment that also honors OS-level proxy settings.
+
+    Terminal proxy variables remain authoritative.  On macOS, GUI proxy
+    settings are otherwise invisible to Rust/Go CLIs launched by DRadar;
+    ``urllib`` reads those settings through SystemConfiguration without
+    changing the user's shell or global network configuration.
+    """
+
+    env = dict(os.environ)
+    proxy_names = {
+        "http": "HTTP_PROXY",
+        "https": "HTTPS_PROXY",
+        "no": "NO_PROXY",
+    }
+    try:
+        proxies = urllib.request.getproxies()
+    except (OSError, ValueError):
+        proxies = {}
+    for proxy_type, env_name in proxy_names.items():
+        if env.get(env_name) or env.get(env_name.lower()):
+            continue
+        value = proxies.get(proxy_type)
+        if isinstance(value, str) and value.strip():
+            env[env_name] = value.strip()
+    return env
 GROK_API_KEY_ENV = "XAI_API_KEY"
 _GROK_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
@@ -94,12 +126,15 @@ _GROK_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 KIMI_PROVIDER = "kimi-subscription"
 KIMI_AGENT = "kimi-code"
 KIMI_MODEL = "k3"
-KIMI_CLI_VERSION = "0.36.0"
+KIMI_CLI_VERSION = "1.49.0"
 KIMI_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
-KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-v1"
-KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-isolated-v1"
-KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-single-slot-v1"
+KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-v2"
+KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-isolated-v2"
+KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-single-slot-v2"
 KIMI_HOME_RELATIVE_PATH = Path("providers") / "kimi"
+KIMI_RUNTIME_RELATIVE_PATH = (
+    KIMI_HOME_RELATIVE_PATH / "runtime" / KIMI_CLI_VERSION
+)
 KIMI_AUTH_RELATIVE_PATH = Path("credentials") / "kimi-code.json"
 KIMI_API_KEY_ENVS = frozenset({
     "KIMI_API_KEY",
@@ -737,7 +772,7 @@ def grok_live_error(
 ) -> str | None:
     """Verify the saved OAuth session and Grok 4.6 catalog without a prompt.
 
-    Grok 1.0.0 reads OAuth from ``$HOME/.grok/auth.json``. DRadar keeps its
+    Grok reads OAuth from ``$HOME/.grok/auth.json``. DRadar keeps its
     canonical slot at a provider-specific path, so the probe uses a private
     temporary HOME matching Grok's native layout and never exposes tokens in
     argv or output.
@@ -754,7 +789,7 @@ def grok_live_error(
             native_home = Path(name) / ".grok"
             native_home.mkdir(mode=0o700)
             _replace_private_file(canonical, native_home / GROK_AUTH_FILENAME)
-            env = dict(os.environ)
+            env = provider_subprocess_env()
             env["HOME"] = name
             env.pop("GROK_HOME", None)
             env.pop(GROK_API_KEY_ENV, None)
@@ -790,11 +825,25 @@ def store_grok_auth(source: Path, *, home: Path | None = None) -> Path:
     return canonical
 
 
+def managed_grok_cli_path(home: Path | None = None) -> Path:
+    """Return DRadar's versioned Grok runtime without consulting ``PATH``."""
+
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    executable = "grok.exe" if os.name == "nt" else "grok"
+    return Path(home) / GROK_RUNTIME_RELATIVE_PATH / "bin" / executable
+
+
 def grok_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
     env = os.environ if environ is None else environ
     explicit = env.get("GROK_CLI_PATH")
     if explicit:
         return explicit
+    managed = managed_grok_cli_path(
+        Path(env["DRADAR_HOME"]) if env.get("DRADAR_HOME") else None
+    )
+    if managed.is_file() and os.access(managed, os.X_OK):
+        return str(managed)
     # Keep the ordinary call signature compatible with doctor/test shims that
     # replace shutil.which with a one-argument platform probe.
     if environ is None:
@@ -860,6 +909,11 @@ def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
     explicit = env.get("KIMI_CLI_PATH")
     if explicit:
         return explicit
+    managed = managed_kimi_cli_path(
+        Path(env["DRADAR_HOME"]) if env.get("DRADAR_HOME") else None
+    )
+    if managed.is_file() and os.access(managed, os.X_OK):
+        return str(managed)
     if environ is None:
         discovered = shutil.which("kimi")
         if discovered:
@@ -871,6 +925,15 @@ def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
             else None
         )
     return shutil.which("kimi", path=env.get("PATH"))
+
+
+def managed_kimi_cli_path(home: Path | None = None) -> Path:
+    """Return DRadar's versioned Kimi runtime without consulting ``PATH``."""
+
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    executable = "kimi.exe" if os.name == "nt" else "kimi"
+    return Path(home) / KIMI_RUNTIME_RELATIVE_PATH / "bin" / executable
 
 
 def parse_kimi_cli_version(output: str) -> str | None:

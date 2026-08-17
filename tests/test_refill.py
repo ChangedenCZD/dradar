@@ -413,6 +413,7 @@ def test_checkout_loop_refills_until_hard_cap_then_drains(
     _configure(tmp_path, [first], refill_to=1, max_tasks=3)
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(runloop, "_disk_allows_refill", lambda _cfg: True)
     ran = []
 
     def run(_client, assignment, *_a, **_kw):
@@ -481,6 +482,7 @@ def test_two_workers_keep_draining_after_total_claim_cap(
     _configure(tmp_path, initial, refill_to=3, max_tasks=5)
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(runloop, "_disk_allows_refill", lambda _cfg: True)
     running = 0
     peak_running = 0
     completed = []

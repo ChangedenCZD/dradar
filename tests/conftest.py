@@ -11,4 +11,13 @@ how (or whether) the package is installed in the interpreter.
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_real_dradar_home(monkeypatch, tmp_path):
+    """Unit tests must never inspect or refresh a volunteer's real secrets."""
+
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "dradar-home"))
