@@ -9,7 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, runner
+from . import __version__, egress, runner
 from .capacity import docker_resources, worker_resource_warnings
 from .identity import _client
 from .local_config import _load_config, tasks_root_from_config
@@ -307,13 +307,24 @@ def cmd_doctor(args) -> int:
         compose = _probe([docker, "compose", "version"])
         all_ok &= _check("docker compose plugin", compose, hints["compose"])
         if daemon_ready:
-            docker_hub_ready, docker_hub_hint = _docker_hub_preflight(
-                docker, plat,
-            )
+            try:
+                legacy_egress = (
+                    egress.egress_proxy_mode() == egress.EGRESS_PROXY_LEGACY_MODE
+                )
+            except egress.EgressProxyError:
+                legacy_egress = False
+            if legacy_egress:
+                egress_ready, egress_hint = _docker_hub_preflight(docker, plat)
+                egress_label = "legacy Pier egress build base (ubuntu:24.04)"
+            else:
+                egress_ready, egress_hint = egress.egress_proxy_preflight(
+                    docker, plat,
+                )
+                egress_label = "pinned Pier egress image (amd64/arm64)"
             all_ok &= _check(
-                "Docker Hub auth + egress base (ubuntu:24.04)",
-                docker_hub_ready,
-                docker_hub_hint,
+                egress_label,
+                egress_ready,
+                egress_hint,
             )
             cpus, memory_gib, probe_warnings = docker_resources()
             if cpus is not None and memory_gib is not None:

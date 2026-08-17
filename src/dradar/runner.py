@@ -26,6 +26,7 @@ from pathlib import Path
 
 import httpx
 
+from . import egress
 from .manifest import task_content_hash
 from .providers import (
     DEFAULT_CODEX_PROVIDER,
@@ -510,6 +511,19 @@ def _ensure_dsh_agent_module(home: Path) -> Path:
     )
 
 
+def _ensure_pier_sitecustomize(home: Path) -> Path:
+    """Install the fail-closed prebuilt-egress shim into Pier's PYTHONPATH."""
+
+    source = Path(__file__).with_name("pier_sitecustomize.py")
+    if not source.is_file():
+        raise RunnerError(
+            "Pier egress bootstrap is missing; reinstall or upgrade dradar"
+        )
+    return _materialize_shared_file(
+        home / "sitecustomize.py", source.read_bytes(), mode=0o600,
+    )
+
+
 def _version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))
 
@@ -650,6 +664,8 @@ def _validate_dsh_assignment(assignment: dict) -> None:
 def _pier_process_env(
     assignment: dict,
     *,
+    pier_bootstrap_dir: Path | None = None,
+    egress_environment: dict[str, str] | None = None,
     deepseek_module_dir: Path | None = None,
     grok_module_dir: Path | None = None,
     kimi_module_dir: Path | None = None,
@@ -659,6 +675,21 @@ def _pier_process_env(
     """Keep provider secrets out of Pier's inherited environment."""
 
     env = dict(os.environ)
+    # Pier sees only the per-run adapters and bootstrap. Ambient Python paths
+    # can shadow its isolated installation or inject unrelated sitecustomize
+    # code before the network fence is installed.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    python_dirs = [
+        path for path in (
+            pier_bootstrap_dir, deepseek_module_dir, grok_module_dir,
+            kimi_module_dir, zcode_module_dir, dsh_module_dir,
+        ) if path is not None
+    ]
+    if python_dirs:
+        env["PYTHONPATH"] = os.pathsep.join(
+            dict.fromkeys(str(path) for path in python_dirs)
+        )
     if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
         # The key has already been materialized in a private auth.json file.
         # Removing the ambient variable prevents accidental fallback to the
@@ -667,39 +698,21 @@ def _pier_process_env(
         # uvx's public Pier environment must see only the copied, standalone
         # adapter module. An ambient PYTHONPATH/PYTHONHOME could accidentally
         # shadow datacurve-pier with another local Pier installation.
-        env.pop("PYTHONPATH", None)
-        env.pop("PYTHONHOME", None)
-        if deepseek_module_dir is not None:
-            env["PYTHONPATH"] = str(deepseek_module_dir)
     if assignment.get("agent") == GROK_AGENT:
         env.pop(GROK_API_KEY_ENV, None)
-        env.pop("PYTHONPATH", None)
-        env.pop("PYTHONHOME", None)
-        if grok_module_dir is not None:
-            env["PYTHONPATH"] = str(grok_module_dir)
     if assignment.get("agent") == KIMI_AGENT:
         for name in KIMI_API_KEY_ENVS:
             env.pop(name, None)
-        env.pop("PYTHONPATH", None)
-        env.pop("PYTHONHOME", None)
-        if kimi_module_dir is not None:
-            env["PYTHONPATH"] = str(kimi_module_dir)
     if assignment.get("agent") == ZCODE_AGENT:
         for name in (
             ZCODE_API_KEY_ENV, "BIGMODEL_API_KEY", "ZHIPUAI_API_KEY",
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
         ):
             env.pop(name, None)
-        env.pop("PYTHONPATH", None)
-        env.pop("PYTHONHOME", None)
-        if zcode_module_dir is not None:
-            env["PYTHONPATH"] = str(zcode_module_dir)
     if assignment.get("agent") == DSH_AGENT:
         env.pop(DEEPSEEK_API_KEY_ENV, None)
-        env.pop("PYTHONPATH", None)
-        env.pop("PYTHONHOME", None)
-        if dsh_module_dir is not None:
-            env["PYTHONPATH"] = str(dsh_module_dir)
+    if egress_environment:
+        env.update(egress_environment)
     return env
 
 
@@ -2100,6 +2113,14 @@ def run_trial(
         print(f"verified pinned DSH Minimal: {dsh_version}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        egress_environment = egress.prepare_egress_proxy_runtime(announce=True)
+    except egress.EgressProxyError as exc:
+        raise RunnerError(
+            f"Pier egress environment is not ready: {exc}; no model quota was used"
+        ) from exc
+    if egress_environment:
+        _ensure_pier_sitecustomize(work_dir)
     jobs_dir = work_dir / "jobs"
     job_name = f"a{assignment['assignment_id']}"
     # A fresh lease re-run must not collide with a stale job dir.
@@ -2194,6 +2215,8 @@ def run_trial(
             )
         env = _pier_process_env(
             effective_assignment,
+            pier_bootstrap_dir=(work_dir if egress_environment else None),
+            egress_environment=egress_environment,
             deepseek_module_dir=(
                 work_dir if codex_provider == DEEPSEEK_PROVIDER else None
             ),

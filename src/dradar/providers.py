@@ -101,6 +101,15 @@ def provider_subprocess_env() -> dict[str, str]:
     """
 
     env = dict(os.environ)
+    # One explicit DRadar interface can drive host-side OAuth/live checks,
+    # Docker builds, and the Pier runtime sidecar. Standard HTTP(S)_PROXY
+    # variables remain supported; this dedicated override is authoritative
+    # when users need a deterministic runbook across shells and platforms.
+    if proxy := env.get("DRADAR_HTTP_PROXY", "").strip():
+        env["HTTP_PROXY"] = proxy
+        env["HTTPS_PROXY"] = proxy
+    if no_proxy := env.get("DRADAR_NO_PROXY", "").strip():
+        env["NO_PROXY"] = no_proxy
     proxy_names = {
         "http": "HTTP_PROXY",
         "https": "HTTPS_PROXY",

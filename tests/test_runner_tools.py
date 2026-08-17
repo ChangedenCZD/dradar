@@ -1021,6 +1021,35 @@ def test_run_trial_registry_failure_starts_nothing(tmp_path, monkeypatch):
     assert not (tmp_path / "jobs").exists()
 
 
+def test_run_trial_egress_failure_starts_nothing(tmp_path, monkeypatch):
+    started = []
+    marked_started = []
+    monkeypatch.setattr(
+        runner_mod.egress,
+        "prepare_egress_proxy_runtime",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runner_mod.egress.EgressProxyError("container route unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        runner_mod.subprocess,
+        "Popen",
+        lambda *a, **k: started.append(True),
+    )
+
+    with pytest.raises(RunnerError, match="no model quota was used"):
+        run_trial(
+            _assignment("claude-code"),
+            tmp_path,
+            tmp_path,
+            on_started=lambda: marked_started.append(True),
+        )
+
+    assert started == []
+    assert marked_started == []
+    assert not (tmp_path / "jobs").exists()
+
+
 def test_no_network_task_requires_enforceable_environment_switch(
         tmp_path, monkeypatch):
     _stub_pier(monkeypatch)

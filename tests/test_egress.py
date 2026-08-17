@@ -1,0 +1,304 @@
+"""Immutable Pier egress image and host-proxy bridge contracts."""
+
+import json
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from dradar import egress, pier_sitecustomize
+
+
+_REAL_ENSURE_IMAGE = egress.ensure_egress_proxy_image
+_TEST_IMAGE = "sha256:" + "a" * 64
+
+
+def test_image_override_must_pin_the_official_repository(monkeypatch):
+    monkeypatch.setenv(
+        egress.EGRESS_PROXY_IMAGE_OVERRIDE_ENV,
+        "ghcr.io/example/other@sha256:" + "a" * 64,
+    )
+
+    with pytest.raises(egress.EgressProxyError, match="official image repository"):
+        egress.egress_proxy_image()
+
+
+def test_legacy_mode_is_an_explicit_one_release_escape_hatch(monkeypatch):
+    monkeypatch.setenv(
+        egress.EGRESS_PROXY_MODE_ENV, egress.EGRESS_PROXY_LEGACY_MODE,
+    )
+
+    assert egress.egress_proxy_image() is None
+    assert egress.pier_egress_environment() == {}
+
+
+def test_loopback_http_proxy_is_bridged_into_docker(monkeypatch):
+    monkeypatch.setattr(
+        egress,
+        "provider_subprocess_env", lambda: pytest.fail("not used for container config"),
+    )
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV,
+        "http://user:p%40ss@127.0.0.1:39127",
+    )
+    monkeypatch.setenv(egress.DRADAR_NO_PROXY_ENV, "localhost,127.0.0.1")
+
+    runtime = egress.pier_egress_environment(_TEST_IMAGE)
+
+    assert runtime["DRADAR_EGRESS_UPSTREAM_HOST"] == "host.docker.internal"
+    assert runtime["DRADAR_EGRESS_UPSTREAM_PORT"] == "39127"
+    assert runtime["DRADAR_EGRESS_UPSTREAM_USERNAME"] == "user"
+    assert runtime["DRADAR_EGRESS_UPSTREAM_PASSWORD"] == "p@ss"
+    assert runtime["DRADAR_EGRESS_BUILD_PROXY"] == (
+        "http://user:p%40ss@host.docker.internal:39127"
+    )
+
+
+def test_no_proxy_configuration_does_not_invent_one(monkeypatch):
+    for name in (
+        egress.DRADAR_HTTP_PROXY_ENV, "HTTPS_PROXY", "https_proxy",
+        "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    runtime = egress.pier_egress_environment(_TEST_IMAGE)
+
+    assert runtime == {"DRADAR_EGRESS_PROXY_IMAGE": _TEST_IMAGE}
+
+
+def test_remote_proxy_keeps_the_users_own_host_and_port(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV,
+        "http://proxy.corp.example:43128",
+    )
+
+    runtime = egress.pier_egress_environment(_TEST_IMAGE)
+
+    assert runtime["DRADAR_EGRESS_UPSTREAM_HOST"] == "proxy.corp.example"
+    assert runtime["DRADAR_EGRESS_UPSTREAM_PORT"] == "43128"
+    assert runtime["DRADAR_EGRESS_BUILD_PROXY"] == (
+        "http://proxy.corp.example:43128"
+    )
+
+
+def test_usable_standard_http_proxy_wins_over_unrelated_socks_proxy(monkeypatch):
+    monkeypatch.delenv(egress.DRADAR_HTTP_PROXY_ENV, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:39081")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:43128")
+
+    runtime = egress.pier_egress_environment(_TEST_IMAGE)
+
+    assert runtime["DRADAR_EGRESS_UPSTREAM_HOST"] == "proxy.example"
+    assert runtime["DRADAR_EGRESS_UPSTREAM_PORT"] == "43128"
+
+
+def test_release_download_uses_standard_proxy_contract_without_rewriting_it():
+    assert egress._download_proxy_settings(
+        "https://github.com/example",
+        {"HTTPS_PROXY": "http://proxy.example:43128", "NO_PROXY": "github.com"},
+    ) == (None, True)
+
+
+def test_release_download_honors_dradar_no_proxy():
+    assert egress._download_proxy_settings(
+        "https://github.com/example",
+        {
+            egress.DRADAR_HTTP_PROXY_ENV: "http://127.0.0.1:43128",
+            egress.DRADAR_NO_PROXY_ENV: ".github.com,localhost",
+        },
+    ) == (None, False)
+
+
+def test_socks_proxy_fails_before_claim_or_model_start(monkeypatch):
+    monkeypatch.setenv(
+        egress.DRADAR_HTTP_PROXY_ENV, "socks5://127.0.0.1:39081",
+    )
+
+    with pytest.raises(egress.EgressProxyError, match="HTTP upstream proxy"):
+        egress.pier_egress_environment(_TEST_IMAGE)
+
+
+def test_missing_image_is_loaded_once_then_validated_non_root(monkeypatch):
+    identities = iter([None, None])
+    calls = []
+
+    monkeypatch.setattr(egress, "_docker_arch", lambda _docker: "arm64")
+    monkeypatch.setattr(
+        egress, "_validated_release_image_id", lambda *_args: next(identities),
+    )
+
+    @contextmanager
+    def unlocked():
+        yield
+
+    monkeypatch.setattr(egress, "_image_lock", unlocked)
+    monkeypatch.setattr(
+        egress, "_load_release_asset",
+        lambda docker, arch, image: (
+            calls.append((docker, arch, image)) or _TEST_IMAGE
+        ),
+    )
+
+    image = _REAL_ENSURE_IMAGE("docker")
+
+    expected_tag = egress._portable_image_tag("arm64")
+    assert image == _TEST_IMAGE
+    assert calls == [("docker", "arm64", expected_tag)]
+
+
+def test_release_asset_uses_verified_local_docker_load(monkeypatch, tmp_path):
+    archive = tmp_path / "egress.tar.gz"
+    archive.write_bytes(b"verified archive")
+    calls = []
+    monkeypatch.setattr(egress, "_upstream_proxy_environment", lambda: {})
+    monkeypatch.setattr(
+        egress, "_download_release_asset", lambda *_args: archive,
+    )
+    monkeypatch.setattr(
+        egress.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            calls.append((command, kwargs))
+            or SimpleNamespace(returncode=0, stdout="loaded", stderr="")
+        ),
+    )
+    monkeypatch.setattr(
+        egress, "_validated_release_image_id", lambda *_args: _TEST_IMAGE,
+    )
+    tag = egress._portable_image_tag("arm64")
+
+    image = egress._load_release_asset("docker", "arm64", tag)
+
+    assert image == _TEST_IMAGE
+    assert calls[0][0] == ["docker", "load", "--input", str(archive)]
+    assert calls[0][1]["timeout"] == 300
+
+
+def test_pull_failure_is_sanitized(monkeypatch):
+    monkeypatch.setenv(
+        egress.EGRESS_PROXY_IMAGE_OVERRIDE_ENV,
+        f"{egress.EGRESS_PROXY_IMAGE_REPOSITORY}@sha256:" + "b" * 64,
+    )
+    monkeypatch.setattr(egress, "_docker_arch", lambda _docker: "arm64")
+    monkeypatch.setattr(egress, "_docker_image_details", lambda *_args: None)
+
+    @contextmanager
+    def unlocked():
+        yield
+
+    monkeypatch.setattr(egress, "_image_lock", unlocked)
+    monkeypatch.setattr(
+        egress.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="unauthorized token=do-not-print",
+        ),
+    )
+
+    with pytest.raises(egress.EgressProxyError) as caught:
+        _REAL_ENSURE_IMAGE("docker")
+
+    assert "rejected the public image request" in str(caught.value)
+    assert "do-not-print" not in str(caught.value)
+
+
+def test_compose_uses_pinned_image_and_never_dynamic_build(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setenv("DRADAR_EGRESS_PROXY_IMAGE", _TEST_IMAGE)
+    monkeypatch.setenv("DRADAR_EGRESS_UPSTREAM_HOST", "host.docker.internal")
+    monkeypatch.setenv("DRADAR_EGRESS_UPSTREAM_PORT", "39127")
+    path = tmp_path / "docker-compose-egress-proxy.json"
+    allowlist = SimpleNamespace(domains=["api.openai.com"])
+
+    pier_sitecustomize._write_docker_proxy_compose(
+        path=path,
+        proxy_dir=tmp_path / "must-not-exist",
+        allowlist=allowlist,
+        token="runtime-secret",
+    )
+
+    compose = json.loads(path.read_text())
+    service = compose["services"]["pier-egress-proxy"]
+    assert service["image"] == _TEST_IMAGE
+    assert service["pull_policy"] == "never"
+    assert "build" not in service
+    assert service["environment"]["PROXY_TOKEN"] == "runtime-secret"
+    assert service["extra_hosts"] == ["host.docker.internal:host-gateway"]
+    assert not (tmp_path / "must-not-exist").exists()
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_pier_bootstrap_accepts_only_local_image_id_or_official_digest():
+    assert pier_sitecustomize._image_is_immutable(_TEST_IMAGE)
+    assert pier_sitecustomize._image_is_immutable(
+        "ghcr.io/codex-radar/dradar-egress-proxy@sha256:" + "b" * 64
+    )
+    assert not pier_sitecustomize._image_is_immutable(
+        "ghcr.io/example/other@sha256:" + "b" * 64
+    )
+    assert not pier_sitecustomize._image_is_immutable(
+        "ghcr.io/codex-radar/dradar-egress-proxy:v1"
+    )
+
+
+def test_agent_build_proxy_is_added_only_when_configured(monkeypatch):
+    monkeypatch.setenv(
+        "DRADAR_EGRESS_BUILD_PROXY",
+        "http://host.docker.internal:39127",
+    )
+    monkeypatch.setenv("DRADAR_EGRESS_UPSTREAM_HOST", "host.docker.internal")
+
+    override = pier_sitecustomize._build_proxy_override()
+
+    assert override["args"]["HTTPS_PROXY"] == (
+        "http://host.docker.internal:39127"
+    )
+    assert override["extra_hosts"] == ["host.docker.internal=host-gateway"]
+
+
+def test_runtime_probe_keeps_credentials_out_of_process_arguments(monkeypatch):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[1] == "port":
+            return SimpleNamespace(
+                returncode=0, stdout="127.0.0.1:43119\n", stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="container-id", stderr="")
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, _url):
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(egress.subprocess, "run", run)
+    monkeypatch.setattr(egress.httpx, "Client", Client)
+    monkeypatch.setattr(egress, "provider_subprocess_env", lambda: {})
+    runtime = {
+        "DRADAR_EGRESS_UPSTREAM_HOST": "proxy.example",
+        "DRADAR_EGRESS_UPSTREAM_PORT": "43128",
+        "DRADAR_EGRESS_UPSTREAM_USERNAME": "user",
+        "DRADAR_EGRESS_UPSTREAM_PASSWORD": "do-not-leak",
+    }
+
+    egress._probe_runtime_egress("docker", _TEST_IMAGE, runtime)
+
+    run_command = calls[0][0]
+    assert run_command[:4] == ["docker", "run", "--detach", "--rm"]
+    assert "PROXY_TOKEN" in run_command
+    assert "UPSTREAM_PROXY_PASSWORD" in run_command
+    assert "do-not-leak" not in " ".join(run_command)
+    assert calls[-1][0][0:3] == ["docker", "rm", "--force"]

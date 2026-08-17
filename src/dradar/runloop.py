@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, artifact_staging, checkpoints, image_cache, pending,
+    __version__, artifact_staging, checkpoints, egress, image_cache, pending,
     refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError
@@ -116,6 +116,20 @@ def _ensure_selected_tasks_root(tasks_root: Path, benchmark_id: str) -> None:
         ensure_tasks_root(tasks_root)
     else:
         ensure_tasks_root(tasks_root, benchmark_id)
+
+
+def _ensure_egress_runtime(*, probe_connectivity: bool = True) -> None:
+    """Finish the only shared image pull before any automatic CLI claim."""
+
+    try:
+        if probe_connectivity:
+            egress.ensure_egress_runtime_ready(announce=True)
+        else:
+            egress.prepare_egress_proxy_runtime(announce=True)
+    except egress.EgressProxyError as exc:
+        raise RunnerError(
+            f"Pier egress environment is not ready: {exc}; no task was started"
+        ) from exc
 
 
 def _selected_tasks_root(cfg: dict) -> Path:
@@ -2260,6 +2274,9 @@ def cmd_go(args) -> int:
                     raise RunnerError(str(exc)) from exc
             _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
             ensure_pier()
+            _ensure_egress_runtime(
+                probe_connectivity=not getattr(args, "worker_child", False),
+            )
         except RunnerError as exc:
             sys.exit(str(exc))
 
@@ -2543,6 +2560,7 @@ def _run_worker_pool(args) -> int:
                 raise RunnerError(str(exc)) from exc
         _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
         ensure_pier()
+        _ensure_egress_runtime()
     except RunnerError as exc:
         sys.exit(str(exc))
     _retry_pending_uploads(client)

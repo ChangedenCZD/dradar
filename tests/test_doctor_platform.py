@@ -264,7 +264,7 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
 ):
     tasks_root = tmp_path / "deep-swe" / "tasks"
     state = {"pier_ready": False, "pier_calls": 0, "task_calls": 0}
-    docker_hub_calls = []
+    egress_image_calls = []
 
     def which(name):
         if name == "docker":
@@ -287,10 +287,10 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
     monkeypatch.setattr(doctor.shutil, "which", which)
     monkeypatch.setattr(doctor, "_probe", lambda _cmd: True)
     monkeypatch.setattr(
-        doctor,
-        "_docker_hub_preflight",
+        doctor.egress,
+        "egress_proxy_preflight",
         lambda docker, platform: (
-            docker_hub_calls.append((docker, platform)) or (True, "")
+            egress_image_calls.append((docker, platform)) or (True, "")
         ),
     )
     monkeypatch.setattr(
@@ -315,10 +315,11 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
 
     assert rc == 1  # no agent auth or server login in this isolated test
     assert state == {"pier_ready": True, "pier_calls": 1, "task_calls": 1}
-    assert docker_hub_calls == [
+    assert egress_image_calls == [
         ("C:/Program Files/Docker/docker.exe", "windows"),
     ]
     assert "[ok ] docker daemon" in out
+    assert "[ok ] pinned Pier egress image (amd64/arm64)" in out
     assert "[ok ] docker resources (8 CPU / 16.0 GiB memory)" in out
     assert "[ok ] pier" in out
     assert "[ok ] tasks_root" in out
@@ -440,7 +441,7 @@ def test_dsh_scoped_doctor_uses_public_uvx_without_host_pier(
     assert "[ok ] uvx — isolated public DSH runner" in out
     assert "[ok ] DeepSeek V4 Flash / Pro — DSH Minimal agent ready" in out
     assert "SecurityMind" not in out
-    assert "pier" not in out.lower()
+    assert "[ok ] pier" not in out.lower()
 
 
 def test_dsh_scoped_doctor_reports_its_own_retry_command(
