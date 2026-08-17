@@ -115,7 +115,7 @@ def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
         providers,
         "provider_subprocess_env",
         lambda: {
-            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "HTTPS_PROXY": "http://127.0.0.1:18080",
             "KIMI_API_KEY": "must-not-leak",
         },
     )
@@ -133,7 +133,7 @@ def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
 
     assert kimi_live_error("/managed/kimi", auth) is None
     assert json.loads(auth.read_text())["refresh_token"] == "new-refresh"
-    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
     assert "KIMI_API_KEY" not in seen["env"]
     assert "old-refresh" not in " ".join(seen["cmd"])
     assert "new-refresh" not in " ".join(seen["cmd"])
@@ -299,6 +299,8 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert '"kimi_cli.tools.agent:Agent"' not in source
     assert 'event = "PreToolUse"' in source
     assert '"KIMI_SHARE_DIR": remote_home' in source
+    assert 'kwargs.setdefault("trust_env", True)' in source
+    assert "aiohttp.ClientSession = _proxy_aware_client_session" in source
     assert '"--print"' in source
     assert '"--config-file", remote_config' in source
     assert '"--agent-file", remote_agent_spec' in source

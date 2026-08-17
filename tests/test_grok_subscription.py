@@ -255,15 +255,15 @@ def test_provider_subprocess_env_adds_os_proxy_without_overriding_shell(
         providers.urllib.request,
         "getproxies",
         lambda: {
-            "http": "http://127.0.0.1:7897",
-            "https": "http://127.0.0.1:7897",
+            "http": "http://127.0.0.1:18080",
+            "https": "http://127.0.0.1:18080",
         },
     )
 
     env = providers.provider_subprocess_env()
 
-    assert env["HTTP_PROXY"] == "http://127.0.0.1:7897"
-    assert env["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert env["HTTP_PROXY"] == "http://127.0.0.1:18080"
+    assert env["HTTPS_PROXY"] == "http://127.0.0.1:18080"
 
     monkeypatch.setenv("HTTPS_PROXY", "http://explicit.example:8080")
     assert providers.provider_subprocess_env()["HTTPS_PROXY"] == (
@@ -298,6 +298,6 @@ def test_grok_live_probe_rejects_unauthenticated_fallback(
         ),
     )
 
-    assert "not authenticated" in (
-        providers.grok_live_error("/usr/bin/grok", auth) or ""
-    )
+    issue = providers.grok_live_error("/usr/bin/grok", auth) or ""
+    assert "not authenticated" in issue
+    assert "dradar provider setup grok" in issue

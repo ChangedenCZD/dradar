@@ -106,6 +106,27 @@ def _build_proxy_override() -> dict[str, object] | None:
     return build
 
 
+def _finalize_docker_proxy_compose(
+    path: Path,
+    runtime_environment: dict[str, str],
+    build_override: dict[str, object] | None,
+) -> None:
+    """Move the short-lived proxy token out of `docker compose exec` argv."""
+
+    compose = json.loads(path.read_text(encoding="utf-8"))
+    main = compose["services"]["main"]
+    environment = dict(main.get("environment") or {})
+    environment.update(runtime_environment)
+    main["environment"] = environment
+    if build_override is not None:
+        main["build"] = build_override
+    path.write_text(json.dumps(compose, indent=2), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def _patch_pier() -> None:
     image = os.environ.get(_IMAGE_ENV)
     if not image:
@@ -125,21 +146,21 @@ def _patch_pier() -> None:
 
     def prepare_with_build_proxy(self) -> None:
         original_prepare(self)
-        override = _build_proxy_override()
-        if (
-            override is None
-            or self._egress_proxy_compose_path is None
-            or self.agent_install_spec is None
-        ):
+        if self._egress_proxy_compose_path is None:
             return
         path = self._egress_proxy_compose_path
-        compose = json.loads(path.read_text(encoding="utf-8"))
-        compose["services"]["main"]["build"] = override
-        path.write_text(json.dumps(compose, indent=2), encoding="utf-8")
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        runtime_environment = dict(self._egress_proxy_env)
+        build_override = (
+            _build_proxy_override()
+            if self.agent_install_spec is not None else None
+        )
+        _finalize_docker_proxy_compose(
+            path, runtime_environment, build_override,
+        )
+        # The main service already carries these values. Clearing the Pier
+        # injection map prevents the short-lived Basic token from appearing in
+        # `docker compose exec -e HTTP_PROXY=...` process arguments.
+        self._egress_proxy_env = {}
 
     docker_environment.DockerEnvironment._prepare_egress_proxy_compose = (
         prepare_with_build_proxy
