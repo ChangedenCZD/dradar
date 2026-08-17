@@ -188,6 +188,8 @@ def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
     assert 'f"{shlex.quote(remote_cli)} models "' in source
     assert "grep -Fq" in source
     assert "grok-4.6" in source
+    assert '"accounts.x.ai"' in source
+    assert '"api.x.ai"' in source
     assert '"grok.com"' in source
     assert '"code.grok.com"' in source
     assert "GROK_TELEMETRY_ENABLED" in source

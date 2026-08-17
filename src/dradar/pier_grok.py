@@ -124,6 +124,8 @@ class GrokBuild(BaseInstalledAgent):
         # fetch are also removed at the CLI layer below.
         return NetworkAllowlist(
             domains=[
+                "accounts.x.ai",
+                "api.x.ai",
                 "auth.x.ai",
                 "cli-chat-proxy.grok.com",
                 # Grok Build loads the subscription settings and
