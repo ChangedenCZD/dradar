@@ -343,7 +343,22 @@ def _quota_share_line(a: dict) -> str:
     their own column; otherwise label the denomination instead of implying
     it's universal."""
     if a.get("billing_mode") == "api":
-        return "pay-as-you-go API billing (not ChatGPT subscription quota)"
+        pricing = a.get("token_pricing") or {}
+        model = str(a.get("model") or "").removeprefix("dsh-")
+        current = (pricing.get("current") or {}).get(model) or {}
+        rates = current.get("usd_per_million") or {}
+        band = current.get("band")
+        if band in {"peak", "off_peak"} and all(
+            key in rates for key in ("input", "cached_input", "output")
+        ):
+            label = "peak" if band == "peak" else "off-peak (50% of peak)"
+            return (
+                "pay-as-you-go DeepSeek API billing; current Beijing band: "
+                f"{label}; per 1M tokens ${rates['input']} uncached input / "
+                f"${rates['cached_input']} cached input / ${rates['output']} output "
+                "(peak 09:00–12:00 and 14:00–18:00; not ChatGPT quota)"
+            )
+        return "pay-as-you-go DeepSeek API billing (not ChatGPT subscription quota)"
     pct = a.get("est_quota_pct")
     if pct is None:
         return "?"
@@ -654,7 +669,7 @@ def _dsh_trial_usage(trial_dir: Path) -> dict | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if not isinstance(value, dict) or value.get("schema") != "dsh-provider-usage-v1":
+    if not isinstance(value, dict) or value.get("schema") != "dsh-provider-usage-v2":
         return None
     names = (
         "uncachedInputTokens", "cacheReadTokens", "cacheWriteTokens",
@@ -672,6 +687,44 @@ def _dsh_trial_usage(trial_dir: Path) -> dict | None:
         + value["cacheReadTokens"]
         + value["cacheWriteTokens"]
     )
+    requests = value.get("requests")
+    if (not isinstance(requests, list)
+            or len(requests) != value["requestCount"]):
+        return None
+    token_usage_events = []
+    request_totals = {name: 0 for name in names[:-1]}
+    for request in requests:
+        if not isinstance(request, dict):
+            return None
+        occurred_at = request.get("occurredAt")
+        try:
+            instant = datetime.fromisoformat(
+                occurred_at.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if instant.tzinfo is None:
+            return None
+        if any(
+            not isinstance(request.get(name), int)
+            or isinstance(request.get(name), bool)
+            or request[name] < 0
+            for name in names[:-1]
+        ):
+            return None
+        for name in names[:-1]:
+            request_totals[name] += request[name]
+        token_usage_events.append({
+            "occurred_at": occurred_at,
+            "n_input_tokens": (
+                request["uncachedInputTokens"]
+                + request["cacheReadTokens"]
+                + request["cacheWriteTokens"]
+            ),
+            "n_cache_tokens": request["cacheReadTokens"],
+            "n_output_tokens": request["outputTokens"],
+        })
+    if any(request_totals[name] != value[name] for name in names[:-1]):
+        return None
     return {
         "schema": value["schema"],
         "complete": True,
@@ -683,6 +736,8 @@ def _dsh_trial_usage(trial_dir: Path) -> dict | None:
         "n_input_tokens": n_input,
         "n_cache_tokens": value["cacheReadTokens"],
         "n_output_tokens": value["outputTokens"],
+        "token_usage_events": token_usage_events,
+        "timed_usage_complete": True,
     }
 
 
@@ -911,6 +966,7 @@ def _upload_trial(
             "agent_session_count", "root_session_count",
             "subagent_session_count", "agent_session_usage", "request_count",
             "uncached_input_tokens", "cache_read_tokens", "cache_write_tokens",
+            "token_usage_events", "timed_usage_complete",
         ):
             source_key = "sessions" if key == "agent_session_usage" else key
             if source_key in usage:

@@ -160,6 +160,13 @@ function summarize(events, firstSeq) {
   let text = "";
   let reason;
   const usageByStep = new Map();
+  function usageTimestamp(event) {
+    const value = event.timestamp ?? event.createdAt ?? event.time ??
+      event.data?.timestamp ?? event.data?.createdAt;
+    if (value === undefined || value === null) return null;
+    const instant = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(instant.getTime()) ? null : instant.toISOString();
+  }
   for (const event of events) {
     if (event.seq < firstSeq) continue;
     if (event.type === "turn/start") {
@@ -176,7 +183,10 @@ function summarize(events, firstSeq) {
     if (usage !== undefined) {
       // A finalized assistant message repeats the usage chunk for the same
       // request. Last-wins by (turn, step), matching DSH token-meter's fold.
-      usageByStep.set(`${event.data.turn}:${event.data.step}`, usage);
+      usageByStep.set(`${event.data.turn}:${event.data.step}`, {
+        usage,
+        occurredAt: usageTimestamp(event),
+      });
     }
     if (event.type === "assistant/message") {
       const joined = event.data.message.content
@@ -193,13 +203,26 @@ function summarize(events, firstSeq) {
     cacheWriteTokens: 0,
     outputTokens: 0,
   };
-  for (const usage of usageByStep.values()) {
+  const requests = [];
+  for (const item of usageByStep.values()) {
+    const usage = item.usage;
     totals.uncachedInputTokens += usage.inputTokens;
     totals.cacheReadTokens += usage.cacheReadTokens ?? 0;
     totals.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
     totals.outputTokens += usage.outputTokens;
+    requests.push({
+      occurredAt: item.occurredAt,
+      uncachedInputTokens: usage.inputTokens,
+      cacheReadTokens: usage.cacheReadTokens ?? 0,
+      cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+      outputTokens: usage.outputTokens,
+    });
   }
-  return { text, reason, usage: { ...totals, requestCount: usageByStep.size } };
+  return {
+    text,
+    reason,
+    usage: { ...totals, requestCount: usageByStep.size, requests },
+  };
 }
 
 async function run(ctx, task, io) {
@@ -254,7 +277,7 @@ async function run(ctx, task, io) {
   }), { encoding: "utf8", mode: 0o600 });
   if (outcome.usage.requestCount > 0) {
     writeFileSync(process.env.DSH_USAGE_FILE, JSON.stringify({
-      schema: "dsh-provider-usage-v1",
+      schema: "dsh-provider-usage-v2",
       model: selection.model,
       ...outcome.usage,
     }), { encoding: "utf8", mode: 0o600 });

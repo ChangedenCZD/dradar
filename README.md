@@ -181,6 +181,11 @@ Pier 退出后立即删除。该本地文件存在时优先使用，避免桌面
 `DEEPSEEK_API_KEY` 静默覆盖用户刚配置的新 key；没有本地文件的自动化环境仍可临时
 设置 `DEEPSEEK_API_KEY`，CLI 会先写入短期 auth 文件，再从 Pier 的继承环境中移除该变量。
 
+DeepSeek API 价格按北京时间分段：每天 `09:00–12:00`、`14:00–18:00` 为高峰价，
+其余时间为非高峰价（高峰价的 50%）。CLI 会在领取/启动前显示当前价段与三类 token
+单价，并把每次 provider usage 的时间和 token 桶一并上传；服务端按请求发生时间拆分
+跨价段任务并冻结账单，后续调价不会倒算已有记录。
+
 运行前 CLI 会校验随包发布的 DeepSeek 官方 Codex `models.json` 的 SHA-256，并由一个
 很窄的公开 Pier 子类把它上传到任务容器隔离的 `/tmp/codex-home/models.json`。文件缺失、
 被修改或不含 `none`/`low`/`high`/`max` 上游档位时，能力不会上报、`doctor` 会失败，任务也会在发出任何

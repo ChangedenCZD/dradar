@@ -62,8 +62,10 @@ DSH_RUNTIME_MODELS = {
     DSH_PRO_MODEL: DEEPSEEK_PRO_MODEL,
 }
 DSH_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})
-DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v4"
-DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v4"
+DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v5"
+DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v5"
+DSH_FLASH_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v4"
+DSH_PRO_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v4"
 DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-rc6-v1"
 DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-v1"
 
@@ -531,7 +533,14 @@ def advertised_capabilities(
         deepseek_api_key(environ) is not None
         and Path(__file__).with_name("pier_dsh.py").is_file()
     ):
-        capabilities.extend((DSH_FLASH_CAPABILITY, DSH_PRO_CAPABILITY))
+        capabilities.extend((
+            DSH_FLASH_CAPABILITY,
+            DSH_PRO_CAPABILITY,
+            # Transitional compatibility: an old server knows only v4,
+            # while the v5 marker lets the new server require timed usage.
+            DSH_FLASH_LEGACY_CAPABILITY,
+            DSH_PRO_LEGACY_CAPABILITY,
+        ))
     # Unlike API-key providers, a subscription slot is scarce and stateful.
     # Advertise it only when both the CLI and a safe refreshable OAuth session
     # are actually present, preventing the server from assigning unusable work.
