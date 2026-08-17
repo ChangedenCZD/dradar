@@ -9,6 +9,18 @@ import pytest
 from dradar import doctor
 
 
+_REAL_DOCKER_HUB_PREFLIGHT = doctor._docker_hub_preflight
+
+
+@pytest.fixture(autouse=True)
+def _stub_docker_hub_preflight(monkeypatch):
+    """Unit tests must never depend on the caller's live Docker registry."""
+
+    monkeypatch.setattr(
+        doctor, "_docker_hub_preflight", lambda _docker, _platform: (True, ""),
+    )
+
+
 def test_platform_macos(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     assert doctor._platform() == "macos"
@@ -36,6 +48,84 @@ def test_platform_bare_linux(monkeypatch, tmp_path: Path):
 def test_platform_linux_without_proc_version(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(sys, "platform", "linux")
     assert doctor._platform(proc_version=tmp_path / "missing") == "linux"
+
+
+def test_docker_hub_preflight_uses_buildkit_without_pulling_layers(
+    monkeypatch,
+):
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen.update(cmd=cmd, kwargs=kwargs)
+        assert Path(cmd[-1]).is_dir()
+        return SimpleNamespace(returncode=0, stdout="Check complete", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    assert _REAL_DOCKER_HUB_PREFLIGHT("/usr/bin/docker", "linux") == (True, "")
+    assert seen["cmd"][:-1] == [
+        "/usr/bin/docker", "build", "--check", "--pull", "--file", "-",
+    ]
+    assert seen["kwargs"]["input"] == (
+        "FROM docker.io/library/ubuntu:24.04\n"
+    )
+    assert seen["kwargs"]["timeout"] == 20
+
+
+def test_docker_hub_preflight_falls_back_for_older_docker(monkeypatch):
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "build":
+            return SimpleNamespace(
+                returncode=125, stdout="", stderr="unknown flag: --check",
+            )
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    assert _REAL_DOCKER_HUB_PREFLIGHT("docker", "linux") == (True, "")
+    assert calls[1] == [
+        "docker", "manifest", "inspect", "docker.io/library/ubuntu:24.04",
+    ]
+
+
+def test_docker_hub_preflight_reports_dns_tls_interception(monkeypatch):
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "x509: certificate is valid for *.twimg.com, not "
+                "registry-1.docker.io"
+            ),
+        ),
+    )
+
+    ready, hint = _REAL_DOCKER_HUB_PREFLIGHT("docker", "macos")
+
+    assert ready is False
+    assert "wrong TLS endpoint" in hint
+    assert "OrbStack/Docker Desktop" in hint
+    assert "twimg" not in hint
+
+
+def test_docker_hub_preflight_reports_timeout_without_leaking_output(
+    monkeypatch,
+):
+    def timeout(*_args, **_kwargs):
+        raise doctor.subprocess.TimeoutExpired("docker", timeout=20)
+
+    monkeypatch.setattr(doctor.subprocess, "run", timeout)
+
+    ready, hint = _REAL_DOCKER_HUB_PREFLIGHT("docker", "linux")
+
+    assert ready is False
+    assert "authentication/registry access failed" in hint
+    assert "Docker daemon proxy and DNS" in hint
 
 
 def _run_doctor(monkeypatch, capsys, plat: str) -> tuple[int, str]:
@@ -174,6 +264,7 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
 ):
     tasks_root = tmp_path / "deep-swe" / "tasks"
     state = {"pier_ready": False, "pier_calls": 0, "task_calls": 0}
+    docker_hub_calls = []
 
     def which(name):
         if name == "docker":
@@ -196,6 +287,13 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
     monkeypatch.setattr(doctor.shutil, "which", which)
     monkeypatch.setattr(doctor, "_probe", lambda _cmd: True)
     monkeypatch.setattr(
+        doctor,
+        "_docker_hub_preflight",
+        lambda docker, platform: (
+            docker_hub_calls.append((docker, platform)) or (True, "")
+        ),
+    )
+    monkeypatch.setattr(
         doctor, "docker_resources", lambda: (8, 16.0, ()),
     )
     monkeypatch.setattr(
@@ -217,6 +315,9 @@ def test_windows_healthy_docker_preserves_existing_bootstrap(
 
     assert rc == 1  # no agent auth or server login in this isolated test
     assert state == {"pier_ready": True, "pier_calls": 1, "task_calls": 1}
+    assert docker_hub_calls == [
+        ("C:/Program Files/Docker/docker.exe", "windows"),
+    ]
     assert "[ok ] docker daemon" in out
     assert "[ok ] docker resources (8 CPU / 16.0 GiB memory)" in out
     assert "[ok ] pier" in out
