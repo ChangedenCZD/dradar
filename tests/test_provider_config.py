@@ -328,6 +328,47 @@ def test_grok_auto_install_rejects_changed_installer(tmp_path, monkeypatch, caps
     assert "refusing to execute" in capsys.readouterr().out
 
 
+def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "dradar"))
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: True),
+    )
+    monkeypatch.setattr(provider_config, "_ensure_grok_cli", lambda: "/managed/grok")
+    monkeypatch.setattr(
+        provider_config,
+        "provider_subprocess_env",
+        lambda: {
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "GROK_HOME": "/ambient/grok-home",
+            "XAI_API_KEY": "must-not-leak",
+        },
+    )
+    seen = {}
+
+    def run(cmd, *, env):
+        seen.update(cmd=cmd, env=env)
+        auth = provider_config.Path(env["HOME"]) / ".grok" / "auth.json"
+        auth.parent.mkdir(parents=True)
+        auth.write_text(json.dumps({
+            "https://auth.x.ai::client": {
+                "auth_mode": "oauth",
+                "key": "access",
+                "refresh_token": "refresh",
+            },
+        }))
+        if os.name != "nt":
+            auth.chmod(0o600)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(provider_config.subprocess, "run", run)
+
+    assert provider_config._setup_grok_subscription() == 0
+    assert seen["cmd"] == ["/managed/grok", "login", "--device-auth"]
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert "GROK_HOME" not in seen["env"]
+    assert "XAI_API_KEY" not in seen["env"]
+
+
 def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatch):
     target = tmp_path / "dradar/providers/kimi/runtime/1.49.0/bin/kimi"
     seen = {}
