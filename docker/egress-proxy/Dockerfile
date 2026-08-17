@@ -11,6 +11,9 @@ RUN apt-get update \
         apache2-utils \
         ca-certificates \
         squid \
+    && rm -f \
+        /etc/ssl/certs/ssl-cert-snakeoil.pem \
+        /etc/ssl/private/ssl-cert-snakeoil.key \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --chmod=0755 start-squid.sh /usr/local/bin/start-squid.sh
