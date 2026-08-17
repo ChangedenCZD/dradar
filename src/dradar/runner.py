@@ -2116,7 +2116,9 @@ def run_trial(
     live_error_offsets: dict[Path, int] = {}
     live_error_counts: dict[str, int] = {}
     watch_live_account_errors = (
-        (dev_agent or effective_assignment["agent"]) in ("codex", DSH_AGENT)
+        (dev_agent or effective_assignment["agent"]) in (
+            "codex", DSH_AGENT, GROK_AGENT, KIMI_AGENT, ZCODE_AGENT,
+        )
     )
 
     provider_auth_path = None
@@ -2505,9 +2507,11 @@ DIAG_ADVICE = {
         "the pool will not start another task, while already-running siblings "
         "are allowed to finish; recharge it, then run `dradar resume`."),
     "auth": (
-        "the agent could not authenticate inside the container — for DeepSeek "
-        "run `dradar provider status deepseek` (or set it up again); for the "
-        "original OpenAI path run `codex login`, then re-check `dradar doctor`."),
+        "the agent could not authenticate inside the container. Run the matching "
+        "live check before claiming again: `dradar provider status deepseek "
+        "--live`, `dradar provider status grok`, `dradar provider status kimi "
+        "--live`, or `dradar provider status zcode --live`; for the original "
+        "OpenAI path run `codex login`, then re-check `dradar doctor`."),
     "model-capacity": (
         "the model stayed at capacity after Pier retried the original Codex "
         "session with bounded backoff. This is not a problem with your setup "

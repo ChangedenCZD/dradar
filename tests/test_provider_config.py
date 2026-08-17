@@ -136,6 +136,7 @@ def test_setup_uses_hidden_input_and_never_echoes_key(
         "getpass",
         lambda _prompt: "sentinel-provider-secret",
     )
+    monkeypatch.setattr(provider_config, "_live_deepseek_status", lambda _key: 0)
 
     rc = provider_config.cmd_provider_setup(SimpleNamespace(provider="deepseek"))
 
@@ -158,6 +159,7 @@ def test_setup_key_is_active_even_with_a_stale_inherited_environment(
         "getpass",
         lambda _prompt: "new-file-secret",
     )
+    monkeypatch.setattr(provider_config, "_live_deepseek_status", lambda _key: 0)
 
     rc = provider_config.cmd_provider_setup(SimpleNamespace(provider="deepseek"))
 
@@ -167,6 +169,27 @@ def test_setup_key_is_active_even_with_a_stale_inherited_environment(
     output = capsys.readouterr().out
     assert "stale-environment-secret" not in output
     assert "new-file-secret" not in output
+
+
+def test_setup_keeps_rejected_key_but_refuses_ready_state(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: True),
+    )
+    monkeypatch.setattr(
+        provider_config.getpass, "getpass", lambda _prompt: "rejected-secret",
+    )
+    monkeypatch.setattr(provider_config, "_live_deepseek_status", lambda _key: 1)
+
+    assert provider_config.cmd_provider_setup(
+        SimpleNamespace(provider="deepseek")
+    ) == 1
+    assert deepseek_api_key() == "rejected-secret"
+    output = capsys.readouterr().out
+    assert "not ready for a task" in output
+    assert "rejected-secret" not in output
 
 
 def test_status_reports_source_without_secret(tmp_path, monkeypatch, capsys):
@@ -200,7 +223,7 @@ def test_live_status_verifies_auth_and_required_models(
             ]},
         )
 
-    monkeypatch.setattr(provider_config.httpx, "get", get)
+    monkeypatch.setattr(provider_config, "_provider_httpx_get", get)
     rc = provider_config.cmd_provider_status(
         SimpleNamespace(provider="deepseek", live=True))
 
@@ -222,7 +245,7 @@ def test_live_status_distinguishes_rejected_key_from_transport_failure(
     monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
     store_deepseek_api_key("sentinel-provider-secret")
     monkeypatch.setattr(
-        provider_config.httpx, "get",
+        provider_config, "_provider_httpx_get",
         lambda *args, **kwargs: SimpleNamespace(status_code=401),
     )
     assert provider_config.cmd_provider_status(
@@ -235,7 +258,7 @@ def test_live_status_distinguishes_rejected_key_from_transport_failure(
     def fail(*args, **kwargs):
         raise httpx.ConnectError("sentinel-provider-secret")
 
-    monkeypatch.setattr(provider_config.httpx, "get", fail)
+    monkeypatch.setattr(provider_config, "_provider_httpx_get", fail)
     assert provider_config.cmd_provider_status(
         SimpleNamespace(provider="deepseek", live=True)) == 1
     transport = capsys.readouterr().out
@@ -270,6 +293,85 @@ def test_subscription_setup_prepares_runtime_before_requesting_interactive_oauth
     assert f"provider setup {provider}" in output
 
 
+@pytest.mark.parametrize(
+    ("provider", "ensure_name", "auth_error_name", "live_name"),
+    [
+        ("grok", "_ensure_grok_cli", "grok_auth_error", "grok_live_error"),
+        ("kimi", "_ensure_kimi_cli", "kimi_auth_error", "kimi_live_error"),
+    ],
+)
+def test_existing_valid_subscription_is_reused_without_new_login(
+    provider, ensure_name, auth_error_name, live_name, monkeypatch, capsys,
+):
+    monkeypatch.setattr(provider_config, ensure_name, lambda: f"/managed/{provider}")
+    monkeypatch.setattr(
+        provider_config, auth_error_name, lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(provider_config, live_name, lambda _cli: None)
+    monkeypatch.setattr(
+        provider_config.sys,
+        "stdin",
+        SimpleNamespace(
+            isatty=lambda: pytest.fail("ready credential must not request a TTY"),
+        ),
+    )
+    monkeypatch.setattr(
+        provider_config.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("ready credential must not re-login"),
+    )
+
+    assert provider_config.cmd_provider_setup(SimpleNamespace(provider=provider)) == 0
+    assert "already ready" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("provider", ["grok", "kimi"])
+def test_interrupted_reauthentication_preserves_previous_credential(
+    provider, tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "dradar"))
+    monkeypatch.setattr(
+        provider_config.sys, "stdin", SimpleNamespace(isatty=lambda: True),
+    )
+    if provider == "grok":
+        path = provider_config.grok_auth_path()
+        payload = {
+            "https://auth.x.ai::client": {
+                "auth_mode": "oauth",
+                "key": "old-access",
+                "refresh_token": "old-refresh",
+            },
+        }
+        monkeypatch.setattr(provider_config, "_ensure_grok_cli", lambda: "/grok")
+        monkeypatch.setattr(
+            provider_config, "grok_live_error", lambda _cli: "revoked OAuth",
+        )
+    else:
+        path = provider_config.kimi_auth_path()
+        payload = {
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "token_type": "Bearer",
+        }
+        monkeypatch.setattr(provider_config, "_ensure_kimi_cli", lambda: "/kimi")
+        monkeypatch.setattr(
+            provider_config, "kimi_live_error", lambda _cli: "revoked OAuth",
+        )
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload))
+    if os.name != "nt":
+        path.chmod(0o600)
+    original = path.read_bytes()
+    monkeypatch.setattr(
+        provider_config.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=130),
+    )
+
+    assert provider_config.cmd_provider_setup(SimpleNamespace(provider=provider)) == 130
+    assert path.read_bytes() == original
+
+
 def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
     target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
     seen = {}
@@ -282,8 +384,8 @@ def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
         provider_config.hashlib.sha256(installer).hexdigest(),
     )
     monkeypatch.setattr(
-        provider_config.httpx,
-        "get",
+        provider_config,
+        "_provider_httpx_get",
         lambda *args, **kwargs: SimpleNamespace(
             status_code=200, content=installer,
         ),
@@ -312,8 +414,8 @@ def test_grok_auto_install_rejects_changed_installer(tmp_path, monkeypatch, caps
     monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
     monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
     monkeypatch.setattr(
-        provider_config.httpx,
-        "get",
+        provider_config,
+        "_provider_httpx_get",
         lambda *args, **kwargs: SimpleNamespace(
             status_code=200, content=b"#!/bin/bash\necho changed\n",
         ),
@@ -326,6 +428,48 @@ def test_grok_auto_install_rejects_changed_installer(tmp_path, monkeypatch, caps
 
     assert provider_config._install_managed_grok_cli() is None
     assert "refusing to execute" in capsys.readouterr().out
+
+
+def test_provider_http_client_uses_os_proxy_and_honors_no_proxy(monkeypatch):
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, url, **kwargs):
+            seen.update(url=url, request=kwargs)
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(provider_config.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        provider_config,
+        "provider_subprocess_env",
+        lambda: {
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "NO_PROXY": "open.bigmodel.cn",
+        },
+    )
+
+    provider_config._provider_httpx_get(
+        "https://auth.x.ai/oauth2/device/code",
+        timeout=7.0,
+        follow_redirects=True,
+    )
+    assert seen["client"] == {
+        "proxy": "http://127.0.0.1:7897",
+        "trust_env": False,
+        "timeout": 7.0,
+        "follow_redirects": True,
+    }
+    provider_config._provider_httpx_get("https://open.bigmodel.cn/models")
+    assert seen["client"]["proxy"] is None
 
 
 def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
@@ -361,6 +505,7 @@ def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(provider_config.subprocess, "run", run)
+    monkeypatch.setattr(provider_config, "grok_live_error", lambda _cli: None)
 
     assert provider_config._setup_grok_subscription() == 0
     assert seen["cmd"] == ["/managed/grok", "login", "--device-auth"]
@@ -374,6 +519,11 @@ def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatc
     seen = {}
     monkeypatch.setattr(provider_config, "managed_kimi_cli_path", lambda: target)
     monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(
+        provider_config,
+        "provider_subprocess_env",
+        lambda: {"HTTPS_PROXY": "http://127.0.0.1:7897"},
+    )
 
     def run(cmd, *, env, check):
         seen.update(cmd=cmd, env=env)
@@ -391,6 +541,7 @@ def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatc
     assert seen["cmd"][-1] == "kimi-cli==1.49.0"
     assert seen["env"]["UV_TOOL_BIN_DIR"] == str(target.parent)
     assert seen["env"]["UV_TOOL_DIR"].startswith(str(target.parent.parent))
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
 
 
 def test_kimi_login_uses_current_share_directory_contract(
@@ -406,10 +557,23 @@ def test_kimi_login_uses_current_share_directory_contract(
     monkeypatch.setattr(
         provider_config, "kimi_auth_error", lambda *args, **kwargs: next(issues),
     )
+    monkeypatch.setattr(provider_config, "kimi_live_error", lambda _cli: None)
+    monkeypatch.setattr(
+        provider_config,
+        "provider_subprocess_env",
+        lambda: {
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "KIMI_CODE_HOME": "/ambient/legacy-home",
+            "KIMI_API_KEY": "must-not-leak",
+        },
+    )
     seen = {}
 
     def run(cmd, *, env):
         seen.update(cmd=cmd, env=env)
+        seen["bootstrap"] = (
+            provider_config.Path(env["PYTHONPATH"]) / "sitecustomize.py"
+        ).read_text()
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(provider_config.subprocess, "run", run)
@@ -419,4 +583,7 @@ def test_kimi_login_uses_current_share_directory_contract(
     assert seen["env"]["KIMI_SHARE_DIR"] == str(
         provider_config.kimi_home()
     )
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
     assert "KIMI_CODE_HOME" not in seen["env"]
+    assert "KIMI_API_KEY" not in seen["env"]
+    assert 'kwargs.setdefault("trust_env", True)' in seen["bootstrap"]

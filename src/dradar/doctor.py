@@ -30,6 +30,7 @@ from .providers import (
     kimi_auth_error,
     kimi_auth_path,
     kimi_cli_path,
+    kimi_live_error,
     parse_kimi_cli_version,
     parse_grok_cli_version,
     zcode_api_key,
@@ -285,7 +286,7 @@ def cmd_doctor(args) -> int:
             pass
     grok_oauth_issue = grok_auth_error() if grok_requested else None
     grok_live_issue = (
-        grok_live_error(grok, grok_auth_path())
+        grok_live_error(grok)
         if grok_cli_ready and grok_oauth_issue is None else None
     )
     grok_ready = (
@@ -309,7 +310,14 @@ def cmd_doctor(args) -> int:
         except (subprocess.TimeoutExpired, OSError):
             pass
     kimi_oauth_issue = kimi_auth_error() if kimi_requested else None
-    kimi_ready = kimi_cli_ready and kimi_requested and kimi_oauth_issue is None
+    kimi_live_issue = (
+        kimi_live_error(kimi)
+        if kimi_cli_ready and kimi_oauth_issue is None else None
+    )
+    kimi_ready = (
+        kimi_cli_ready and kimi_requested
+        and kimi_oauth_issue is None and kimi_live_issue is None
+    )
     zcode_key_ready = bool(zcode_api_key())
     zcode_requested = zcode_only or (selected_agent is None and zcode_key_ready)
     zcode_cli_issue = zcode_cli_error(zcode_cli_path()) if zcode_requested else None
@@ -356,6 +364,12 @@ def cmd_doctor(args) -> int:
                 kimi_oauth_issue is None,
                 kimi_oauth_issue or "run `dradar provider setup kimi`",
             )
+            if kimi_cli_ready and kimi_oauth_issue is None:
+                all_ok &= _check(
+                    "Kimi K3 — live subscription access",
+                    kimi_live_issue is None,
+                    kimi_live_issue or "run `dradar provider setup kimi`",
+                )
             if kimi_ready:
                 _check("Kimi K3 — subscription provider ready", True)
         if zcode_requested:
