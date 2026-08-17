@@ -423,8 +423,8 @@ def test_pier_process_isolates_deepseek_secret_and_adapter_path(
     assert deepseek_env["PYTHONPATH"] == str(tmp_path)
     assert "PYTHONHOME" not in deepseek_env
     assert openai_env[DEEPSEEK_API_KEY_ENV] == "sentinel-deepseek-secret"
-    assert openai_env["PYTHONPATH"] == "/private/pier"
-    assert openai_env["PYTHONHOME"] == "/private/python"
+    assert "PYTHONPATH" not in openai_env
+    assert "PYTHONHOME" not in openai_env
 
 
 def test_run_removes_temporary_auth_when_command_build_fails(

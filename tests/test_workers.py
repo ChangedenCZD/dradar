@@ -192,6 +192,36 @@ def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
         assert "checking for a different waiting task" in output
 
 
+def test_egress_preflight_failure_happens_before_checkout(monkeypatch):
+    checked_out = []
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
+    monkeypatch.setattr(runloop, "tasks_root_from_config", lambda _cfg: object())
+    monkeypatch.setattr(runloop, "RunnerTelemetry", _Telemetry)
+    monkeypatch.setattr(runloop, "acquire_run_lock", lambda _home: None)
+    monkeypatch.setattr(runloop, "sweep_orphan_compose", lambda *_a: None)
+    monkeypatch.setattr(
+        runloop, "_maintain_image_cache", lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
+    monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        runloop.egress,
+        "ensure_egress_runtime_ready",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runloop.egress.EgressProxyError("container route unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        runloop, "_go_menu", lambda *_a, **_k: checked_out.append(True) or 0,
+    )
+
+    with pytest.raises(SystemExit, match="no task was started"):
+        runloop.cmd_go(_args(workers=1, auto=None))
+
+    assert checked_out == []
+
+
 class _Process:
     next_pid = 100
 

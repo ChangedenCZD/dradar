@@ -271,6 +271,21 @@ def test_provider_subprocess_env_adds_os_proxy_without_overriding_shell(
     )
 
 
+def test_dradar_http_proxy_is_the_authoritative_cross_platform_interface(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://ambient.example:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient.example:8080")
+    monkeypatch.setenv("DRADAR_HTTP_PROXY", "http://configured.example:43128")
+    monkeypatch.setenv("DRADAR_NO_PROXY", "localhost,127.0.0.1")
+
+    env = providers.provider_subprocess_env()
+
+    assert env["HTTP_PROXY"] == "http://configured.example:43128"
+    assert env["HTTPS_PROXY"] == "http://configured.example:43128"
+    assert env["NO_PROXY"] == "localhost,127.0.0.1"
+
+
 def test_grok_live_probe_rejects_unauthenticated_fallback(
     tmp_path: Path, monkeypatch,
 ) -> None:

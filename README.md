@@ -147,6 +147,7 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 运行完整环境体检，并给出与 macOS、Linux、WSL2 或 Windows 对应的修复建议。它会检查：
 
 - Docker CLI、Docker daemon 和 Compose 插件；
+- 固定 SHA-256 的 Pier egress 双架构镜像归档，以及一次性容器内联网探测；
 - 与 DRadar 固定版本兼容的 Pier，缺失时会尝试安装；
 - Codex CLI + `auth.json`、Claude CLI + OAuth Token，以及所选可选 provider 的本地凭据、
   固定 CLI 版本和模型访问能力；
@@ -157,6 +158,26 @@ dradar login --server https://api.codexradar.com --token <YOUR_TOKEN> \
 ```bash
 dradar doctor
 ```
+
+DRadar 不假设代理软件、端口或 Docker 实现。无代理配置时按直连检查；需要代理时可使用
+跨平台的 DRadar 专用接口（它同时作用于 OAuth/模型访问检查、Docker 构建和 Pier 运行时
+egress）：
+
+```bash
+export DRADAR_HTTP_PROXY=http://127.0.0.1:<PORT>
+export DRADAR_NO_PROXY=localhost,127.0.0.1
+dradar doctor
+```
+
+标准 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 也受支持；显式设置的
+`DRADAR_HTTP_PROXY` / `DRADAR_NO_PROXY` 优先。回环地址只会在传给容器时转换成
+`host.docker.internal`，主机和端口始终来自用户自己的配置。凭据不会进入命令参数、镜像
+层或 DRadar 服务端。若代理协议、容器路由或官方镜像下载不可用，`doctor` 会在领题前
+失败并给出这个接口的修复命令，而不会修改用户的系统代理或 Docker 设置。
+
+官方 egress 镜像通过普通 HTTPS 下载并校验归档 SHA-256，随后使用 `docker load` 本地
+载入；普通用户不需要登录 GHCR，也不需要为 Docker daemon 单独配置代理。只有显式设置
+`DRADAR_EGRESS_PROXY_IMAGE_OVERRIDE` 的运维回滚路径才会直接从 GHCR 拉取固定 digest。
 
 ### DeepSeek V4 Flash / Pro 补充 provider
 
