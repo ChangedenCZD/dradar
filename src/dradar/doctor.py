@@ -6,6 +6,7 @@ import ctypes
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from . import __version__, runner
@@ -112,6 +113,9 @@ _CODEX_HINTS = {
     "windows": "PowerShell: irm https://chatgpt.com/codex/install.ps1 | iex",
 }
 
+_PIER_EGRESS_BASE_IMAGE = "docker.io/library/ubuntu:24.04"
+_DOCKER_HUB_PROBE_TIMEOUT_SEC = 20
+
 
 def _probe(cmd: list[str]) -> bool:
     """Run a doctor probe; a wedged daemon must not hang doctor forever."""
@@ -119,6 +123,107 @@ def _probe(cmd: list[str]) -> bool:
         return subprocess.run(cmd, capture_output=True, timeout=10).returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _docker_hub_hint(output: str, platform: str) -> str:
+    """Turn BuildKit/registry failures into an actionable volunteer hint."""
+
+    lowered = output.lower()
+    if platform == "macos":
+        action = (
+            "configure OrbStack/Docker Desktop to use the host proxy and a "
+            "working DNS resolver, then restart it"
+        )
+    elif platform == "windows":
+        action = (
+            "configure Docker Desktop's proxy and DNS, then restart Docker "
+            "Desktop in Linux-container mode"
+        )
+    elif platform == "wsl":
+        action = (
+            "configure Docker Desktop/WSL proxy and DNS, then restart the "
+            "Linux Docker engine"
+        )
+    else:
+        action = "configure the Docker daemon proxy and DNS, then restart Docker"
+    if "x509:" in lowered and "certificate is valid for" in lowered:
+        reason = "Docker Hub resolved to the wrong TLS endpoint (DNS/proxy interception)"
+    elif "toomanyrequests" in lowered or "429 too many requests" in lowered:
+        reason = "Docker Hub anonymous pull limit was reached; run `docker login`"
+    elif "timed out" in lowered or "timeout" in lowered:
+        reason = "Docker Hub authentication/registry access failed"
+    elif any(marker in lowered for marker in (
+        "failed to fetch anonymous token",
+        "auth.docker.io",
+        "registry-1.docker.io",
+    )) and any(marker in lowered for marker in (
+        "timeout", "timed out", "deadline exceeded", "connection refused",
+        "network is unreachable", "no such host",
+    )):
+        reason = "Docker Hub authentication/registry access failed"
+    else:
+        reason = f"cannot inspect required image {_PIER_EGRESS_BASE_IMAGE}"
+    return f"{reason}; {action}"
+
+
+def _docker_hub_preflight(
+    docker: str, platform: str,
+) -> tuple[bool, str]:
+    """Use Docker's own BuildKit path to validate Hub auth and base metadata.
+
+    ``--check --pull`` resolves the real Pier sidecar base through the same
+    daemon/proxy path used by ``docker compose build`` without downloading its
+    layers or creating a container. Older engines that do not support build
+    checks fall back to the CLI's non-downloading manifest inspection.
+    """
+
+    dockerfile = f"FROM {_PIER_EGRESS_BASE_IMAGE}\n"
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="dradar-docker-hub-probe-",
+        ) as context:
+            proc = subprocess.run(
+                [
+                    docker, "build", "--check", "--pull", "--file", "-",
+                    context,
+                ],
+                input=dockerfile,
+                capture_output=True,
+                text=True,
+                timeout=_DOCKER_HUB_PROBE_TIMEOUT_SEC,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        return False, _docker_hub_hint("Docker Hub request timed out", platform)
+    except OSError as exc:
+        return False, f"could not start Docker Hub preflight: {exc}"
+
+    output = f"{proc.stdout}\n{proc.stderr}"
+    unsupported = any(marker in output.lower() for marker in (
+        "unknown flag: --check",
+        "unknown flag: --pull",
+        "unknown shorthand flag",
+        "build checks require buildkit",
+    ))
+    if proc.returncode != 0 and unsupported:
+        try:
+            proc = subprocess.run(
+                [docker, "manifest", "inspect", _PIER_EGRESS_BASE_IMAGE],
+                capture_output=True,
+                text=True,
+                timeout=_DOCKER_HUB_PROBE_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, _docker_hub_hint(
+                "Docker Hub request timed out", platform,
+            )
+        except OSError as exc:
+            return False, f"could not start Docker Hub preflight: {exc}"
+        output = f"{proc.stdout}\n{proc.stderr}"
+    if proc.returncode == 0:
+        return True, ""
+    return False, _docker_hub_hint(output, platform)
 
 
 _PF_VIRT_FIRMWARE_ENABLED = 21
@@ -202,6 +307,14 @@ def cmd_doctor(args) -> int:
         compose = _probe([docker, "compose", "version"])
         all_ok &= _check("docker compose plugin", compose, hints["compose"])
         if daemon_ready:
+            docker_hub_ready, docker_hub_hint = _docker_hub_preflight(
+                docker, plat,
+            )
+            all_ok &= _check(
+                "Docker Hub auth + egress base (ubuntu:24.04)",
+                docker_hub_ready,
+                docker_hub_hint,
+            )
             cpus, memory_gib, probe_warnings = docker_resources()
             if cpus is not None and memory_gib is not None:
                 resource_label = (
@@ -477,5 +590,6 @@ def cmd_doctor(args) -> int:
 
 __all__ = [
     "cmd_doctor", "_platform", "_check", "_warn", "_probe", "_DOCKER_HINTS",
-    "_CODEX_HINTS", "_windows_virtualization_state",
+    "_CODEX_HINTS", "_docker_hub_hint", "_docker_hub_preflight",
+    "_windows_virtualization_state",
 ]
