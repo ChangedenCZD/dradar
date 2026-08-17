@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
@@ -75,14 +75,6 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
 
-      - name: Keep the volunteer runtime anonymously pullable
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh api --method PATCH
-          "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/dradar-egress-proxy"
-          -f visibility=public
-
       - name: Install cosign
         uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
 
@@ -90,3 +82,41 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # Volunteers should not need a GHCR login or a separately configured
+      # Docker-daemon proxy. Export both platform images as ordinary public
+      # GitHub release assets; the CLI downloads and verifies the matching
+      # archive over its normal HTTPS/proxy path, then uses `docker load`.
+      - name: Export portable image archives
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            source_ref="${IMAGE}@${DIGEST}"
+            portable_ref="${IMAGE}:release-${GITHUB_SHA}-${arch}"
+            docker pull --platform "linux/${arch}" "${source_ref}"
+            docker tag "${source_ref}" "${portable_ref}"
+            docker image inspect --format '{{.Id}}' "${portable_ref}" \
+              > "dist/dradar-egress-proxy-linux-${arch}.image-id"
+            docker save "${portable_ref}" \
+              | gzip -9 > "dist/dradar-egress-proxy-linux-${arch}.tar.gz"
+            docker image rm "${portable_ref}" "${source_ref}"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Publish anonymous release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          release_tag="egress-proxy-${GITHUB_SHA}"
+          gh release create "${release_tag}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "DRadar egress proxy ${GITHUB_SHA}" \
+            --notes "Signed multi-architecture Pier egress image. GHCR manifest: ${DIGEST}" \
+            --prerelease \
+            --latest=false
