@@ -101,6 +101,23 @@ if any(marker in tool_input for marker in PROTECTED):
 KIMI_LAUNCHER = r'''#!/usr/bin/env python3
 import os
 
+import aiohttp
+
+# Kimi CLI's OAuth refresh transport does not currently opt in to the
+# standard proxy environment.  Pier deliberately exposes outbound access
+# through those variables, so make the official refresh client honour the
+# same interface as Kimi's model client.  This keeps refresh working during
+# long runs without assuming a host proxy product, address, or port.
+_original_client_session = aiohttp.ClientSession
+
+
+def _proxy_aware_client_session(*args, **kwargs):
+    kwargs.setdefault("trust_env", True)
+    return _original_client_session(*args, **kwargs)
+
+
+aiohttp.ClientSession = _proxy_aware_client_session
+
 from kimi_cli import llm as kimi_llm
 
 effort = os.environ.get("KIMI_MODEL_THINKING_EFFORT", "")

@@ -452,7 +452,7 @@ def test_provider_http_client_uses_os_proxy_and_honors_no_proxy(monkeypatch):
         provider_config,
         "provider_subprocess_env",
         lambda: {
-            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "HTTPS_PROXY": "http://127.0.0.1:18080",
             "NO_PROXY": "open.bigmodel.cn",
         },
     )
@@ -463,7 +463,7 @@ def test_provider_http_client_uses_os_proxy_and_honors_no_proxy(monkeypatch):
         follow_redirects=True,
     )
     assert seen["client"] == {
-        "proxy": "http://127.0.0.1:7897",
+        "proxy": "http://127.0.0.1:18080",
         "trust_env": False,
         "timeout": 7.0,
         "follow_redirects": True,
@@ -482,7 +482,7 @@ def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
         provider_config,
         "provider_subprocess_env",
         lambda: {
-            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "HTTPS_PROXY": "http://127.0.0.1:18080",
             "GROK_HOME": "/ambient/grok-home",
             "XAI_API_KEY": "must-not-leak",
         },
@@ -509,7 +509,7 @@ def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
 
     assert provider_config._setup_grok_subscription() == 0
     assert seen["cmd"] == ["/managed/grok", "login", "--device-auth"]
-    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
     assert "GROK_HOME" not in seen["env"]
     assert "XAI_API_KEY" not in seen["env"]
 
@@ -522,7 +522,7 @@ def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatc
     monkeypatch.setattr(
         provider_config,
         "provider_subprocess_env",
-        lambda: {"HTTPS_PROXY": "http://127.0.0.1:7897"},
+        lambda: {"HTTPS_PROXY": "http://127.0.0.1:18080"},
     )
 
     def run(cmd, *, env, check):
@@ -541,7 +541,7 @@ def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatc
     assert seen["cmd"][-1] == "kimi-cli==1.49.0"
     assert seen["env"]["UV_TOOL_BIN_DIR"] == str(target.parent)
     assert seen["env"]["UV_TOOL_DIR"].startswith(str(target.parent.parent))
-    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
 
 
 def test_kimi_login_uses_current_share_directory_contract(
@@ -562,7 +562,7 @@ def test_kimi_login_uses_current_share_directory_contract(
         provider_config,
         "provider_subprocess_env",
         lambda: {
-            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "HTTPS_PROXY": "http://127.0.0.1:18080",
             "KIMI_CODE_HOME": "/ambient/legacy-home",
             "KIMI_API_KEY": "must-not-leak",
         },
@@ -583,7 +583,7 @@ def test_kimi_login_uses_current_share_directory_contract(
     assert seen["env"]["KIMI_SHARE_DIR"] == str(
         provider_config.kimi_home()
     )
-    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
     assert "KIMI_CODE_HOME" not in seen["env"]
     assert "KIMI_API_KEY" not in seen["env"]
     assert 'kwargs.setdefault("trust_env", True)' in seen["bootstrap"]

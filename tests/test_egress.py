@@ -260,6 +260,25 @@ def test_agent_build_proxy_is_added_only_when_configured(monkeypatch):
     assert override["extra_hosts"] == ["host.docker.internal=host-gateway"]
 
 
+def test_runtime_proxy_token_moves_into_private_compose_environment(tmp_path):
+    path = tmp_path / "docker-compose-egress-proxy.json"
+    path.write_text(json.dumps({
+        "services": {"main": {"networks": ["internal"]}},
+    }))
+    runtime = {
+        "HTTP_PROXY": "http://agent:short-lived@pier-egress-proxy:8080",
+        "HTTPS_PROXY": "http://agent:short-lived@pier-egress-proxy:8080",
+    }
+    build = {"args": {"HTTPS_PROXY": "http://host.docker.internal:43128"}}
+
+    pier_sitecustomize._finalize_docker_proxy_compose(path, runtime, build)
+
+    compose = json.loads(path.read_text())
+    assert compose["services"]["main"]["environment"] == runtime
+    assert compose["services"]["main"]["build"] == build
+    assert path.stat().st_mode & 0o077 == 0
+
+
 def test_runtime_probe_keeps_credentials_out_of_process_arguments(monkeypatch):
     calls = []
 

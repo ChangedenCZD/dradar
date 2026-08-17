@@ -856,7 +856,10 @@ def _run_grok_live_probe(cli: str, credential: Path, root: Path) -> str | None:
             _replace_private_file(native_auth, credential)
     output = f"{proc.stdout}\n{proc.stderr}"
     if "not authenticated" in output.lower():
-        return "Grok OAuth session is not authenticated"
+        return (
+            "Grok OAuth session is not authenticated; run "
+            "`dradar provider setup grok` in your own interactive Terminal"
+        )
     if proc.returncode != 0:
         return "Grok live model check failed; check this machine's network/proxy"
     if GROK_MODEL not in output:
