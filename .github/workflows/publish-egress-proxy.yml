@@ -37,13 +37,15 @@ jobs:
           sbom: false
           tags: dradar-egress-proxy:scan
 
-      - name: Scan fixable high and critical vulnerabilities
-        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # v0.30.0
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
-          image-ref: dradar-egress-proxy:scan
-          ignore-unfixed: true
-          severity: HIGH,CRITICAL
-          exit-code: 1
+          version: v0.74.0
+
+      - name: Scan fixable high and critical vulnerabilities
+        run: >-
+          trivy image --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1
+          dradar-egress-proxy:scan
 
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
