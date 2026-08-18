@@ -317,3 +317,84 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert "KIMI_DISABLE_TELEMETRY" in source
     assert "KIMI_DISABLE_CRON" in source
     assert "[REDACTED_KIMI_CREDENTIAL]" in source
+
+
+def _write_kimi_session(
+    trial: Path, *, include_result: bool = True, malformed: bool = False,
+) -> None:
+    agent = trial / "agent"
+    agent.mkdir(parents=True)
+    (agent / "trajectory.json").write_text(json.dumps({
+        "session_id": "kimi-session-1",
+        "agent": {"model_name": KIMI_MODEL},
+    }))
+    records = [
+        {"type": "metadata", "protocol_version": "1"},
+        {"timestamp": 1.0, "message": {
+            "type": "TurnBegin", "payload": {"user_input": "task"}}},
+        {"timestamp": 2.0, "message": {
+            "type": "ToolCall", "payload": {
+                "type": "function", "id": "call-1",
+                "function": {
+                    "name": "Shell",
+                    "arguments": json.dumps({
+                        "command": "curl https://example.com/data",
+                    }),
+                },
+            }}},
+    ]
+    if include_result:
+        records.append({"timestamp": 3.0, "message": {
+            "type": "ToolResult", "payload": {
+                "tool_call_id": "call-1",
+                "return_value": {"output": "proxy denied"},
+            }}})
+    records.append({"timestamp": 4.0, "message": {
+        "type": "TurnEnd", "payload": {}}})
+    text = "\n".join(json.dumps(record) for record in records) + "\n"
+    if malformed:
+        text += "{not-json}\n"
+    (agent / "kimi-code-session.log").write_text(text)
+
+
+def test_kimi_tool_bundle_retains_calls_results_and_pairing(tmp_path: Path) -> None:
+    trial = tmp_path / "trial"
+    _write_kimi_session(trial)
+
+    bundle = runner.build_kimi_trajectory_bundle(trial)
+
+    assert bundle is not None
+    assert bundle["schema_version"] == "dradar-kimi-trajectory-bundle-v1"
+    assert bundle["complete"] is True
+    session = bundle["sessions"][0]
+    assert session["tool_call_count"] == 1
+    assert session["tool_result_count"] == 1
+    call = next(event for event in session["events"]
+                if event["type"] == "tool_call")
+    result = next(event for event in session["events"]
+                  if event["type"] == "tool_result")
+    assert call["payload"]["call_id"] == result["payload"]["call_id"] == "call-1"
+    assert "https://example.com/data" in call["payload"]["arguments"]
+
+
+@pytest.mark.parametrize(
+    ("include_result", "malformed"),
+    [(False, False), (True, True)],
+)
+def test_kimi_tool_bundle_keeps_partial_evidence_without_blocking_upload(
+    tmp_path: Path, include_result: bool, malformed: bool,
+) -> None:
+    trial = tmp_path / "trial"
+    _write_kimi_session(
+        trial, include_result=include_result, malformed=malformed,
+    )
+
+    bundle = runner.build_kimi_trajectory_bundle(trial)
+
+    assert bundle is not None
+    assert bundle["complete"] is False
+    assert bundle["sessions"][0]["events"]
+
+
+def test_missing_kimi_session_log_has_no_bundle(tmp_path: Path) -> None:
+    assert runner.build_kimi_trajectory_bundle(tmp_path) is None
