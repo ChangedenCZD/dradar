@@ -1345,7 +1345,7 @@ def _recover_completed_checkpoint_patch(
 
 CODEX_TRAJECTORY_BUNDLE_SCHEMA = "dradar-codex-trajectory-bundle-v1"
 KIMI_TRAJECTORY_BUNDLE_SCHEMA = "dradar-kimi-trajectory-bundle-v1"
-KIMI_SESSION_LOG_RELATIVE = Path("agent") / "kimi-code-session.log"
+KIMI_SESSION_LOG_RELATIVE = Path("agent") / "kimi-code.jsonl"
 
 
 def _codex_usage(value) -> dict | None:
@@ -1678,8 +1678,7 @@ def build_kimi_trajectory_bundle(trial_dir: Path) -> dict | None:
     parse_error_count = 0
     call_ids: list[str] = []
     result_ids: list[str] = []
-    turn_begin_count = 0
-    turn_end_count = 0
+    runtime_version = None
     try:
         handle = log_path.open(errors="replace")
     except OSError:
@@ -1694,89 +1693,76 @@ def build_kimi_trajectory_bundle(trial_dir: Path) -> dict | None:
             if not isinstance(record, dict):
                 parse_error_count += 1
                 continue
-            # The first line is protocol metadata, not a session event.
-            if record.get("type") == "metadata":
+            role = record.get("role")
+            if role == "meta" and record.get("type") == "system.version":
+                value = record.get("version")
+                if isinstance(value, str):
+                    runtime_version = value
                 continue
-            message = record.get("message")
-            if not isinstance(message, dict):
-                parse_error_count += 1
+            if role == "meta" and record.get("type") == "session.resume_hint":
+                value = record.get("session_id")
+                if isinstance(value, str) and value:
+                    session_id = value
                 continue
-            message_type = message.get("type")
-            payload = message.get("payload")
-            timestamp = record.get("timestamp")
-            occurred_at = timestamp if isinstance(timestamp, (int, float)) else None
-
-            if message_type == "TurnBegin":
-                turn_begin_count += 1
-                event_payload = payload if isinstance(payload, dict) else {}
-                events.append({
-                    "type": "turn_begin",
-                    "occurred_at": occurred_at,
-                    "payload": event_payload,
-                })
+            if role == "meta":
                 continue
-            if message_type == "TurnEnd":
-                turn_end_count += 1
-                events.append({
-                    "type": "turn_end",
-                    "occurred_at": occurred_at,
-                    "payload": payload if isinstance(payload, dict) else {},
-                })
-                continue
-            if message_type == "ToolCall":
-                if not isinstance(payload, dict):
+            if role == "assistant":
+                content = record.get("content")
+                if isinstance(content, str) and content:
+                    events.append({
+                        "type": "content_part",
+                        "occurred_at": None,
+                        "payload": {"text": content},
+                    })
+                tool_calls = record.get("tool_calls", [])
+                if tool_calls is None:
+                    tool_calls = []
+                if not isinstance(tool_calls, list):
                     parse_error_count += 1
                     continue
-                function = payload.get("function")
-                call_id = payload.get("id")
-                if (not isinstance(function, dict)
-                        or not isinstance(call_id, str) or not call_id):
-                    parse_error_count += 1
-                    continue
-                name = function.get("name")
-                arguments = function.get("arguments")
-                if (not isinstance(name, str) or not name
-                        or not isinstance(arguments, (str, dict))):
-                    parse_error_count += 1
-                    continue
-                call_ids.append(call_id)
-                events.append({
-                    "type": "tool_call",
-                    "occurred_at": occurred_at,
-                    "payload": {
-                        "call_id": call_id,
-                        "tool_name": name,
-                        "arguments": arguments,
-                    },
-                })
+                for tool_call in tool_calls:
+                    function = (
+                        tool_call.get("function")
+                        if isinstance(tool_call, dict) else None
+                    )
+                    call_id = (
+                        tool_call.get("id")
+                        if isinstance(tool_call, dict) else None
+                    )
+                    if (not isinstance(function, dict)
+                            or not isinstance(call_id, str) or not call_id):
+                        parse_error_count += 1
+                        continue
+                    name = function.get("name")
+                    arguments = function.get("arguments")
+                    if (not isinstance(name, str) or not name
+                            or not isinstance(arguments, (str, dict))):
+                        parse_error_count += 1
+                        continue
+                    call_ids.append(call_id)
+                    events.append({
+                        "type": "tool_call",
+                        "occurred_at": None,
+                        "payload": {
+                            "call_id": call_id,
+                            "tool_name": name,
+                            "arguments": arguments,
+                        },
+                    })
                 continue
-            if message_type == "ToolResult":
-                if not isinstance(payload, dict):
-                    parse_error_count += 1
-                    continue
-                call_id = payload.get("tool_call_id")
+            if role == "tool":
+                call_id = record.get("tool_call_id")
                 if not isinstance(call_id, str) or not call_id:
                     parse_error_count += 1
                     continue
                 result_ids.append(call_id)
                 events.append({
                     "type": "tool_result",
-                    "occurred_at": occurred_at,
+                    "occurred_at": None,
                     "payload": {
                         "call_id": call_id,
-                        "output": payload.get("return_value"),
+                        "output": record.get("content"),
                     },
-                })
-                continue
-            if message_type in {"ContentPart", "StatusUpdate", "StepBegin"}:
-                events.append({
-                    "type": {
-                        "ContentPart": "content_part",
-                        "StatusUpdate": "status_update",
-                        "StepBegin": "step_begin",
-                    }[message_type],
-                    "occurred_at": occurred_at,
-                    "payload": payload if isinstance(payload, dict) else {},
                 })
                 continue
             parse_error_count += 1
@@ -1789,8 +1775,7 @@ def build_kimi_trajectory_bundle(trial_dir: Path) -> dict | None:
     complete = (
         parse_error_count == 0
         and isinstance(session_id, str)
-        and turn_begin_count >= 1
-        and turn_begin_count == turn_end_count
+        and runtime_version == KIMI_CLI_VERSION
         and paired
     )
     session = {
@@ -1798,6 +1783,8 @@ def build_kimi_trajectory_bundle(trial_dir: Path) -> dict | None:
         "role": "root",
         "parent_session_id": None,
         "model_name": KIMI_MODEL,
+        "runtime_generation": "node-stream-json-v1",
+        "runtime_version": runtime_version,
         "artifact_index": 0,
         "parse_error_count": parse_error_count,
         "tool_call_count": len(call_ids),

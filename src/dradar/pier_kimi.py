@@ -28,8 +28,7 @@ from _dradar_kimi_recovery import run_with_kimi_resume, validated_session_id
 
 KIMI_CONFIG = """\
 default_model = "kimi-code/k3"
-default_thinking = true
-default_yolo = true
+default_permission_mode = "auto"
 default_plan_mode = false
 merge_all_available_skills = false
 telemetry = false
@@ -47,33 +46,27 @@ key = "oauth/kimi-code"
 provider = "managed:kimi-code"
 model = "k3"
 max_context_size = 1048576
-capabilities = ["thinking", "always_thinking"]
+capabilities = ["thinking", "always_thinking", "tool_use"]
 display_name = "K3"
+support_efforts = ["low", "high", "max"]
+default_effort = "high"
+
+[thinking]
+enabled = true
 
 [background]
+max_running_tasks = 1
 keep_alive_on_exit = false
+bash_auto_background_on_timeout = false
+
+[tools]
+enabled = ["Read", "ReadMediaFile", "Glob", "Grep", "Write", "Edit", "Bash"]
 
 [[hooks]]
 event = "PreToolUse"
-matcher = "Shell|ReadFile|ReadMediaFile|Glob|Grep|WriteFile|StrReplaceFile"
-command = "/opt/kimi-runtime/tools/kimi-cli/bin/python /tmp/dradar-kimi-policy.py"
+matcher = "Read|ReadMediaFile|Glob|Grep|Write|Edit|Bash"
+command = "/usr/bin/python3 /tmp/dradar-kimi-policy.py"
 timeout = 5
-"""
-
-KIMI_AGENT_SPEC = """\
-version: 1
-agent:
-  extend: default
-  name: dradar-kimi-code
-  allowed_tools:
-    - "kimi_cli.tools.shell:Shell"
-    - "kimi_cli.tools.file:ReadFile"
-    - "kimi_cli.tools.file:ReadMediaFile"
-    - "kimi_cli.tools.file:Glob"
-    - "kimi_cli.tools.file:Grep"
-    - "kimi_cli.tools.file:WriteFile"
-    - "kimi_cli.tools.file:StrReplaceFile"
-  subagents: {}
 """
 
 KIMI_POLICY = r'''#!/usr/bin/env python3
@@ -82,7 +75,6 @@ import sys
 
 PROTECTED = (
     "/tmp/dradar-kimi-home",
-    "KIMI_SHARE_DIR",
     "KIMI_CODE_HOME",
     "credentials/kimi-code.json",
     "oauth/kimi-code",
@@ -100,64 +92,10 @@ if any(marker in tool_input for marker in PROTECTED):
     raise SystemExit(2)
 '''
 
-KIMI_LAUNCHER = r'''#!/usr/bin/env python3
-import os
-
-import aiohttp
-
-# Kimi CLI's OAuth refresh transport does not currently opt in to the
-# standard proxy environment.  Pier deliberately exposes outbound access
-# through those variables, so make the official refresh client honour the
-# same interface as Kimi's model client.  This keeps refresh working during
-# long runs without assuming a host proxy product, address, or port.
-_original_client_session = aiohttp.ClientSession
-
-
-def _proxy_aware_client_session(*args, **kwargs):
-    kwargs.setdefault("trust_env", True)
-    return _original_client_session(*args, **kwargs)
-
-
-aiohttp.ClientSession = _proxy_aware_client_session
-
-from kimi_cli import llm as kimi_llm
-
-effort = os.environ.get("KIMI_MODEL_THINKING_EFFORT", "")
-if effort not in {"low", "high", "max"}:
-    raise SystemExit("invalid DRadar Kimi reasoning effort")
-
-original_create_llm = kimi_llm.create_llm
-
-
-def create_llm_with_effort(*args, **kwargs):
-    llm = original_create_llm(*args, **kwargs)
-    if llm is None:
-        return None
-    provider = kimi_llm.find_kimi_provider(llm.chat_provider)
-    if provider is None:
-        raise RuntimeError("DRadar Kimi launcher requires the official Kimi provider")
-    # Kimi CLI 1.49 configures thinking.type but deliberately stopped adding
-    # the legacy reasoning_effort field.  K3's subscription endpoint still
-    # exposes DRadar's low/high/max lanes through the documented explicit
-    # generation-kwargs passthrough.
-    llm.chat_provider = provider.with_thinking(effort).with_generation_kwargs(
-        reasoning_effort=effort
-    )
-    return llm
-
-
-kimi_llm.create_llm = create_llm_with_effort
-
-from kimi_cli.__main__ import main
-
-raise SystemExit(main())
-'''
-
-KIMI_CLI_VERSION = "1.49.0"
-UV_VERSION = "0.9.7"
-UV_SHA256 = {
-    "x86_64": "b26fcc8dfa1c39b5a5613445af3be3eefda45d9a39359bee271eafe34913583e",
-    "aarch64": "8b3d31a154673c6d357727d2083a33525b515589d153fa5b5455e1db9e9e6363",
+KIMI_CLI_VERSION = "0.36.1"
+KIMI_BINARY_SHA256 = {
+    "x86_64": "78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",
+    "aarch64": "a48e90f49cacee600310b4aebb87df417bf7af9fc3ddc282e721d9fb811391a0",
 }
 
 
@@ -168,35 +106,27 @@ def _install_command() -> str:
         "  echo 'Kimi Code requires a glibc task image' >&2; exit 1; "
         "elif command -v apt-get >/dev/null 2>&1; then "
         "  apt-get update && DEBIAN_FRONTEND=noninteractive "
-        "  apt-get install -y --no-install-recommends ca-certificates curl tar; "
+        "  apt-get install -y --no-install-recommends ca-certificates curl python3; "
         "elif command -v dnf >/dev/null 2>&1; then "
-        "  dnf install -y ca-certificates curl tar gzip; "
+        "  dnf install -y ca-certificates curl python3; "
         "elif command -v yum >/dev/null 2>&1; then "
-        "  yum install -y ca-certificates curl tar gzip; "
+        "  yum install -y ca-certificates curl python3; "
         "else echo 'No supported package manager found' >&2; exit 1; fi; "
         'case "$(uname -m)" in '
-        f"  x86_64) uv_arch=x86_64; uv_sha={UV_SHA256['x86_64']} ;; "
-        f"  aarch64|arm64) uv_arch=aarch64; uv_sha={UV_SHA256['aarch64']} ;; "
+        f"  x86_64) kimi_arch=x64; kimi_sha={KIMI_BINARY_SHA256['x86_64']} ;; "
+        f"  aarch64|arm64) kimi_arch=arm64; kimi_sha={KIMI_BINARY_SHA256['aarch64']} ;; "
         "  *) echo 'Unsupported CPU architecture' >&2; exit 1 ;; "
         "esac; "
-        f"uv_archive=/tmp/uv-{UV_VERSION}.tar.gz; "
-        f"uv_url=https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/"
-        'uv-${uv_arch}-unknown-linux-gnu.tar.gz; '
+        f"kimi_file=/tmp/kimi-code-{KIMI_CLI_VERSION}; "
+        f"kimi_url=https://code.kimi.com/kimi-code/binaries/{KIMI_CLI_VERSION}/"
+        'kimi-code-linux-${kimi_arch}; '
         "curl --fail --silent --show-error --location "
-        '  --output "${uv_archive}" "${uv_url}"; '
-        'printf \'%s  %s\\n\' "${uv_sha}" "${uv_archive}" '
+        '  --output "${kimi_file}" "${kimi_url}"; '
+        'printf \'%s  %s\\n\' "${kimi_sha}" "${kimi_file}" '
         "  | sha256sum --check --strict -; "
-        "mkdir -p /opt/kimi-runtime/bin /opt/kimi-runtime/python "
-        "  /opt/kimi-runtime/tools /tmp/dradar-uv; "
-        'tar -xzf "${uv_archive}" -C /tmp/dradar-uv; '
-        'install -m 0755 "/tmp/dradar-uv/uv-${uv_arch}-unknown-linux-gnu/uv" '
-        "  /opt/kimi-runtime/bin/uv; "
-        "UV_TOOL_DIR=/opt/kimi-runtime/tools "
-        "UV_TOOL_BIN_DIR=/opt/kimi-runtime/bin "
-        "UV_PYTHON_INSTALL_DIR=/opt/kimi-runtime/python "
-        "/opt/kimi-runtime/bin/uv tool install --python 3.13 "
-        f"  'kimi-cli=={KIMI_CLI_VERSION}'; "
-        f"test \"$(/opt/kimi-runtime/bin/kimi --version)\" = 'kimi, version {KIMI_CLI_VERSION}'"
+        "mkdir -p /opt/kimi-runtime/bin; "
+        'install -m 0755 "${kimi_file}" /opt/kimi-runtime/bin/kimi; '
+        f"test \"$(/opt/kimi-runtime/bin/kimi --version)\" = '{KIMI_CLI_VERSION}'"
     )
 
 
@@ -210,14 +140,10 @@ class KimiCode(BaseInstalledAgent):
     _REMOTE_OAUTH_LOCK = _REMOTE_HOME / "oauth" / "kimi-code"
     _REMOTE_CONFIG = _REMOTE_HOME / "config.toml"
     _REMOTE_CLI = PurePosixPath("/opt/kimi-runtime/bin/kimi")
-    _REMOTE_PYTHON = PurePosixPath(
-        "/opt/kimi-runtime/tools/kimi-cli/bin/python"
-    )
-    _REMOTE_AGENT_SPEC = PurePosixPath("/tmp/dradar-kimi-agent.yaml")
     _REMOTE_POLICY = PurePosixPath("/tmp/dradar-kimi-policy.py")
-    _REMOTE_LAUNCHER = PurePosixPath("/tmp/dradar-kimi-launcher.py")
     _REMOTE_SKILLS = PurePosixPath("/tmp/dradar-kimi-empty-skills")
     _STREAM_FILE = "kimi-code.jsonl"
+    _STDERR_FILE = "kimi-code.stderr.log"
     _SESSION_LOG_FILE = "kimi-code-session.log"
 
     @staticmethod
@@ -270,10 +196,10 @@ class KimiCode(BaseInstalledAgent):
             steps=[InstallStep(user="root", run=_install_command())],
             verification_command=(
                 f"test \"$({self._REMOTE_CLI.as_posix()} --version)\" = "
-                f"'kimi, version {KIMI_CLI_VERSION}'"
+                f"'{KIMI_CLI_VERSION}'"
             ),
             cache_key=(
-                f"dradar-kimi-code-{version}-uv-{UV_VERSION}-runtime-v1"
+                f"dradar-kimi-code-{version}-node-native-runtime-v1"
             ),
         )
 
@@ -295,16 +221,14 @@ class KimiCode(BaseInstalledAgent):
         remote_lock = self._REMOTE_OAUTH_LOCK.as_posix()
         remote_config = self._REMOTE_CONFIG.as_posix()
         remote_cli = self._REMOTE_CLI.as_posix()
-        remote_python = self._REMOTE_PYTHON.as_posix()
-        remote_agent_spec = self._REMOTE_AGENT_SPEC.as_posix()
         remote_policy = self._REMOTE_POLICY.as_posix()
-        remote_launcher = self._REMOTE_LAUNCHER.as_posix()
         remote_skills = self._REMOTE_SKILLS.as_posix()
         stream = f"/logs/agent/{self._STREAM_FILE}"
+        stderr_log = f"/logs/agent/{self._STDERR_FILE}"
         session_log = f"/logs/agent/{self._SESSION_LOG_FILE}"
         env = self.build_process_env({
             "HOME": remote_user_home,
-            "KIMI_SHARE_DIR": remote_home,
+            "KIMI_CODE_HOME": remote_home,
             "KIMI_DISABLE_TELEMETRY": "1",
             "KIMI_CODE_NO_AUTO_UPDATE": "1",
             "KIMI_CLI_NO_AUTO_UPDATE": "1",
@@ -336,27 +260,19 @@ class KimiCode(BaseInstalledAgent):
             env=env,
         )
         local_config = self.logs_dir / "kimi-config.toml"
-        local_agent_spec = self.logs_dir / "kimi-agent.yaml"
         local_policy = self.logs_dir / "kimi-policy.py"
-        local_launcher = self.logs_dir / "kimi-launcher.py"
         local_config.write_text(KIMI_CONFIG, encoding="utf-8")
-        local_agent_spec.write_text(KIMI_AGENT_SPEC, encoding="utf-8")
         local_policy.write_text(KIMI_POLICY, encoding="utf-8")
-        local_launcher.write_text(KIMI_LAUNCHER, encoding="utf-8")
         await environment.upload_file(self._auth_json_file, remote_auth)
         await environment.upload_file(local_config, remote_config)
-        await environment.upload_file(local_agent_spec, remote_agent_spec)
         await environment.upload_file(local_policy, remote_policy)
-        await environment.upload_file(local_launcher, remote_launcher)
         targets = " ".join(
             shlex.quote(value)
             for value in (
                 remote_auth,
                 remote_lock,
                 remote_config,
-                remote_agent_spec,
                 remote_policy,
-                remote_launcher,
             )
         )
         if environment.default_user is not None:
@@ -366,9 +282,7 @@ class KimiCode(BaseInstalledAgent):
                     f"chown {shlex.quote(str(environment.default_user))} {targets} "
                     f"&& chmod 600 {shlex.quote(remote_auth)} "
                     f"{shlex.quote(remote_lock)} {shlex.quote(remote_config)} "
-                    f"{shlex.quote(remote_agent_spec)} "
-                    f"&& chmod 500 {shlex.quote(remote_policy)} "
-                    f"{shlex.quote(remote_launcher)}"
+                    f"&& chmod 500 {shlex.quote(remote_policy)}"
                 ),
                 env=env,
             )
@@ -378,9 +292,7 @@ class KimiCode(BaseInstalledAgent):
                 command=(
                     f"chmod 600 {shlex.quote(remote_auth)} "
                     f"{shlex.quote(remote_lock)} {shlex.quote(remote_config)} "
-                    f"{shlex.quote(remote_agent_spec)} "
-                    f"&& chmod 500 {shlex.quote(remote_policy)} "
-                    f"{shlex.quote(remote_launcher)}"
+                    f"&& chmod 500 {shlex.quote(remote_policy)}"
                 ),
                 env=env,
             )
@@ -395,13 +307,8 @@ class KimiCode(BaseInstalledAgent):
             env=env,
         )
         common_flags = [
-            "--print",
-            "--yolo",
             "--model", "kimi-code/k3",
             "--output-format", "stream-json",
-            "--config-file", remote_config,
-            "--work-dir", "/app",
-            "--agent-file", remote_agent_spec,
             "--skills-dir", remote_skills,
         ]
 
@@ -409,10 +316,12 @@ class KimiCode(BaseInstalledAgent):
             flags = [*common_flags, *extra_flags]
             cli = " ".join(shlex.quote(part) for part in flags)
             tee = "tee -a" if append else "tee"
+            stderr_tee = "tee -a" if append else "tee"
             return (
                 "bash -o pipefail -c "
                 + shlex.quote(
-                    f"{remote_python} {remote_launcher} {cli} 2>&1 "
+                    f"cd /app && {remote_cli} {cli} "
+                    f"2> >({stderr_tee} {stderr_log} >&2) "
                     f"| {tee} {stream}"
                 )
             )
@@ -429,7 +338,8 @@ class KimiCode(BaseInstalledAgent):
                     + " -type f -name 'wire.jsonl' -print 2>/dev/null "
                     "| tail -n 1); "
                     f"if [ -n \"$candidate\" ]; then {copy}"
-                    "basename \"$(dirname \"$candidate\")\"; fi"
+                    "session_dir=${candidate%/agents/main/wire.jsonl}; "
+                    "basename \"$session_dir\"; fi"
                 ),
                 env=env,
             )
@@ -518,8 +428,11 @@ class KimiCode(BaseInstalledAgent):
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         stream_path = self.logs_dir / self._STREAM_FILE
+        stderr_path = self.logs_dir / self._STDERR_FILE
         session_log_path = self.logs_dir / self._SESSION_LOG_FILE
-        self._redact_or_reject_credential_output([stream_path, session_log_path])
+        self._redact_or_reject_credential_output(
+            [stream_path, stderr_path, session_log_path]
+        )
         try:
             lines = stream_path.read_text(
                 encoding="utf-8", errors="replace"

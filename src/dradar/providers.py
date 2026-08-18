@@ -135,11 +135,20 @@ _GROK_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 KIMI_PROVIDER = "kimi-subscription"
 KIMI_AGENT = "kimi-code"
 KIMI_MODEL = "k3"
-KIMI_CLI_VERSION = "1.49.0"
+KIMI_CLI_VERSION = "0.36.1"
 KIMI_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
-KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-v2"
-KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-isolated-v2"
-KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-single-slot-v2"
+KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-node-v1"
+KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-node-isolated-v1"
+KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-node-single-slot-v1"
+KIMI_BINARY_BASE_URL = "https://code.kimi.com/kimi-code/binaries/0.36.1"
+KIMI_BINARY_SHA256 = {
+    "linux-x64": "78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",
+    "linux-arm64": "a48e90f49cacee600310b4aebb87df417bf7af9fc3ddc282e721d9fb811391a0",
+    "darwin-x64": "037b201bf8dccca987fcc98645ea746d6d683bd2d8cc201891c062bf0b14798e",
+    "darwin-arm64": "53b8a5d9380131a23c58937f28d64e93830c56aa92c41432f24ab9d8eccf0e50",
+    "win32-x64": "9da56c617b2c51a55a313a33d52aebfe5729734e36b2fe6d5c989b4a51b7d327",
+    "win32-arm64": "70e14eb27776e65b0ddc0660d06d020b7de88930fe412a7b504f26371c0ae533",
+}
 KIMI_HOME_RELATIVE_PATH = Path("providers") / "kimi"
 KIMI_RUNTIME_RELATIVE_PATH = (
     KIMI_HOME_RELATIVE_PATH / "runtime" / KIMI_CLI_VERSION
@@ -151,58 +160,6 @@ KIMI_API_KEY_ENVS = frozenset({
     "MOONSHOT_API_KEY",
 })
 _KIMI_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
-_KIMI_LIVE_PROBE = r"""
-import asyncio
-import sys
-
-import aiohttp
-
-_original_client_session = aiohttp.ClientSession
-
-
-def _proxy_aware_client_session(*args, **kwargs):
-    kwargs.setdefault("trust_env", True)
-    return _original_client_session(*args, **kwargs)
-
-
-aiohttp.ClientSession = _proxy_aware_client_session
-
-from kimi_cli.auth import KIMI_CODE_PLATFORM_ID
-from kimi_cli.auth.oauth import (
-    KIMI_CODE_OAUTH_KEY,
-    load_tokens,
-    refresh_token,
-    save_tokens,
-)
-from kimi_cli.auth.platforms import get_platform_by_id, list_models
-from kimi_cli.config import OAuthRef
-
-
-async def _main():
-    ref = OAuthRef(storage="file", key=KIMI_CODE_OAUTH_KEY)
-    token = load_tokens(ref)
-    if token is None or not token.refresh_token:
-        return 3
-    try:
-        refreshed = await refresh_token(token.refresh_token)
-    except Exception as exc:
-        message = str(exc).lower()
-        if any(marker in message for marker in ("invalid", "unauthorized", "rejected")):
-            return 6
-        return 7
-    save_tokens(ref, refreshed)
-    platform = get_platform_by_id(KIMI_CODE_PLATFORM_ID)
-    if platform is None:
-        return 4
-    try:
-        models = await list_models(platform, refreshed.access_token)
-    except Exception:
-        return 8
-    return 0 if any(model.id == "k3" for model in models) else 5
-
-
-sys.exit(asyncio.run(_main()))
-"""
 
 # ZCode is driven through the official desktop bundle's headless protocol.  A
 # fixed CLI digest and the domestic Coding Plan endpoint keep this preview lane
@@ -989,54 +946,23 @@ def kimi_auth_error(path: Path | None = None) -> str | None:
     return None
 
 
-def _kimi_runtime_python(executable: str | Path) -> Path | None:
-    """Resolve the Python interpreter behind the pinned Kimi console script."""
-
-    try:
-        cli = Path(executable).expanduser().resolve(strict=True)
-    except OSError:
-        return None
-    candidates = (
-        cli.parent / ("python.exe" if os.name == "nt" else "python"),
-        cli.parent / "python3",
-    )
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    if os.name != "nt":
-        try:
-            first_line = cli.open("rb").readline(4096).decode("utf-8").strip()
-        except (OSError, UnicodeDecodeError):
-            return None
-        if first_line.startswith("#!"):
-            candidate = Path(first_line[2:]).expanduser()
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate
-    return None
-
-
 def _run_kimi_live_probe(
     executable: str | Path,
     credential: Path,
     root: Path,
 ) -> str | None:
-    python = _kimi_runtime_python(executable)
-    if python is None:
-        return "Kimi managed runtime Python is unavailable"
-    share = root / "share"
+    share = root / "home"
     native_auth = share / KIMI_AUTH_RELATIVE_PATH
     _replace_private_file(credential, native_auth)
     env = provider_subprocess_env()
-    env["KIMI_SHARE_DIR"] = str(share)
-    env.pop("KIMI_CODE_HOME", None)
+    env["KIMI_CODE_HOME"] = str(share)
     env["KIMI_DISABLE_TELEMETRY"] = "1"
     env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
-    env["KIMI_CLI_NO_AUTO_UPDATE"] = "1"
     for name in KIMI_API_KEY_ENVS:
         env.pop(name, None)
     try:
         proc = subprocess.run(
-            [str(python), "-c", _KIMI_LIVE_PROBE],
+            [str(executable), "login"],
             capture_output=True,
             text=True,
             timeout=45,
@@ -1050,16 +976,17 @@ def _run_kimi_live_probe(
         # credential even if the following model-catalog check failed.
         if kimi_auth_error(native_auth) is None:
             _replace_private_file(native_auth, credential)
-    if proc.returncode == 5:
-        return f"Kimi subscription account cannot access {KIMI_MODEL}"
-    if proc.returncode == 6:
-        return "Kimi OAuth session was rejected; run `dradar provider setup kimi`"
-    if proc.returncode == 7:
-        return "Kimi OAuth refresh failed; check this machine's network/proxy"
-    if proc.returncode == 8:
-        return "Kimi K3 catalog check failed; check this machine's network/proxy"
     if proc.returncode != 0:
-        return "Kimi live OAuth check failed"
+        output = (proc.stdout + "\n" + proc.stderr).lower()
+        if any(marker in output for marker in ("unauthorized", "invalid_grant", "rejected")):
+            return "Kimi OAuth session was rejected; run `dradar provider setup kimi`"
+        return "Kimi OAuth refresh failed; check this machine's network/proxy"
+    try:
+        config_text = (share / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return "Kimi login did not provision the official model catalog"
+    if '"kimi-code/k3"' not in config_text:
+        return f"Kimi subscription account cannot access {KIMI_MODEL}"
     return None
 
 

@@ -60,8 +60,8 @@ def _assignment(**overrides: object) -> dict:
 
 
 def test_official_kimi_version_banner_is_parsed() -> None:
-    assert parse_kimi_cli_version("1.49.0\n") == KIMI_CLI_VERSION
-    assert parse_kimi_cli_version("kimi version 1.49.0\n") == KIMI_CLI_VERSION
+    assert parse_kimi_cli_version("0.36.1\n") == KIMI_CLI_VERSION
+    assert parse_kimi_cli_version("kimi version 0.36.1\n") == KIMI_CLI_VERSION
     assert parse_kimi_cli_version("unexpected") is None
 
 
@@ -106,11 +106,7 @@ def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
-    python = tmp_path / "python"
-    python.write_text("runtime")
-    python.chmod(0o700)
     seen = {}
-    monkeypatch.setattr(providers, "_kimi_runtime_python", lambda _cli: python)
     monkeypatch.setattr(
         providers,
         "provider_subprocess_env",
@@ -123,10 +119,13 @@ def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
     def fake_run(cmd, **kwargs):
         seen.update(cmd=cmd, env=kwargs["env"])
         native = (
-            Path(kwargs["env"]["KIMI_SHARE_DIR"])
+            Path(kwargs["env"]["KIMI_CODE_HOME"])
             / "credentials" / "kimi-code.json"
         )
         _write_auth(native, _oauth("new", "new-refresh"))
+        (Path(kwargs["env"]["KIMI_CODE_HOME"]) / "config.toml").write_text(
+            '[models."kimi-code/k3"]\nmodel = "k3"\n'
+        )
         return providers.subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(providers.subprocess, "run", fake_run)
@@ -143,18 +142,16 @@ def test_kimi_live_probe_rejects_missing_k3_without_losing_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
-    python = tmp_path / "python"
-    python.write_text("runtime")
-    python.chmod(0o700)
-    monkeypatch.setattr(providers, "_kimi_runtime_python", lambda _cli: python)
-
     def fake_run(cmd, **kwargs):
         native = (
-            Path(kwargs["env"]["KIMI_SHARE_DIR"])
+            Path(kwargs["env"]["KIMI_CODE_HOME"])
             / "credentials" / "kimi-code.json"
         )
         _write_auth(native, _oauth("new", "new-refresh"))
-        return providers.subprocess.CompletedProcess(cmd, 5, "", "")
+        (Path(kwargs["env"]["KIMI_CODE_HOME"]) / "config.toml").write_text(
+            '[models."kimi-code/k2"]\nmodel = "k2"\n'
+        )
+        return providers.subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(providers.subprocess, "run", fake_run)
 
@@ -166,15 +163,11 @@ def test_kimi_live_probe_distinguishes_revoked_oauth_from_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth = _write_auth(tmp_path / "auth.json")
-    python = tmp_path / "python"
-    python.write_text("runtime")
-    python.chmod(0o700)
-    monkeypatch.setattr(providers, "_kimi_runtime_python", lambda _cli: python)
     monkeypatch.setattr(
         providers.subprocess,
         "run",
         lambda cmd, **kwargs: providers.subprocess.CompletedProcess(
-            cmd, 6, "", "",
+            cmd, 1, "", "invalid_grant",
         ),
     )
 
@@ -298,22 +291,18 @@ def test_kimi_checkpoint_resume_is_rejected(
 def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
     assert 'return NetworkAllowlist(domains=["auth.kimi.com", "api.kimi.com"])' in source
-    assert '"kimi_cli.tools.shell:Shell"' in source
-    assert '"kimi_cli.tools.web:SearchWeb"' not in source
-    assert '"kimi_cli.tools.agent:Agent"' not in source
+    assert 'enabled = ["Read", "ReadMediaFile", "Glob", "Grep", "Write", "Edit", "Bash"]' in source
+    assert '"WebSearch"' not in source
+    assert '"FetchURL"' not in source
     assert 'event = "PreToolUse"' in source
-    assert '"KIMI_SHARE_DIR": remote_home' in source
-    assert 'kwargs.setdefault("trust_env", True)' in source
-    assert "aiohttp.ClientSession = _proxy_aware_client_session" in source
-    assert '"--print"' in source
+    assert '"KIMI_CODE_HOME": remote_home' in source
     assert "run_with_kimi_resume" in source
     assert '"--session", session_id' in source
     assert 'tee = "tee -a" if append else "tee"' in source
-    assert '"--config-file", remote_config' in source
-    assert '"--agent-file", remote_agent_spec' in source
-    assert "provider.with_thinking(effort).with_generation_kwargs" in source
-    assert "kimi-cli=={KIMI_CLI_VERSION}" in source
-    assert '"--auto"' not in source
+    assert '"--config-file"' not in source
+    assert '"--agent-file"' not in source
+    assert "KIMI_MODEL_THINKING_EFFORT" in source
+    assert "kimi-code-linux-${kimi_arch}" in source
     assert "KIMI_DISABLE_TELEMETRY" in source
     assert "KIMI_DISABLE_CRON" in source
     assert "[REDACTED_KIMI_CREDENTIAL]" in source
@@ -329,32 +318,28 @@ def _write_kimi_session(
         "agent": {"model_name": KIMI_MODEL},
     }))
     records = [
-        {"type": "metadata", "protocol_version": "1"},
-        {"timestamp": 1.0, "message": {
-            "type": "TurnBegin", "payload": {"user_input": "task"}}},
-        {"timestamp": 2.0, "message": {
-            "type": "ToolCall", "payload": {
-                "type": "function", "id": "call-1",
-                "function": {
-                    "name": "Shell",
-                    "arguments": json.dumps({
-                        "command": "curl https://example.com/data",
-                    }),
-                },
-            }}},
+        {"role": "meta", "type": "system.version", "version": KIMI_CLI_VERSION},
+        {"role": "meta", "type": "session.resume_hint",
+         "session_id": "kimi-session-1"},
+        {"role": "assistant", "tool_calls": [{
+            "type": "function", "id": "call-1",
+            "function": {
+                "name": "Bash",
+                "arguments": json.dumps({
+                    "command": "curl https://example.com/data",
+                }),
+            },
+        }]},
     ]
     if include_result:
-        records.append({"timestamp": 3.0, "message": {
-            "type": "ToolResult", "payload": {
-                "tool_call_id": "call-1",
-                "return_value": {"output": "proxy denied"},
-            }}})
-    records.append({"timestamp": 4.0, "message": {
-        "type": "TurnEnd", "payload": {}}})
+        records.append({
+            "role": "tool", "tool_call_id": "call-1",
+            "content": "proxy denied",
+        })
     text = "\n".join(json.dumps(record) for record in records) + "\n"
     if malformed:
         text += "{not-json}\n"
-    (agent / "kimi-code-session.log").write_text(text)
+    (agent / "kimi-code.jsonl").write_text(text)
 
 
 def test_kimi_tool_bundle_retains_calls_results_and_pairing(tmp_path: Path) -> None:
