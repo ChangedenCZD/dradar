@@ -51,7 +51,8 @@ from .providers import (
     assignment_codex_provider,
 )
 from .runner import (
-    DIAG_ADVICE, BuildFlakeError, RunnerError, build_codex_trajectory_bundle,
+    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
+    build_codex_trajectory_bundle, build_kimi_trajectory_bundle,
     _recover_completed_checkpoint_patch,
     check_task_content_hash, classify_exception_message,
     codex_trajectory_bundle_usage,
@@ -968,9 +969,19 @@ def _upload_trial(
               "redacted copy. The raw patch stays local.")
 
     upload_meta = dict(entry.get("meta") or {})
-    trajectory_bundle = build_codex_trajectory_bundle(Path(entry["trial_dir"]))
-    usage = (codex_trajectory_bundle_usage(trajectory_bundle)
-             if trajectory_bundle is not None else None)
+    trial_dir = Path(entry["trial_dir"])
+    trajectory_bundle = build_codex_trajectory_bundle(trial_dir)
+    if trajectory_bundle is None:
+        trajectory_bundle = build_kimi_trajectory_bundle(trial_dir)
+    usage = (
+        codex_trajectory_bundle_usage(trajectory_bundle)
+        if (
+            trajectory_bundle is not None
+            and trajectory_bundle.get("schema_version")
+            == CODEX_TRAJECTORY_BUNDLE_SCHEMA
+        )
+        else None
+    )
     if upload_meta.get("dsh_version") and usage is None:
         usage = _dsh_trial_usage(Path(entry["trial_dir"]))
     if entry.get("artifact_staging_recovery"):

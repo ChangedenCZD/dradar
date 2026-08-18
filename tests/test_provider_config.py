@@ -271,7 +271,7 @@ def test_live_status_distinguishes_rejected_key_from_transport_failure(
     ("provider", "ensure_name", "auth_error_name", "version"),
     [
         ("grok", "_ensure_grok_cli", "grok_auth_error", "1.0.3"),
-        ("kimi", "_ensure_kimi_cli", "kimi_auth_error", "1.49.0"),
+        ("kimi", "_ensure_kimi_cli", "kimi_auth_error", "0.36.1"),
     ],
 )
 def test_subscription_setup_prepares_runtime_before_requesting_interactive_oauth(
@@ -514,37 +514,34 @@ def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
     assert "XAI_API_KEY" not in seen["env"]
 
 
-def test_kimi_auto_install_uses_private_uv_tool_directories(tmp_path, monkeypatch):
-    target = tmp_path / "dradar/providers/kimi/runtime/1.49.0/bin/kimi"
-    seen = {}
+def test_kimi_auto_install_uses_reviewed_official_binary(tmp_path, monkeypatch):
+    target = tmp_path / "dradar/providers/kimi/runtime/0.36.1/bin/kimi"
+    binary = b"official-kimi-node-bundle"
     monkeypatch.setattr(provider_config, "managed_kimi_cli_path", lambda: target)
-    monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/usr/bin/uv")
     monkeypatch.setattr(
-        provider_config,
-        "provider_subprocess_env",
-        lambda: {"HTTPS_PROXY": "http://127.0.0.1:18080"},
+        provider_config.platform, "system", lambda: "Linux",
     )
-
-    def run(cmd, *, env, check):
-        seen.update(cmd=cmd, env=env)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("managed-kimi")
-        target.chmod(0o700)
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(provider_config.subprocess, "run", run)
+    monkeypatch.setattr(provider_config.platform, "machine", lambda: "x86_64")
+    monkeypatch.setitem(
+        provider_config.KIMI_BINARY_SHA256,
+        "linux-x64",
+        provider_config.hashlib.sha256(binary).hexdigest(),
+    )
+    seen = {}
+    def get(url, **kwargs):
+        seen.update(url=url, kwargs=kwargs)
+        return SimpleNamespace(status_code=200, content=binary)
+    monkeypatch.setattr(provider_config, "_provider_httpx_get", get)
     monkeypatch.setattr(
-        provider_config, "_kimi_cli_version", lambda executable: "1.49.0",
+        provider_config, "_kimi_cli_version", lambda executable: "0.36.1",
     )
 
     assert provider_config._install_managed_kimi_cli() == str(target)
-    assert seen["cmd"][-1] == "kimi-cli==1.49.0"
-    assert seen["env"]["UV_TOOL_BIN_DIR"] == str(target.parent)
-    assert seen["env"]["UV_TOOL_DIR"].startswith(str(target.parent.parent))
-    assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
+    assert target.read_bytes() == binary
+    assert seen["url"].endswith("/kimi-code-linux-x64")
 
 
-def test_kimi_login_uses_current_share_directory_contract(
+def test_kimi_login_uses_node_code_home_contract(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "dradar"))
@@ -571,19 +568,12 @@ def test_kimi_login_uses_current_share_directory_contract(
 
     def run(cmd, *, env):
         seen.update(cmd=cmd, env=env)
-        seen["bootstrap"] = (
-            provider_config.Path(env["PYTHONPATH"]) / "sitecustomize.py"
-        ).read_text()
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(provider_config.subprocess, "run", run)
 
     assert provider_config._setup_kimi_subscription() == 0
     assert seen["cmd"] == ["/managed/kimi", "login"]
-    assert seen["env"]["KIMI_SHARE_DIR"] == str(
-        provider_config.kimi_home()
-    )
+    assert seen["env"]["KIMI_CODE_HOME"] == str(provider_config.kimi_home())
     assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
-    assert "KIMI_CODE_HOME" not in seen["env"]
     assert "KIMI_API_KEY" not in seen["env"]
-    assert 'kwargs.setdefault("trust_env", True)' in seen["bootstrap"]

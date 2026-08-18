@@ -1344,6 +1344,8 @@ def _recover_completed_checkpoint_patch(
 
 
 CODEX_TRAJECTORY_BUNDLE_SCHEMA = "dradar-codex-trajectory-bundle-v1"
+KIMI_TRAJECTORY_BUNDLE_SCHEMA = "dradar-kimi-trajectory-bundle-v1"
+KIMI_SESSION_LOG_RELATIVE = Path("agent") / "kimi-code.jsonl"
 
 
 def _codex_usage(value) -> dict | None:
@@ -1640,6 +1642,164 @@ def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
         "timed_usage_complete": timed_usage_complete,
         "usage_sessions": usage_sessions,
         "sessions": sessions,
+    }
+
+
+def build_kimi_trajectory_bundle(trial_dir: Path) -> dict | None:
+    """Normalize Kimi's lossless session log into an auditable tool bundle.
+
+    ``trajectory.json`` intentionally stays compact and display-oriented.  The
+    official Kimi CLI also emits a private session protocol log containing
+    every ToolCall/ToolResult pair; retain that evidence separately so the
+    server can inspect shell arguments and their matching observations.
+
+    A malformed or partial log still produces an incomplete bundle when there
+    is usable evidence.  The bundle remains optional during the provider's
+    rollout, so callers may upload the patch/result even when this returns
+    ``None`` or ``complete`` is false.
+    """
+    log_path = trial_dir / KIMI_SESSION_LOG_RELATIVE
+    if not log_path.is_file():
+        return None
+
+    trajectory_path = trial_dir / "agent" / "trajectory.json"
+    session_id = None
+    if trajectory_path.is_file():
+        try:
+            trajectory = json.loads(trajectory_path.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            trajectory = None
+        if isinstance(trajectory, dict):
+            value = trajectory.get("session_id")
+            if isinstance(value, str) and value:
+                session_id = value
+
+    events = []
+    parse_error_count = 0
+    call_ids: list[str] = []
+    result_ids: list[str] = []
+    runtime_version = None
+    try:
+        handle = log_path.open(errors="replace")
+    except OSError:
+        return None
+    with handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                parse_error_count += 1
+                continue
+            if not isinstance(record, dict):
+                parse_error_count += 1
+                continue
+            role = record.get("role")
+            if role == "meta" and record.get("type") == "system.version":
+                value = record.get("version")
+                if isinstance(value, str):
+                    runtime_version = value
+                continue
+            if role == "meta" and record.get("type") == "session.resume_hint":
+                value = record.get("session_id")
+                if isinstance(value, str) and value:
+                    session_id = value
+                continue
+            if role == "meta":
+                continue
+            if role == "assistant":
+                content = record.get("content")
+                if isinstance(content, str) and content:
+                    events.append({
+                        "type": "content_part",
+                        "occurred_at": None,
+                        "payload": {"text": content},
+                    })
+                tool_calls = record.get("tool_calls", [])
+                if tool_calls is None:
+                    tool_calls = []
+                if not isinstance(tool_calls, list):
+                    parse_error_count += 1
+                    continue
+                for tool_call in tool_calls:
+                    function = (
+                        tool_call.get("function")
+                        if isinstance(tool_call, dict) else None
+                    )
+                    call_id = (
+                        tool_call.get("id")
+                        if isinstance(tool_call, dict) else None
+                    )
+                    if (not isinstance(function, dict)
+                            or not isinstance(call_id, str) or not call_id):
+                        parse_error_count += 1
+                        continue
+                    name = function.get("name")
+                    arguments = function.get("arguments")
+                    if (not isinstance(name, str) or not name
+                            or not isinstance(arguments, (str, dict))):
+                        parse_error_count += 1
+                        continue
+                    call_ids.append(call_id)
+                    events.append({
+                        "type": "tool_call",
+                        "occurred_at": None,
+                        "payload": {
+                            "call_id": call_id,
+                            "tool_name": name,
+                            "arguments": arguments,
+                        },
+                    })
+                continue
+            if role == "tool":
+                call_id = record.get("tool_call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    parse_error_count += 1
+                    continue
+                result_ids.append(call_id)
+                events.append({
+                    "type": "tool_result",
+                    "occurred_at": None,
+                    "payload": {
+                        "call_id": call_id,
+                        "output": record.get("content"),
+                    },
+                })
+                continue
+            parse_error_count += 1
+
+    if not events:
+        return None
+    calls_unique = len(call_ids) == len(set(call_ids))
+    results_unique = len(result_ids) == len(set(result_ids))
+    paired = calls_unique and results_unique and set(call_ids) == set(result_ids)
+    complete = (
+        parse_error_count == 0
+        and isinstance(session_id, str)
+        and runtime_version == KIMI_CLI_VERSION
+        and paired
+    )
+    session = {
+        "session_id": session_id,
+        "role": "root",
+        "parent_session_id": None,
+        "model_name": KIMI_MODEL,
+        "runtime_generation": "node-stream-json-v1",
+        "runtime_version": runtime_version,
+        "artifact_index": 0,
+        "parse_error_count": parse_error_count,
+        "tool_call_count": len(call_ids),
+        "tool_result_count": len(result_ids),
+        "complete": complete,
+        "events": events,
+    }
+    return {
+        "schema_version": KIMI_TRAJECTORY_BUNDLE_SCHEMA,
+        "complete": complete,
+        "session_file_count": 1,
+        "agent_session_count": 1,
+        "root_session_count": 1,
+        "subagent_session_count": 0,
+        "sessions": [session],
     }
 
 

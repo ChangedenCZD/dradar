@@ -5,6 +5,7 @@ from __future__ import annotations
 import getpass
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,8 @@ from .providers import (
     GROK_CLI_VERSION,
     GROK_MODEL,
     KIMI_API_KEY_ENVS,
+    KIMI_BINARY_BASE_URL,
+    KIMI_BINARY_SHA256,
     KIMI_CLI_VERSION,
     ZCODE_APP_VERSION,
     ZCODE_CLI_VERSION,
@@ -65,21 +68,6 @@ _GROK_INSTALLER_URL = "https://x.ai/cli/install.sh"
 _GROK_INSTALLER_SHA256 = (
     "43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
 )
-_KIMI_AIOHTTP_PROXY_BOOTSTRAP = """\
-import aiohttp
-
-_dradar_original_client_session = aiohttp.ClientSession
-
-
-def _dradar_proxy_aware_client_session(*args, **kwargs):
-    kwargs.setdefault("trust_env", True)
-    return _dradar_original_client_session(*args, **kwargs)
-
-
-aiohttp.ClientSession = _dradar_proxy_aware_client_session
-"""
-
-
 def _private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
@@ -217,37 +205,65 @@ def _install_managed_grok_cli() -> str | None:
 
 
 def _install_managed_kimi_cli() -> str | None:
-    """Install the current stable Kimi release into DRadar's private slot."""
+    """Install the reviewed official Kimi Code native bundle privately."""
 
-    uv = shutil.which("uv")
-    if not uv:
-        print(
-            "Could not auto-install Kimi Code because uv is unavailable. "
-            "Install uv, then retry."
-        )
+    system = platform.system().lower()
+    system = {
+        "windows": "win32", "darwin": "darwin", "linux": "linux",
+    }.get(system, system)
+    machine = platform.machine().lower()
+    if machine in {"aarch64", "arm64"}:
+        arch = "arm64"
+    elif machine in {"x86_64", "amd64"}:
+        arch = "x64"
+    else:
+        arch = ""
+    artifact = f"{system}-{arch}" if arch else ""
+    expected = KIMI_BINARY_SHA256.get(artifact)
+    if expected is None:
+        print(f"Could not auto-install Kimi Code on {system}/{machine}.")
         return None
     target = managed_kimi_cli_path()
     runtime = target.parent.parent
     _private_directory(runtime)
     _private_directory(target.parent)
-    env = provider_subprocess_env()
-    env["UV_TOOL_DIR"] = str(runtime / "tools")
-    env["UV_TOOL_BIN_DIR"] = str(target.parent)
-    env["UV_PYTHON_INSTALL_DIR"] = str(runtime / "python")
     print(f"Installing official Kimi Code CLI {KIMI_CLI_VERSION} for DRadar...")
     try:
-        result = subprocess.run(
-            [
-                uv, "tool", "install", "--force", "--refresh", "--python", "3.13",
-                f"kimi-cli=={KIMI_CLI_VERSION}",
-            ],
-            env=env,
-            check=False,
+        suffix = ".exe" if system == "win32" else ""
+        response = _provider_httpx_get(
+            f"{KIMI_BINARY_BASE_URL}/kimi-code-{artifact}{suffix}",
+            timeout=60.0,
+            follow_redirects=True,
         )
+    except httpx.HTTPError as exc:
+        print(f"Could not download official Kimi Code CLI: {type(exc).__name__}.")
+        return None
+    if response.status_code != 200:
+        print(f"Could not download official Kimi Code CLI (HTTP {response.status_code}).")
+        return None
+    if hashlib.sha256(response.content).hexdigest() != expected:
+        print("Official Kimi Code binary checksum mismatch; refusing to install it.")
+        return None
+    temp_name: str | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=".kimi-", dir=target.parent)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(response.content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp = Path(temp_name)
+        if os.name != "nt":
+            temp.chmod(0o700)
+        os.replace(temp, target)
     except OSError as exc:
         print(f"Could not install Kimi Code CLI: {exc}")
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink()
+            except OSError:
+                pass
         return None
-    if result.returncode != 0 or _kimi_cli_version(target) != KIMI_CLI_VERSION:
+    if _kimi_cli_version(target) != KIMI_CLI_VERSION:
         print("The official Kimi installer completed without a usable DRadar runtime.")
         return None
     return str(target)
@@ -668,32 +684,17 @@ def _setup_kimi_subscription() -> int:
     if os.name != "nt":
         os.chmod(home, 0o700)
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=".kimi-login-bootstrap-", dir=home,
-        ) as name:
-            bootstrap = Path(name)
-            (bootstrap / "sitecustomize.py").write_text(
-                _KIMI_AIOHTTP_PROXY_BOOTSTRAP,
-                encoding="utf-8",
-            )
-            env = provider_subprocess_env()
-            # Kimi CLI 1.x stores both config and OAuth state under
-            # KIMI_SHARE_DIR. Its OAuth helper uses aiohttp with trust_env off,
-            # so the private sitecustomize shim enables only standard proxy
-            # discovery for this login process.
-            env["PYTHONPATH"] = str(bootstrap)
-            env["KIMI_SHARE_DIR"] = str(home)
-            env.pop("KIMI_CODE_HOME", None)
-            env["KIMI_DISABLE_TELEMETRY"] = "1"
-            env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
-            env["KIMI_CLI_NO_AUTO_UPDATE"] = "1"
-            for name in KIMI_API_KEY_ENVS:
-                env.pop(name, None)
-            print(
-                "Starting official Kimi device OAuth for the dedicated DRadar slot. "
-                "Complete the browser/device prompt shown by Kimi."
-            )
-            proc = subprocess.run([executable, "login"], env=env)
+        env = provider_subprocess_env()
+        env["KIMI_CODE_HOME"] = str(home)
+        env["KIMI_DISABLE_TELEMETRY"] = "1"
+        env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
+        for name in KIMI_API_KEY_ENVS:
+            env.pop(name, None)
+        print(
+            "Starting official Kimi device OAuth for the dedicated DRadar slot. "
+            "Complete the browser/device prompt shown by Kimi."
+        )
+        proc = subprocess.run([executable, "login"], env=env)
     except OSError as exc:
         print(f"could not start Kimi login: {exc}")
         return 1

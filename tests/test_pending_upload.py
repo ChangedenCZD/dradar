@@ -317,6 +317,46 @@ def test_upload_replaces_single_session_cost_and_sends_verified_bundle(
     assert outcome == "submitted"
 
 
+def test_upload_sends_kimi_audit_bundle_without_overriding_result_tokens(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    bundle = {
+        "schema_version": "dradar-kimi-trajectory-bundle-v1",
+        "complete": False,
+        "session_file_count": 1,
+        "agent_session_count": 1,
+        "root_session_count": 1,
+        "subagent_session_count": 0,
+        "sessions": [],
+    }
+    monkeypatch.setattr(
+        runloop, "build_codex_trajectory_bundle", lambda _path: None,
+    )
+    monkeypatch.setattr(
+        runloop, "build_kimi_trajectory_bundle", lambda _path: bundle,
+    )
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert meta["n_output_tokens"] == 321
+            assert "usage_aggregation" not in meta
+            assert trajectory_bundle is not None
+            uploaded = json.loads(trajectory_bundle.read_text())
+            assert uploaded["schema_version"] == bundle["schema_version"]
+            assert uploaded["complete"] is False
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    outcome = runloop._upload_trial(
+        CaptureClient(lambda _aid: None),
+        _entry(trial_dir, meta={"n_output_tokens": 321}),
+    )
+    assert outcome == "submitted"
+
+
 def test_upload_suppresses_cost_when_any_subagent_usage_is_missing(
     tmp_path: Path, monkeypatch,
 ):
