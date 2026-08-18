@@ -12,7 +12,6 @@ import math
 import os
 import shlex
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -34,97 +33,98 @@ GROK_LINUX_SHA256 = {
 
 
 def _grok_usage_facts(events: list[dict]) -> dict:
-    """Read complete cumulative Grok usage without cache overlap."""
+    """Cross-check Grok's official per-response and terminal token ledgers."""
 
     names = (
         "input_tokens", "cache_read_input_tokens",
         "cache_creation_input_tokens", "output_tokens",
     )
-    previous = {name: 0 for name in names}
-    timed_events = []
-    valid = True
+    terminals = [
+        event for event in events
+        if isinstance(event, dict)
+        and event.get("type") == "result"
+        and isinstance(event.get("usage"), dict)
+    ]
+    terminal = terminals[0] if len(terminals) == 1 else None
+    usage = terminal.get("usage") if terminal is not None else None
+    values = {
+        name: usage.get(name)
+        if (isinstance(usage, dict)
+            and isinstance(usage.get(name), int)
+            and not isinstance(usage.get(name), bool)
+            and usage[name] >= 0)
+        else None
+        for name in names
+    }
+    valid = terminal is not None and all(value is not None for value in values.values())
+    current = {
+        name: int(value) if value is not None else 0
+        for name, value in values.items()
+    }
+    response_totals = {name: 0 for name in names}
+    response_count = 0
     for event in events:
-        usage = event.get("usage")
-        if not isinstance(usage, dict):
+        if not isinstance(event, dict) or event.get("type") != "assistant":
             continue
-        current = {
-            name: usage.get(name)
-            if (isinstance(usage.get(name), int)
-                and not isinstance(usage.get(name), bool)
-                and usage[name] >= 0)
-            else None
-            for name in names
-        }
-        if any(value is None for value in current.values()):
+        message = event.get("message")
+        response_usage = message.get("usage") if isinstance(message, dict) else None
+        if not isinstance(response_usage, dict):
             valid = False
             continue
-        current = {name: int(value) for name, value in current.items()}
-        if any(current[name] < previous[name] for name in names):
-            valid = False
-            continue
-        delta = {name: current[name] - previous[name] for name in names}
-        if any(delta.values()):
-            raw_time = (
-                event.get("timestamp") or event.get("created_at")
-                or event.get("createdAt") or event.get("time")
-            )
-            occurred_at = None
-            try:
-                if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
-                    seconds = float(raw_time) / (
-                        1000 if raw_time > 10_000_000_000 else 1
-                    )
-                    instant = datetime.fromtimestamp(seconds, timezone.utc)
-                elif isinstance(raw_time, str):
-                    instant = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-                    if instant.tzinfo is None:
-                        raise ValueError
-                    instant = instant.astimezone(timezone.utc)
-                else:
-                    raise ValueError
-                occurred_at = instant.isoformat().replace("+00:00", "Z")
-            except (OverflowError, OSError, TypeError, ValueError):
-                pass
-            timed_events.append({
-                "occurred_at": occurred_at,
-                "n_input_tokens": (
-                    delta["input_tokens"] + delta["cache_read_input_tokens"]
-                    + delta["cache_creation_input_tokens"]
-                ),
-                "n_cache_tokens": delta["cache_read_input_tokens"],
-                "n_output_tokens": delta["output_tokens"],
-            })
-        previous = current
+        response_count += 1
+        for name in names:
+            value = response_usage.get(name)
+            if (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+                valid = False
+                continue
+            response_totals[name] += value
     prompt = (
-        previous["input_tokens"] + previous["cache_read_input_tokens"]
-        + previous["cache_creation_input_tokens"]
+        current["input_tokens"] + current["cache_read_input_tokens"]
+        + current["cache_creation_input_tokens"]
     )
-    complete = valid and bool(timed_events) and prompt + previous["output_tokens"] > 0
-    timed_complete = complete and all(event["occurred_at"] for event in timed_events)
+    expected_total = prompt + current["output_tokens"]
+    reported_total = usage.get("total_tokens") if isinstance(usage, dict) else None
+    if (reported_total is not None
+            and (not isinstance(reported_total, int)
+                 or isinstance(reported_total, bool)
+                 or reported_total != expected_total)):
+        valid = False
+    if terminal is not None and (
+        terminal.get("usage_is_incomplete") is True
+        or terminal.get("subtype") not in {"success", None}
+    ):
+        valid = False
+    request_count = terminal.get("num_turns") if terminal is not None else None
+    if (not isinstance(request_count, int) or isinstance(request_count, bool)
+            or request_count < 1):
+        valid = False
+        request_count = 0
+    if response_count != request_count or response_totals != current:
+        valid = False
+    complete = valid and expected_total > 0
     reported_cost = None
-    for event in reversed(events):
-        value = event.get("total_cost_usd")
+    if terminal is not None and terminal.get("cost_is_partial") is not True:
+        value = terminal.get("total_cost_usd")
         try:
             candidate = float(value)
         except (TypeError, ValueError):
-            continue
-        if math.isfinite(candidate) and candidate >= 0:
+            candidate = None
+        if candidate is not None and math.isfinite(candidate) and candidate >= 0:
             reported_cost = candidate
-            break
     return {
         "schema": "dradar-subscription-provider-usage-v1",
         "provider": "grok",
         "model": "grok-4.6",
         "complete": complete,
-        "request_count": len(timed_events),
+        "request_count": request_count,
         "n_input_tokens": prompt,
-        "n_cache_tokens": previous["cache_read_input_tokens"],
-        "n_output_tokens": previous["output_tokens"],
-        "cache_creation_tokens": previous["cache_creation_input_tokens"],
+        "n_cache_tokens": current["cache_read_input_tokens"],
+        "n_output_tokens": current["output_tokens"],
+        "cache_creation_tokens": current["cache_creation_input_tokens"],
         "subscription_reported_cost_usd": reported_cost,
         "subscription_reported_cost_basis": "official-grok-cli",
-        "token_usage_events": timed_events if timed_complete else [],
-        "timed_usage_complete": timed_complete,
+        "token_usage_events": [],
+        "timed_usage_complete": False,
     }
 
 

@@ -131,6 +131,10 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
     )}
     events = []
     valid = True
+    ended_turns = sum(
+        1 for record in records
+        if isinstance(record, dict) and record.get("type") == "turn.ended"
+    )
     for record in records:
         if (record.get("type") != "usage.record"
                 or record.get("usageScope") != "turn"):
@@ -170,7 +174,12 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
         totals["inputOther"] + totals["inputCacheRead"]
         + totals["inputCacheCreation"]
     )
-    complete = valid and bool(events) and prompt_tokens + totals["output"] > 0
+    complete = (
+        valid
+        and bool(events)
+        and ended_turns == len(events)
+        and prompt_tokens + totals["output"] > 0
+    )
     timed_complete = complete and all(event["occurred_at"] for event in events)
     return {
         "schema": "dradar-subscription-provider-usage-v1",
@@ -178,6 +187,7 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
         "model": "k3",
         "complete": complete,
         "request_count": len(events),
+        "completed_turn_count": ended_turns,
         "n_input_tokens": prompt_tokens,
         "n_cache_tokens": totals["inputCacheRead"],
         "n_output_tokens": totals["output"],

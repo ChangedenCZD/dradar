@@ -211,22 +211,62 @@ def test_grok_usage_keeps_cached_input_as_prompt_subset() -> None:
     namespace = {"datetime": datetime, "timezone": timezone, "math": math}
     exec(compile(ast.Module(body=[helper], type_ignores=[]), "pier_grok.py", "exec"),
          namespace)
-    facts = namespace["_grok_usage_facts"]([{
-        "timestamp": "2026-08-18T01:00:00Z",
+    first_usage = {
+        "input_tokens": 300,
+        "cache_read_input_tokens": 250,
+        "cache_creation_input_tokens": 60,
+        "output_tokens": 30,
+    }
+    second_usage = {
+        "input_tokens": 200,
+        "cache_read_input_tokens": 150,
+        "cache_creation_input_tokens": 40,
+        "output_tokens": 20,
+    }
+    official_usage = {
+        "input_tokens": 500,
+        "cache_read_input_tokens": 400,
+        "cache_creation_input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 1_050,
+    }
+    response_events = [
+        {"type": "assistant", "message": {"usage": first_usage}},
+        {"type": "assistant", "message": {"usage": second_usage}},
+    ]
+    terminal = {
+        "type": "result",
+        "subtype": "success",
+        "num_turns": 2,
         "total_cost_usd": 0.00142052,
-        "usage": {
-            "input_tokens": 500,
-            "cache_read_input_tokens": 400,
-            "cache_creation_input_tokens": 100,
-            "output_tokens": 50,
-        },
-    }])
+        "usage": official_usage,
+    }
+    facts = namespace["_grok_usage_facts"]([*response_events, terminal])
     assert facts["complete"] is True
     assert facts["n_input_tokens"] == 1_000
     assert facts["n_cache_tokens"] == 400
     assert facts["n_output_tokens"] == 50
     assert facts["cache_creation_tokens"] == 100
+    assert facts["request_count"] == 2
+    assert facts["timed_usage_complete"] is False
     assert facts["subscription_reported_cost_usd"] == pytest.approx(0.00142052)
+
+    incomplete = namespace["_grok_usage_facts"]([
+        *response_events,
+        {**terminal, "usage_is_incomplete": True},
+    ])
+    assert incomplete["complete"] is False
+
+    mismatched = namespace["_grok_usage_facts"]([
+        *response_events,
+        {**terminal, "usage": {**official_usage, "total_tokens": 1_051}},
+    ])
+    assert mismatched["complete"] is False
+
+    missing_response = namespace["_grok_usage_facts"]([
+        response_events[0], terminal,
+    ])
+    assert missing_response["complete"] is False
 
 
 def test_grok_live_probe_uses_native_private_home(

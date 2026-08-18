@@ -341,6 +341,8 @@ def test_kimi_wire_usage_sums_request_records_without_cache_overlap() -> None:
             "inputCacheRead": 30,
             "output": 4,
         }, "2026-08-18T01:00:02Z"),
+        {"type": "turn.ended"},
+        {"type": "turn.ended"},
         {"message": {"type": "Unrelated"}},
     ])
     assert facts["complete"] is True
@@ -349,7 +351,20 @@ def test_kimi_wire_usage_sums_request_records_without_cache_overlap() -> None:
     assert facts["n_output_tokens"] == 31
     assert facts["cache_creation_tokens"] == 121
     assert facts["request_count"] == 2
+    assert facts["completed_turn_count"] == 2
     assert sum(e["n_input_tokens"] for e in facts["token_usage_events"]) == 21_325
+
+    incomplete = namespace["_kimi_usage_facts"]([
+        status({
+            "inputOther": 1_964,
+            "inputCacheCreation": 0,
+            "inputCacheRead": 19_200,
+            "output": 27,
+        }, "2026-08-18T01:00:00Z"),
+        {"type": "turn.ended"},
+        {"type": "turn.ended"},
+    ])
+    assert incomplete["complete"] is False
 
 
 def _write_kimi_session(
