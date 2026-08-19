@@ -1348,6 +1348,16 @@ class ZCodeBigModel(BaseInstalledAgent):
         if not isinstance(usage, dict):
             usage = {}
         usage_facts = _zcode_usage_facts(payload)
+        model_error_count = usage.get("modelErrorCount")
+        usage_facts["model_error_count"] = (
+            model_error_count
+            if (
+                isinstance(model_error_count, int)
+                and not isinstance(model_error_count, bool)
+                and model_error_count >= 0
+            )
+            else None
+        )
         prompt_tokens = usage_facts["n_input_tokens"] if usage_facts["complete"] else 0
         cached_tokens = usage_facts["n_cache_tokens"] if usage_facts["complete"] else 0
         output_tokens = usage_facts["n_output_tokens"] if usage_facts["complete"] else 0

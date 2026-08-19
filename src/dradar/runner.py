@@ -2368,11 +2368,23 @@ def _zcode_failure_diagnostic(
     return diagnostic
 
 
-def _read_json_object(path: Path | None) -> dict:
+_ZCODE_TERMINAL_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _read_capped_json_object(path: Path | None, max_bytes: int) -> dict:
     if path is None:
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not _plain_file(path)
+            or path.stat().st_size > max_bytes
+        ):
+            return {}
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            return {}
+        payload = json.loads(raw)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -2380,8 +2392,7 @@ def _read_json_object(path: Path | None) -> dict:
 
 def _zcode_false_success_reason(
     result_path: Path | None,
-    trajectory_path: Path | None,
-    outcome_path: Path | None,
+    usage_path: Path | None,
     runtime_diagnostic: dict[str, object],
 ) -> str | None:
     """Recognize only hard ZCode rc=0 false-success evidence.
@@ -2396,19 +2407,33 @@ def _zcode_false_success_reason(
     Incomplete token telemetry alone is deliberately *not* a failure: the
     accounting path already fails closed, and a real patch must still be
     gradeable when the provider merely omitted usage.  A positive provider
-    model-error counter is different: it is a hard terminal failure even when
-    ZCode returns process status zero.
+    model-error counter is different only when the session never recovered to
+    a complete, reconciled provider terminal: that combination is the known
+    false-success signature.
     """
-    result = _read_json_object(result_path)
+    result = _read_capped_json_object(
+        result_path, _ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
+    )
     agent_result = result.get("agent_result")
     if not isinstance(agent_result, dict):
         agent_result = {}
     metadata = agent_result.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    provider_usage = metadata.get("provider_usage")
-    if not isinstance(provider_usage, dict):
-        provider_usage = {}
+    embedded_usage = metadata.get("provider_usage")
+    if not isinstance(embedded_usage, dict):
+        embedded_usage = {}
+    sidecar_usage = _read_capped_json_object(
+        usage_path, _ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
+    )
+    if not (
+        sidecar_usage.get("schema")
+        == "dradar-subscription-provider-usage-v1"
+        and sidecar_usage.get("provider") == "zcode"
+        and sidecar_usage.get("model") == ZCODE_MODEL
+    ):
+        sidecar_usage = {}
+    provider_usage = sidecar_usage or embedded_usage
 
     request_count = provider_usage.get("request_count")
     provider_terminal = (
@@ -2417,25 +2442,14 @@ def _zcode_false_success_reason(
         and provider_usage.get("model") == ZCODE_MODEL
         and provider_usage.get("complete") is True
         and provider_usage.get("request_usage_complete") is True
+        and provider_usage.get("request_usage_observed") is True
+        and provider_usage.get("usage_evidence_tier") == "complete_reconciled"
         and isinstance(request_count, int)
         and not isinstance(request_count, bool)
         and request_count > 0
     )
 
-    outcome = _read_json_object(outcome_path)
-    raw_usage = outcome.get("usage")
-    if not isinstance(raw_usage, dict):
-        raw_usage = {}
-    trajectory = _read_json_object(trajectory_path)
-    metrics = trajectory.get("final_metrics")
-    if not isinstance(metrics, dict):
-        metrics = {}
-    extra = metrics.get("extra")
-    if not isinstance(extra, dict):
-        extra = {}
-    model_error_count = raw_usage.get(
-        "modelErrorCount", extra.get("model_error_count")
-    )
+    model_error_count = provider_usage.get("model_error_count")
     explicit_model_error = (
         isinstance(model_error_count, int)
         and not isinstance(model_error_count, bool)
@@ -2448,23 +2462,10 @@ def _zcode_false_success_reason(
         and not isinstance(steps, bool)
         and steps > 0
     )
-    if not meaningful_agent_result:
-        trajectory_steps = trajectory.get("steps")
-        meaningful_agent_result = (
-            isinstance(trajectory_steps, list)
-            and any(
-                isinstance(step, dict)
-                and step.get("source") in {"agent", "assistant"}
-                and isinstance(step.get("message"), str)
-                and bool(step["message"].strip())
-                for step in trajectory_steps
-            )
-        )
-
     status = runtime_diagnostic.get("zcode_last_status")
     if status in {"error", "failed", "stopped"}:
         return "terminal_status"
-    if explicit_model_error:
+    if explicit_model_error and not provider_terminal:
         return "provider_model_error"
     if not meaningful_agent_result and not provider_terminal:
         return "empty_agent_result"
@@ -2903,8 +2904,7 @@ def run_trial(
         runtime_diagnostic = _zcode_runtime_diagnostic(jobs_dir, job_name)
         false_success_reason = _zcode_false_success_reason(
             result,
-            trajectory,
-            trial_dir / "agent" / "zcode-outcome.json",
+            trial_dir / "agent" / "provider-usage.json",
             runtime_diagnostic,
         )
         if false_success_reason is not None:

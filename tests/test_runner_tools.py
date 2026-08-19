@@ -504,7 +504,8 @@ from dradar.runner import _normalize_utf16_patch, _verify_dsh_artifact_binding
 
 def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
                trajectory_payload=None, runtime_diagnostic=None,
-               zcode_outcome=None, result=None, rc=0):
+               zcode_outcome=None, provider_usage_sidecar=None,
+               result=None, rc=0):
     """Stub build_pier_command + subprocess.run; the fake 'pier' lays down the
     trial-dir layout the real one would. Returns a dict capturing job_name."""
     captured = {}
@@ -540,6 +541,10 @@ def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
             if zcode_outcome is not None:
                 (trial / "agent" / "zcode-outcome.json").write_text(
                     json.dumps(zcode_outcome)
+                )
+            if provider_usage_sidecar is not None:
+                (trial / "agent" / "provider-usage.json").write_text(
+                    json.dumps(provider_usage_sidecar)
                 )
             if result is not None:
                 (trial / "result.json").write_text(json.dumps(result))
@@ -744,6 +749,17 @@ def _prepare_fake_zcode(monkeypatch, tmp_path):
     )
 
 
+def test_zcode_terminal_reader_rejects_oversized_json_without_loading_it(
+        tmp_path):
+    oversized = tmp_path / "oversized.json"
+    with oversized.open("wb") as stream:
+        stream.truncate(runner_mod._ZCODE_TERMINAL_ARTIFACT_MAX_BYTES + 1)
+
+    assert runner_mod._read_capped_json_object(
+        oversized, runner_mod._ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
+    ) == {}
+
+
 def test_run_trial_rejects_real_zcode_model_error_rc0_signature(
         tmp_path, monkeypatch):
     _prepare_fake_zcode(monkeypatch, tmp_path)
@@ -785,6 +801,15 @@ def test_run_trial_rejects_real_zcode_model_error_rc0_signature(
             "state": {"projection": {"status": "idle", "turnCount": 73}},
             "usage": {"modelErrorCount": 1, "modelRequestCount": 134},
             "events": {"events": []},
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": False,
+            "request_count": 0,
+            "request_usage_complete": False,
+            "model_error_count": 1,
         },
         runtime_diagnostic={
             "schema": "dradar-zcode-runtime-v1",
@@ -845,7 +870,7 @@ def test_run_trial_rejects_zcode_rc0_without_meaningful_agent_result(
         run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
 
 
-def test_run_trial_accepts_valid_zcode_patch_even_if_it_later_grades_zero(
+def test_run_trial_accepts_recovered_zcode_model_error_with_valid_patch(
         tmp_path, monkeypatch):
     _prepare_fake_zcode(monkeypatch, tmp_path)
     _fake_pier(
@@ -861,6 +886,8 @@ def test_run_trial_accepts_valid_zcode_patch_even_if_it_later_grades_zero(
                     "complete": True,
                     "request_count": 25,
                     "request_usage_complete": True,
+                    "request_usage_observed": True,
+                    "usage_evidence_tier": "complete_reconciled",
                     "n_input_tokens": 100_000,
                     "n_cache_tokens": 80_000,
                     "n_output_tokens": 5_000,
@@ -869,13 +896,24 @@ def test_run_trial_accepts_valid_zcode_patch_even_if_it_later_grades_zero(
         },
         trajectory_payload={
             "steps": [{"source": "agent", "message": "completed patch"}],
-            "final_metrics": {"extra": {"model_error_count": 0}},
+            "final_metrics": {"extra": {"model_error_count": 1}},
         },
         zcode_outcome={
             "schema": "dradar-zcode-outcome-v1",
             "sessionId": "sess_valid_patch",
             "state": {"projection": {"status": "idle", "turnCount": 18}},
-            "usage": {"modelErrorCount": 0, "modelRequestCount": 25},
+            "usage": {"modelErrorCount": 1, "modelRequestCount": 25},
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": True,
+            "request_count": 25,
+            "request_usage_complete": True,
+            "request_usage_observed": True,
+            "usage_evidence_tier": "complete_reconciled",
+            "model_error_count": 1,
         },
         runtime_diagnostic={
             "schema": "dradar-zcode-runtime-v1",
@@ -924,6 +962,15 @@ def test_run_trial_keeps_zcode_patch_gradeable_when_only_usage_is_incomplete(
             "sessionId": "sess_usage_only",
             "state": {"projection": {"status": "idle", "turnCount": 12}},
             "usage": {"modelErrorCount": 0, "modelRequestCount": 12},
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": False,
+            "request_count": 0,
+            "request_usage_complete": False,
+            "model_error_count": 0,
         },
         runtime_diagnostic={
             "schema": "dradar-zcode-runtime-v1",
