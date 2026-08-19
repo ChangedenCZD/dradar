@@ -32,6 +32,39 @@ GROK_LINUX_SHA256 = {
 }
 
 
+def _grok_model_preflight_command(remote_cli: str) -> str:
+    """Return a fail-closed model probe that emits only a safe category."""
+
+    return (
+        "umask 077; "
+        f"models_output=$({shlex.quote(remote_cli)} models 2>&1); "
+        "models_rc=$?; "
+        "if [ \"$models_rc\" -ne 0 ]; then "
+        "  models_lower=$(printf '%s' \"$models_output\" "
+        "    | tr '[:upper:]' '[:lower:]'); "
+        "  case \"$models_lower\" in "
+        "    *'not authenticated'*|*'unauthorized'*|*'forbidden'*|"
+        "*'authentication failed'*|*'token expired'*) "
+        "      preflight_kind=auth ;; "
+        "    *'settings fetch failed'*|*'connection error'*|"
+        "*'connection refused'*|*'connection reset'*|*'timed out'*|"
+        "*'network'*|*'dns'*|*'tls'*) preflight_kind=network ;; "
+        "    *) preflight_kind=unknown ;; "
+        "  esac; "
+        "  printf 'DRADAR_GROK_PREFLIGHT_FAILURE=%s\\n' "
+        "    \"$preflight_kind\"; "
+        "  exit 78; "
+        "fi; "
+        # Do not pipe the Rust CLI directly into grep -q. grep exits on the
+        # first match and Grok 1.0.3 then panics on EPIPE.
+        "if ! printf '%s\\n' \"$models_output\" "
+        "  | grep -Fq grok-4.6; then "
+        "  printf 'DRADAR_GROK_PREFLIGHT_FAILURE=catalog\\n'; "
+        "  exit 78; "
+        "fi"
+    )
+
+
 def _grok_usage_facts(events: list[dict]) -> dict:
     """Cross-check Grok's official per-response and terminal token ledgers."""
 
@@ -353,18 +386,13 @@ class GrokBuild(BaseInstalledAgent):
         # Grok discovers subscription models dynamically.  A fresh,
         # auth-only GROK_HOME otherwise retains the bundled 4.5 fallback and
         # rejects 4.6 before making a model request.  Populate the isolated
-        # model cache and fail closed if this OAuth slot cannot see 4.6.
+        # model cache and fail closed if this OAuth slot cannot see 4.6. Do
+        # not expose raw provider diagnostics: emit one bounded category so
+        # the outer run loop can defer this unspent assignment instead of
+        # manufacturing a zero-token invalid submission.
         await self.exec_as_agent(
             environment,
-            command=(
-                # Do not pipe the Rust CLI directly into grep -q.  grep exits
-                # on the first match, closing stdout while Grok is still
-                # printing the catalog; Grok 1.0.3 then panics on EPIPE and a
-                # valid OAuth slot is misclassified as an agent failure.
-                f"models_output=$({shlex.quote(remote_cli)} models) "
-                f"&& printf '%s\\n' \"$models_output\" "
-                f"| grep -Fq {shlex.quote('grok-4.6')}"
-            ),
+            command=_grok_model_preflight_command(remote_cli),
             env=env,
         )
 

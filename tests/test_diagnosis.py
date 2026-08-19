@@ -380,6 +380,28 @@ def test_mark_stopped_downgrades_only_diagnostic_422(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_mark_stopped_downgrades_failure_kind_for_old_server(capsys):
+    attempts = []
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            attempts.append((assignment_id, kwargs))
+            if len(attempts) == 1:
+                raise ApiError(
+                    "server returned 422: unsupported failure_kind",
+                    status_code=422,
+                )
+            return {"ok": True}
+
+    assert runloop._mark_stopped_quietly(
+        Client(), "assignment-old", failure_kind="auth",
+    ) is True
+    assert len(attempts) == 2
+    assert attempts[0][1]["failure_kind"] == "auth"
+    assert "failure_kind" not in attempts[1][1]
+    assert capsys.readouterr().out == ""
+
+
 def test_mark_stopped_does_not_downgrade_unrelated_422(capsys):
     attempts = []
 
@@ -394,3 +416,70 @@ def test_mark_stopped_does_not_downgrade_unrelated_422(capsys):
     ) is False
     assert len(attempts) == 1
     assert "could not confirm checkout cleanup" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kind", ["auth", "network", "catalog", "unknown"])
+def test_grok_preflight_parser_accepts_only_sanitized_stdout_kind(
+    tmp_path: Path, kind: str,
+):
+    result = _result(
+        tmp_path,
+        "Command failed (exit 78): shell contains "
+        "DRADAR_GROK_PREFLIGHT_FAILURE=%s\n"
+        f"stdout: DRADAR_GROK_PREFLIGHT_FAILURE={kind}\n"
+        "stderr: None",
+    )
+    assert runloop._grok_preflight_failure(result) == kind
+
+
+def test_grok_preflight_parser_ignores_template_and_unbounded_output(tmp_path: Path):
+    result = _result(
+        tmp_path,
+        "Command failed: printf DRADAR_GROK_PREFLIGHT_FAILURE=%s\n"
+        "stdout: attacker-token=must-not-classify\n"
+        "stderr: DRADAR_GROK_PREFLIGHT_FAILURE=auth",
+    )
+    assert runloop._grok_preflight_failure(result) is None
+
+
+def test_grok_preflight_is_deferred_without_invalid_upload_or_task_switch(
+    monkeypatch, capsys, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "pool-abort"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    art = _fake_art(tmp_path, rc=0, result_data={
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": (
+                "Command failed (exit 78): sanitized preflight\n"
+                "stdout: DRADAR_GROK_PREFLIGHT_FAILURE=auth\n"
+                "stderr: None"
+            ),
+        },
+        "agent_result": {},
+    }, codex_cli_version=None)
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw)) or {"ok": True}
+    assignment = {
+        **ASSIGNMENT,
+        "agent": "grok-build",
+        "provider": "xai-subscription",
+        "model": "grok-4.6",
+        "effort": "medium",
+    }
+
+    outcome = runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "provider-preflight-failed"
+    assert client.submissions == []
+    assert stopped == [("a1", {"defer_seconds": 900, "failure_kind": "auth"})]
+    assert abort_file.read_text() == "drain:Grok provider preflight failed (auth)"
+    assert art.result.is_file()
+    out = capsys.readouterr().out
+    assert "provider setup grok" in out
+    assert "no invalid submission was created" in out

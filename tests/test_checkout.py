@@ -274,6 +274,56 @@ def test_checkout_loop_always_fuses_after_insufficient_balance(
     assert "siblings with model runs already in flight are allowed to finish" in out
 
 
+def test_checkout_loop_fuses_after_grok_preflight_without_switching_task(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *args, **kwargs):
+        attempts.append(assignment["assignment_id"])
+        runloop._signal_pool_abort(
+            "Grok provider preflight failed (network)", interrupt_siblings=False,
+        )
+        return "provider-preflight-failed"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    abort_file = tmp_path / "pool-abort"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    client = CheckoutClient(
+        {"active": [_cell("grok-bad")], "free_pick": True},
+        [{"assignment": _cell("grok-bad"), "held": 2, "unstarted": 1},
+         {"assignment": _cell("must-not-run"), "held": 2, "unstarted": 0}],
+    )
+
+    rc = runloop._go_menu(_args(), {}, client, tmp_path)
+
+    assert rc == 1
+    assert attempts == ["grok-bad"]
+    assert len(client._checkouts) == 1
+    assert abort_file.read_text().startswith("drain:")
+    out = capsys.readouterr().out
+    assert "stopping this worker before the next task" in out
+    assert "siblings with model runs already in flight are allowed to finish" in out
+
+
+def test_serial_batch_fuses_after_grok_preflight(monkeypatch, tmp_path):
+    attempts = []
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runloop, "_run_and_submit",
+        lambda _client, assignment, *_args, **_kwargs: (
+            attempts.append(assignment["assignment_id"])
+            or "provider-preflight-failed"
+        ),
+    )
+    cells = [_cell("grok-bad"), _cell("must-not-run")]
+
+    rc = runloop._run_batch(_args(), CheckoutClient({}, []), tmp_path, cells)
+
+    assert rc == 1
+    assert attempts == ["grok-bad"]
+
+
 def test_checkout_worker_obeys_existing_pool_balance_fuse(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)

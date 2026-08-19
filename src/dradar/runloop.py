@@ -12,6 +12,7 @@ identity (login/register) and doctor (environment checks) concerns.
 
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -78,7 +79,7 @@ _TERMINAL_LOCAL_OUTCOMES = {
 }
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
-    "recovery-exhausted", "runtime-incompatible",
+    "recovery-exhausted", "runtime-incompatible", "provider-preflight-failed",
 }
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
@@ -97,6 +98,31 @@ _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
 # cannot strand an otherwise valid patch/result at the proxy edge.
 _UPLOAD_BODY_BUDGET_BYTES = 95_000_000
 _MULTIPART_OVERHEAD_BUDGET_BYTES = 64 * 1024
+
+_GROK_PREFLIGHT_STDOUT_RE = re.compile(
+    r"(?:^|\n)stdout: DRADAR_GROK_PREFLIGHT_FAILURE="
+    r"(auth|network|catalog|unknown)(?:\n|$)"
+)
+_GROK_PREFLIGHT_ADVICE = {
+    "auth": (
+        "Grok subscription authentication is no longer usable. Run "
+        "`dradar provider setup grok`, then `dradar provider status grok` "
+        "before resuming."
+    ),
+    "network": (
+        "Grok's live catalog could not be reached. Check this machine's "
+        "network/proxy, then run `dradar provider status grok` before resuming."
+    ),
+    "catalog": (
+        "This Grok subscription session cannot currently see grok-4.6. Run "
+        "`dradar provider status grok`; reauthenticate if that check confirms "
+        "the model is unavailable."
+    ),
+    "unknown": (
+        "Grok's live catalog check failed without a safe diagnostic. Run "
+        "`dradar provider status grok` before resuming."
+    ),
+}
 
 _TERMINAL_FAILURE_OUTCOMES = {
     "auth": ("auth-failure", "agent authentication failed"),
@@ -307,6 +333,9 @@ def _announce_account_stop(outcome: str) -> None:
         "quota-exhausted": "the account quota window is exhausted",
         "recovery-exhausted": "checkpoint recovery reached its safety limit",
         "runtime-incompatible": "the agent runtime is incompatible",
+        "provider-preflight-failed": (
+            "the selected subscription provider failed its live check"
+        ),
     }
     reason = messages.get(outcome, "an account-wide stop condition was detected")
     print(
@@ -316,6 +345,31 @@ def _announce_account_stop(outcome: str) -> None:
         "Unstarted leases and checkpoints remain untouched; fix or wait for "
         "the condition, then explicitly start `dradar resume` again."
     )
+
+
+def _grok_preflight_failure(result_path: Path | None) -> str | None:
+    """Read only the adapter's bounded preflight class from Pier output.
+
+    The command text contains the marker template, so accepting an arbitrary
+    substring would misclassify every later Grok exception. Pier's explicit
+    ``stdout:`` field is the only trusted transport; its value is restricted
+    to four non-secret recovery classes.
+    """
+
+    if result_path is None or not result_path.is_file():
+        return None
+    try:
+        data = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    info = data.get("exception_info")
+    if not isinstance(info, dict):
+        return None
+    message = info.get("exception_message")
+    if not isinstance(message, str):
+        return None
+    match = _GROK_PREFLIGHT_STDOUT_RE.search(message)
+    return match.group(1) if match is not None else None
 
 
 def _terminal_failure_outcome(kind: str | None) -> str | None:
@@ -1367,6 +1421,17 @@ def _mark_stopped_quietly(
                 # never generalize this to unrelated 4xx responses.
                 failure_diagnostic = None
                 continue
+            if (
+                failure_kind is not None
+                and exc.status_code == 422
+                and "failure_kind" in str(exc)
+            ):
+                # A pre-failure_kind server can still perform the essential
+                # idempotent checkout cleanup. Drop only the unsupported
+                # observability field; never downgrade unrelated 4xx errors.
+                failure_kind = None
+                failure_diagnostic = None
+                continue
             if exc.status_code is not None and exc.status_code < 500:
                 break
         except Exception as exc:
@@ -1573,6 +1638,35 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     failure_kind="user_interrupted",
                 )
             raise
+
+    if assignment.get("agent") == GROK_AGENT:
+        preflight_kind = _grok_preflight_failure(art.result)
+        if preflight_kind is not None:
+            # No prompt/model request occurred. Keep this out of the
+            # submission table, return the same assignment to a deferred
+            # retryable state, and drain (not kill) already-running siblings.
+            _signal_pool_abort(
+                f"Grok provider preflight failed ({preflight_kind})",
+                interrupt_siblings=False,
+            )
+            stopped = _mark_stopped_quietly(
+                client,
+                assignment,
+                defer_seconds=900,
+                failure_kind="auth" if preflight_kind == "auth" else None,
+            )
+            print(
+                f"Grok provider preflight failed ({preflight_kind}); no model "
+                "request was made and no invalid submission was created."
+            )
+            print(f"  -> {_GROK_PREFLIGHT_ADVICE[preflight_kind]}")
+            print(f"  local diagnostic kept: {art.result or art.log_path}")
+            if not stopped:
+                print(
+                    "  checkout cleanup was not confirmed; this worker is still "
+                    "stopping and will not take another task."
+                )
+            return "provider-preflight-failed"
 
     # Make the authoritative source copy immediately after Pier returns,
     # before result parsing, image bookkeeping, pause handling, or upload can
