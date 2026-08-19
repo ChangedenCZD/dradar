@@ -257,7 +257,7 @@ def test_grok_model_preflight_emits_only_bounded_failure_category(
     assert "token.example" not in proc.stdout + proc.stderr
 
 
-def test_grok_prompt_is_positional_after_option_terminator(
+def test_grok_prompt_stays_headless_in_one_single_option_argv(
     tmp_path: Path,
 ) -> None:
     source = Path(providers.__file__).with_name("pier_grok.py").read_text()
@@ -272,7 +272,14 @@ def test_grok_prompt_is_positional_after_option_terminator(
          namespace)
     fake = tmp_path / "grok fake"
     fake.write_text(
-        "#!/bin/sh\nprintf '%s\\0' \"$@\"\n",
+        "#!/bin/sh\n"
+        "single_count=0\n"
+        "for arg in \"$@\"; do\n"
+        "  case \"$arg\" in --single=*) single_count=$((single_count + 1));; esac\n"
+        "done\n"
+        "[ \"$single_count\" -eq 1 ] || exit 91\n"
+        "[ ! -t 0 ] || exit 92\n"
+        "printf '%s\\0' \"$@\"\n",
         encoding="utf-8",
     )
     fake.chmod(0o700)
@@ -290,7 +297,7 @@ def test_grok_prompt_is_positional_after_option_terminator(
 
     assert proc.returncode == 0
     assert proc.stdout.split(b"\0")[:-1] == [
-        part.encode() for part in [*flags, "--", instruction]
+        part.encode() for part in [*flags, f"--single={instruction}"]
     ]
     assert stream.read_bytes() == proc.stdout
 

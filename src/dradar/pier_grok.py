@@ -70,14 +70,15 @@ def _grok_prompt_command(
 ) -> str:
     """Build an option-safe Grok invocation for an arbitrary task prompt.
 
-    Grok accepts the prompt as a positional argument.  Put every trusted
-    adapter flag before ``--`` and the complete untrusted benchmark prompt
-    after it so a leading dash can never be parsed as another CLI option.
+    ``--single`` is Grok's non-interactive mode.  Use its ``--option=value``
+    form so the complete untrusted prompt is exactly one argv item and a
+    leading dash can never be reinterpreted as another CLI option.
     """
 
     cli = " ".join(shlex.quote(part) for part in flags)
+    single = shlex.quote(f"--single={instruction}")
     return (
-        f"{shlex.quote(remote_cli)} {cli} -- {shlex.quote(instruction)} "
+        f"{shlex.quote(remote_cli)} {cli} {single} "
         f"2>&1 </dev/null | tee {shlex.quote(stream)}"
     )
 
