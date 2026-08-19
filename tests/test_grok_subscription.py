@@ -6,6 +6,8 @@ import ast
 import json
 import math
 import os
+import shlex
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -187,10 +189,16 @@ def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
     assert '_REMOTE_HOME = _REMOTE_USER_HOME / ".grok"' in source
     assert '"HOME": remote_user_home' in source
     assert '"GROK_HOME": remote_home' not in source
-    assert 'f"models_output=$({shlex.quote(remote_cli)} models) "' in source
-    assert "closing stdout while Grok is still" in source
+    assert 'f"models_output=$({shlex.quote(remote_cli)} models 2>&1); "' in source
+    assert "panics on EPIPE" in source
     assert "grep -Fq" in source
     assert "grok-4.6" in source
+    assert "DRADAR_GROK_PREFLIGHT_FAILURE=%s" in source
+    assert "preflight_kind=auth" in source
+    assert "preflight_kind=network" in source
+    assert "preflight_kind=unknown" in source
+    assert "DRADAR_GROK_PREFLIGHT_FAILURE=catalog" in source
+    assert 'f"&& printf \'%s\\\\n\' \\\"$models_output\\\" "' not in source
     assert '"grok.com"' in source
     assert '"code.grok.com"' in source
     assert "GROK_TELEMETRY_ENABLED" in source
@@ -199,6 +207,54 @@ def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
     assert "GROK_LINUX_SHA256" in source
     assert "sha256sum --check --strict" in source
     assert "await environment.upload_file(self._grok_cli_file" not in source
+
+
+@pytest.mark.parametrize(
+    ("output", "returncode", "expected"),
+    [
+        ("* grok-4.6 (default)\n", 0, None),
+        ("* grok-4.5 (default)\n", 0, "catalog"),
+        ("Not authenticated; refresh=TOPSECRET\n", 1, "auth"),
+        ("settings fetch failed for https://token.example\n", 1, "network"),
+        ("opaque failure TOPSECRET\n", 1, "unknown"),
+    ],
+)
+def test_grok_model_preflight_emits_only_bounded_failure_category(
+    tmp_path: Path, output: str, returncode: int, expected: str | None,
+) -> None:
+    source = Path(providers.__file__).with_name("pier_grok.py").read_text()
+    module = ast.parse(source)
+    helper = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_grok_model_preflight_command"
+    )
+    namespace = {"shlex": shlex}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "pier_grok.py", "exec"),
+         namespace)
+    fake = tmp_path / "grok fake"
+    fake.write_text(
+        "#!/bin/sh\n"
+        + f"printf '%s' {shlex.quote(output)} >&2\n"
+        + f"exit {returncode}\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o700)
+
+    command = namespace["_grok_model_preflight_command"](str(fake))
+    proc = subprocess.run(
+        ["bash", "-c", command], capture_output=True, text=True, check=False,
+    )
+
+    if expected is None:
+        assert proc.returncode == 0
+        assert proc.stdout == ""
+    else:
+        assert proc.returncode == 78
+        assert proc.stdout == f"DRADAR_GROK_PREFLIGHT_FAILURE={expected}\n"
+    assert proc.stderr == ""
+    assert "TOPSECRET" not in proc.stdout + proc.stderr
+    assert "token.example" not in proc.stdout + proc.stderr
 
 
 def test_grok_usage_keeps_cached_input_as_prompt_subset() -> None:
