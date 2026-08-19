@@ -1465,12 +1465,12 @@ def _codex_event_timestamp(event: dict) -> str | None:
 def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
     """Describe one Codex JSONL file and isolate this agent's own usage.
 
-    A spawned Codex agent currently receives a copy of its parent's event
-    prefix.  Consequently its final cumulative counters include the inherited
-    parent tokens.  Summing the final counters would overcharge just as badly
-    as Pier's single-file conversion undercharges.  The last ``task_started``
-    marks the spawned agent's own segment; subtract the final counter before
-    that boundary.
+    Legacy spawned sessions receive a copy of their parent's event prefix, so
+    their final cumulative counters include inherited parent tokens.  Codex's
+    paginated history protocol keeps the metadata prefix but starts token
+    counters at zero for the child.  The explicit ``history_mode`` marker is
+    therefore part of the accounting boundary: subtract legacy inherited
+    counters, but sum paginated child counters as their own usage.
     """
     meta_events = [event for event in events if event.get("type") == "session_meta"]
     first_meta = meta_events[0].get("payload", {}) if meta_events else {}
@@ -1505,10 +1505,14 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
                     usage_events.append(
                         (index, usage, _codex_event_timestamp(event)))
 
-    # Root files start at zero.  Child files containing an inherited prefix
-    # have multiple session_meta/task_started events; their last task_started
-    # is the beginning of the child's own work.
-    inherited_prefix = role == "subagent" and (
+    # Root and paginated child counters start at zero.  Legacy child files
+    # contain a complete inherited prefix; their last task_started is the
+    # beginning of the child's own work.  Unknown history formats stay on the
+    # conservative legacy path so a missing baseline can never be priced.
+    paginated_child = (
+        role == "subagent" and first_meta.get("history_mode") == "paginated"
+    )
+    inherited_prefix = role == "subagent" and not paginated_child and (
         len(meta_events) > 1 or len(starts) > 1)
     boundary = starts[-1] if starts else 0
     baseline = {name: 0 for name in (
@@ -1516,6 +1520,11 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
         "reasoning_output_tokens",
     )}
     baseline_found = not inherited_prefix
+    # A paginated marker paired with inherited counters is internally
+    # inconsistent.  Suppress accounting instead of risking a parent double
+    # count; valid paginated streams have no counter before the child boundary.
+    if paginated_child and any(index < boundary for index, *_ in usage_events):
+        baseline_found = False
     if inherited_prefix:
         for index, usage, _timestamp in usage_events:
             if index >= boundary:

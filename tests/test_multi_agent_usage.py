@@ -5,14 +5,18 @@ from dradar.runner import aggregate_codex_session_usage
 
 
 def _session(path: Path, session_id: str, role: str, usages: list[dict],
-             parent: str | None = None, inherited: dict | None = None) -> None:
+             parent: str | None = None, inherited: dict | None = None,
+             history_mode: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     source = "exec"
     if role == "subagent":
         source = {"subagent": {"thread_spawn": {"parent_thread_id": parent}}}
-    events = [{"type": "session_meta", "payload": {
+    session_meta = {
         "id": session_id, "thread_source": role, "source": source,
-    }}]
+    }
+    if history_mode is not None:
+        session_meta["history_mode"] = history_mode
+    events = [{"type": "session_meta", "payload": session_meta}]
     if inherited is not None:
         events += [
             {"type": "session_meta", "payload": {
@@ -80,6 +84,81 @@ def test_duplicate_session_id_uses_largest_cumulative_record(tmp_path: Path):
     assert usage["agent_session_count"] == 1
     assert usage["n_input_tokens"] == 30
     assert usage["n_output_tokens"] == 4
+
+
+def test_paginated_subagent_counters_start_at_zero(tmp_path: Path):
+    sessions = tmp_path / "agent" / "sessions"
+    _session(sessions / "root.jsonl", "root-1", "user", [
+        _usage(100, 60, 10, 4),
+    ], history_mode="paginated")
+    # Codex 0.148+ retains parent metadata/task boundaries in paginated child
+    # files but omits inherited token counters.  The child's cumulative values
+    # are standalone and must be added once, not rejected or subtracted.
+    _session(sessions / "child.jsonl", "child-1", "subagent", [
+        _usage(50, 20, 5, 3),
+    ], parent="root-1", inherited=None, history_mode="paginated")
+    child_events = [json.loads(line) for line in (
+        sessions / "child.jsonl").read_text().splitlines()]
+    child_events.insert(1, {"type": "session_meta", "payload": {
+        "id": "root-1", "thread_source": "user", "source": "exec",
+        "history_mode": "paginated",
+    }})
+    child_events.insert(2, {"type": "event_msg", "payload": {
+        "type": "task_started",
+    }})
+    (sessions / "child.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in child_events) + "\n")
+
+    usage = aggregate_codex_session_usage(tmp_path)
+
+    assert usage is not None and usage["complete"] is True
+    assert usage["n_input_tokens"] == 150
+    assert usage["n_cache_tokens"] == 80
+    assert usage["n_output_tokens"] == 15
+    assert usage["n_reasoning_output_tokens"] == 7
+    assert usage["timed_usage_complete"] is True
+    assert len(usage["token_usage_events"]) == 2
+
+
+def test_unknown_child_history_without_baseline_remains_incomplete(tmp_path: Path):
+    sessions = tmp_path / "agent" / "sessions"
+    _session(sessions / "root.jsonl", "root-1", "user", [
+        _usage(100, 60, 10),
+    ])
+    _session(sessions / "child.jsonl", "child-1", "subagent", [
+        _usage(50, 20, 5),
+    ], parent="root-1")
+    child_events = [json.loads(line) for line in (
+        sessions / "child.jsonl").read_text().splitlines()]
+    child_events.insert(1, {"type": "session_meta", "payload": {
+        "id": "root-1", "thread_source": "user", "source": "exec",
+    }})
+    child_events.insert(2, {"type": "event_msg", "payload": {
+        "type": "task_started",
+    }})
+    (sessions / "child.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in child_events) + "\n")
+
+    usage = aggregate_codex_session_usage(tmp_path)
+
+    assert usage is not None and usage["complete"] is False
+    assert usage["n_input_tokens"] == 100
+
+
+def test_paginated_marker_with_inherited_counter_is_not_double_counted(
+    tmp_path: Path,
+):
+    sessions = tmp_path / "agent" / "sessions"
+    root_usage = _usage(100, 60, 10)
+    _session(sessions / "root.jsonl", "root-1", "user", [root_usage])
+    _session(sessions / "child.jsonl", "child-1", "subagent", [
+        _usage(150, 80, 15),
+    ], parent="root-1", inherited=root_usage, history_mode="paginated")
+
+    usage = aggregate_codex_session_usage(tmp_path)
+
+    assert usage is not None and usage["complete"] is False
+    assert usage["n_input_tokens"] == 100
 
 
 def test_missing_child_token_count_marks_aggregate_incomplete(tmp_path: Path):
