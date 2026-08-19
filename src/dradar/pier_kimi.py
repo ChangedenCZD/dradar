@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -31,6 +32,10 @@ from _dradar_kimi_recovery import (
     run_with_kimi_resume,
     validated_session_id,
 )
+
+
+_MAX_USAGE_WIRE_BYTES = 16 * 1024 * 1024
+_MAX_USAGE_WIRE_RECORDS = 50_000
 
 
 KIMI_CONFIG = """\
@@ -125,82 +130,222 @@ def _usage_instant(value: Any) -> str | None:
 
 
 def _kimi_usage_facts(records: list[dict]) -> dict:
-    """Read Kimi's per-request durable usage records without cache overlap.
+    """Reconcile Kimi's durable per-request usage to completed turns.
 
     ``inputOther`` and ``inputCacheCreation`` are ordinary-priced prompt
     tokens. ``inputCacheRead`` is both part of total prompt tokens and the
     cached subset. Keeping that invariant matches Pier/DRadar's normalized
     contract: n_input_tokens already includes n_cache_tokens.
+
+    Kimi 0.36.1 emits one ``usage.record`` for every provider request but only
+    one ``turn.ended`` for the enclosing agent turn.  The two counts therefore
+    must not be compared directly.  Instead, require a single durable wire,
+    group retry attempts for each logical ``turnStep``, pair every settled
+    logical request with one later usage record, and require every opened turn
+    to end successfully after its requests are settled. A step that reappears
+    after settlement, or usage without a pending step, fails closed.
     """
 
     totals = {name: 0 for name in (
         "inputOther", "inputCacheRead", "inputCacheCreation", "output",
     )}
-    events = []
-    valid = True
-    ended_turns = sum(
-        1 for record in records
-        if isinstance(record, dict) and record.get("type") == "turn.ended"
-    )
+    events: list[dict[str, Any]] = []
+    usage_valid = True
+    session_identity_valid = True
+    request_ledger_valid = True
+    turn_ledger_valid = True
+    metadata_count = 0
+    model_request_count = 0
+    turn_prompt_count = 0
+    ended_turns = 0
+    duplicate_count = 0
+    unexpected_usage = False
+    turn_open = False
+    pending_requests: deque[tuple[str, datetime | None]] = deque()
+    pending_request_steps: set[str] = set()
+    settled_request_steps: set[str] = set()
+    request_attempt_count = 0
+    request_retry_count = 0
+    seen_turn_ids: set[int] = set()
+    last_usage_instant: datetime | None = None
+
+    def instant(value: Any) -> tuple[str, datetime] | None:
+        text = _usage_instant(value)
+        if text is None:
+            return None
+        return text, datetime.fromisoformat(text.replace("Z", "+00:00"))
+
     for record in records:
-        if (record.get("type") != "usage.record"
+        if not isinstance(record, dict):
+            session_identity_valid = False
+            continue
+        record_type = record.get("type")
+        if record_type == "metadata":
+            metadata_count += 1
+            continue
+        if record_type == "turn.prompt":
+            turn_prompt_count += 1
+            if turn_open:
+                turn_ledger_valid = False
+            turn_open = True
+            continue
+        if record_type == "llm.request":
+            request_attempt_count += 1
+            # The request event uses the provider model id while the usage
+            # event uses Kimi's configured alias.
+            if not turn_open or record.get("model") != "k3":
+                session_identity_valid = False
+            request_step = record.get("turnStep")
+            if not isinstance(request_step, str) or not request_step:
+                request_ledger_valid = False
+            request_instant = instant(record.get("time"))
+            if request_instant is None:
+                request_ledger_valid = False
+                parsed_request_instant = None
+            else:
+                parsed_request_instant = request_instant[1]
+            if isinstance(request_step, str) and request_step:
+                if request_step in settled_request_steps:
+                    duplicate_count += 1
+                    request_ledger_valid = False
+                elif request_step in pending_request_steps:
+                    # Kimi's retry/media-projection fallbacks issue another
+                    # provider request for the same logical turn step. Only
+                    # the eventual successful response emits usage.record.
+                    request_retry_count += 1
+                    if not pending_requests or pending_requests[-1][0] != request_step:
+                        request_ledger_valid = False
+                    else:
+                        pending_requests[-1] = (
+                            request_step, parsed_request_instant,
+                        )
+                else:
+                    model_request_count += 1
+                    pending_request_steps.add(request_step)
+                    pending_requests.append((request_step, parsed_request_instant))
+            continue
+        if record_type == "turn.ended":
+            ended_turns += 1
+            if not turn_open or pending_requests:
+                turn_ledger_valid = False
+            turn_id = record.get("turnId")
+            if (not isinstance(turn_id, int) or isinstance(turn_id, bool)
+                    or turn_id < 0 or turn_id in seen_turn_ids):
+                if isinstance(turn_id, int) and turn_id in seen_turn_ids:
+                    duplicate_count += 1
+                turn_ledger_valid = False
+            else:
+                seen_turn_ids.add(turn_id)
+            terminal_instant = instant(record.get("time"))
+            if (terminal_instant is None
+                    or (last_usage_instant is not None
+                        and terminal_instant[1] < last_usage_instant)
+                    or record.get("reason") != "completed"):
+                turn_ledger_valid = False
+            turn_open = False
+            continue
+        if (record_type != "usage.record"
                 or record.get("usageScope") != "turn"):
             continue
+        if not turn_open or record.get("model") != "kimi-code/k3":
+            session_identity_valid = False
         usage = record.get("usage")
         if not isinstance(usage, dict):
-            valid = False
+            usage_valid = False
             continue
 
         def counter(name: str) -> int | None:
             value = usage.get(name)
             return value if isinstance(value, int) and not isinstance(value, bool) \
-                and value >= 0 else None
+                and 0 <= value <= 2**63 - 1 else None
 
         current = {name: counter(name) for name in totals}
         if any(value is None for value in current.values()):
-            valid = False
+            usage_valid = False
             continue
         current = {name: int(value) for name, value in current.items()}
-        if any(current.values()):
-            occurred_at = _usage_instant(
-                record.get("time") or record.get("timestamp")
-                or record.get("occurred_at")
-            )
-            events.append({
-                "occurred_at": occurred_at,
-                "n_input_tokens": (
-                    current["inputOther"] + current["inputCacheRead"]
-                    + current["inputCacheCreation"]
-                ),
-                "n_cache_tokens": current["inputCacheRead"],
-                "n_output_tokens": current["output"],
-            })
+        occurred = instant(
+            record.get("time") or record.get("timestamp")
+            or record.get("occurred_at")
+        )
+        if occurred is None:
+            usage_valid = False
+            occurred_at = None
+            occurred_instant = None
+        else:
+            occurred_at, occurred_instant = occurred
+            if (last_usage_instant is not None
+                    and occurred_instant < last_usage_instant):
+                usage_valid = False
+            last_usage_instant = occurred_instant
+        if not pending_requests:
+            request_ledger_valid = False
+            unexpected_usage = True
+            duplicate_count += 1
+        else:
+            request_step, request_instant = pending_requests.popleft()
+            pending_request_steps.discard(request_step)
+            settled_request_steps.add(request_step)
+            if (request_instant is None or occurred_instant is None
+                    or occurred_instant < request_instant):
+                request_ledger_valid = False
+        events.append({
+            "occurred_at": occurred_at,
+            "n_input_tokens": (
+                current["inputOther"] + current["inputCacheRead"]
+                + current["inputCacheCreation"]
+            ),
+            "n_cache_tokens": current["inputCacheRead"],
+            "n_output_tokens": current["output"],
+        })
         for name in totals:
             totals[name] += current[name]
+            if totals[name] > 2**63 - 1:
+                usage_valid = False
     prompt_tokens = (
         totals["inputOther"] + totals["inputCacheRead"]
         + totals["inputCacheCreation"]
     )
+    request_ledger_valid = (
+        request_ledger_valid
+        and not pending_requests
+        and model_request_count == len(events)
+    )
+    turn_ledger_valid = (
+        turn_ledger_valid
+        and not turn_open
+        and turn_prompt_count >= 1
+        and ended_turns == turn_prompt_count
+    )
+    session_identity_valid = session_identity_valid and metadata_count == 1
+    observed_valid = usage_valid and session_identity_valid
     complete = (
-        valid
+        observed_valid
+        and request_ledger_valid
+        and turn_ledger_valid
         and bool(events)
-        and ended_turns == len(events)
         and prompt_tokens + totals["output"] > 0
     )
     observed = (
         not complete
-        and valid
+        and observed_valid
+        and not unexpected_usage
+        and duplicate_count == 0
         and bool(events)
         and prompt_tokens + totals["output"] > 0
     )
-    timed_complete = complete and all(event["occurred_at"] for event in events)
+    timed_complete = complete
     return {
         "schema": "dradar-subscription-provider-usage-v1",
         "provider": "kimi-code",
         "model": "k3",
         "complete": complete,
         "request_count": len(events),
+        "session_usage_model_request_count": model_request_count,
+        "session_usage_request_attempt_count": request_attempt_count,
+        "session_usage_request_retry_count": request_retry_count,
         "completed_turn_count": ended_turns,
+        "turn_prompt_count": turn_prompt_count,
         "n_input_tokens": prompt_tokens,
         "n_cache_tokens": totals["inputCacheRead"],
         "n_output_tokens": totals["output"],
@@ -209,6 +354,13 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
         "request_usage_complete": complete,
         "request_usage_observed": complete or observed,
         "timed_usage_complete": timed_complete,
+        "request_ledger_duplicate_count": duplicate_count,
+        "request_ledger_source": "kimi-code-0.36.1-main-wire-v1",
+        "provider_actual_cost_observed": False,
+        "cost_semantics": (
+            "api_equivalent_from_complete_tokens" if complete
+            else "unavailable_incomplete_tokens"
+        ),
         "usage_incomplete_reason": (
             None if complete else
             "turn_completion_ledger_mismatch" if observed else
@@ -630,9 +782,14 @@ class KimiCode(BaseInstalledAgent):
         if assistant_calls == 0:
             return
         try:
-            wire_lines = session_log_path.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
+            if session_log_path.stat().st_size > _MAX_USAGE_WIRE_BYTES:
+                wire_lines = []
+            else:
+                wire_lines = session_log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if len(wire_lines) > _MAX_USAGE_WIRE_RECORDS:
+                    wire_lines = []
         except OSError:
             wire_lines = []
         wire_records = []

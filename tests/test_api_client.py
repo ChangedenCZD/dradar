@@ -11,6 +11,10 @@ import pytest
 from dradar import __version__
 from dradar.api_client import ApiClient, ApiError
 from dradar.providers import DEEPSEEK_CAPABILITY
+from dradar.submission_intent import (
+    UPLOAD_INTENT_VERSION,
+    submission_payload_sha256,
+)
 
 
 def _client(handler, token="drt_test"):
@@ -142,6 +146,46 @@ def test_multipart_submission_can_retry_after_429(tmp_path):
     assert ack["submission_id"] == "s1"
     assert len(bodies) == 2
     assert all(b'name="patch"' in body for body in bodies)
+
+
+def test_submission_upload_intent_and_submit_share_exact_content_hash(tmp_path):
+    requests = []
+
+    def handler(request):
+        requests.append((request.url.path, request.read()))
+        if request.url.path.endswith("submission-upload-intents"):
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(
+            200, json={"submission_id": "s1", "grade_status": "pending"},
+        )
+
+    patch = tmp_path / "model.patch"
+    patch.write_bytes(b"diff --git a/x b/x\n")
+    meta = {"z": 1, "a": "值"}
+    client = _client(handler)
+    intent_id = submission_payload_sha256(
+        assignment_id="a1", session_id="session-1234",
+        resume_generation=2, outcome="completed", meta=meta,
+        patch=patch, trajectory=None, result=None, trajectory_bundle=None,
+    )
+    registered = client.register_submission_upload_intent(
+        "a1", "nonce", "session-1234", 2, intent_id,
+    )
+    assert registered == intent_id
+    client.submit(
+        "a1", "nonce", patch, None, None, meta,
+        resume_generation=2, upload_intent_id=intent_id,
+    )
+
+    intent_form = urllib.parse.parse_qs(requests[0][1].decode())
+    assert requests[0][0] == "/api/v1/submission-upload-intents"
+    assert intent_form["upload_intent_id"] == [intent_id]
+    assert intent_form["session_id"] == ["session-1234"]
+    assert intent_form["intent_version"] == [UPLOAD_INTENT_VERSION]
+    assert len(intent_id) == 64
+    assert requests[1][0] == "/api/v1/submissions"
+    assert intent_id.encode() in requests[1][1]
+    assert json.dumps(meta).encode() in requests[1][1]
 
 
 def test_suggest_passes_n_and_returns_cells():

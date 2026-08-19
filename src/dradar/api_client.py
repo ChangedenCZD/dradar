@@ -12,6 +12,7 @@ import httpx
 
 from . import __version__
 from .providers import advertised_capabilities, normalize_capabilities
+from .submission_intent import UPLOAD_INTENT_VERSION
 
 _RATE_LIMIT_RETRIES = 5
 _DEFAULT_RETRY_AFTER_SEC = 1.0
@@ -381,6 +382,7 @@ class ApiClient:
         outcome: str = "completed",
         resume_generation: int | None = None,
         trajectory_bundle: Path | None = None,
+        upload_intent_id: str | None = None,
     ) -> dict[str, Any]:
         files: list[tuple[str, tuple[str, bytes]]] = [
             ("patch", ("model.patch", patch.read_bytes())),
@@ -400,8 +402,32 @@ class ApiClient:
         }
         if resume_generation is not None:
             data["resume_generation"] = str(resume_generation)
+        if upload_intent_id is not None:
+            data["upload_intent_id"] = upload_intent_id
         return self._post(
             "/api/v1/submissions",
             data=data,
             files=files,
         )
+
+    def register_submission_upload_intent(
+        self,
+        assignment_id: str,
+        nonce: str,
+        session_id: str,
+        resume_generation: int,
+        upload_intent_id: str,
+    ) -> str:
+        """Precommit one exact payload before the potentially large POST."""
+        self._post(
+            "/api/v1/submission-upload-intents",
+            data={
+                "assignment_id": assignment_id,
+                "nonce": nonce,
+                "session_id": session_id,
+                "resume_generation": str(resume_generation),
+                "upload_intent_id": upload_intent_id,
+                "intent_version": UPLOAD_INTENT_VERSION,
+            },
+        )
+        return upload_intent_id
