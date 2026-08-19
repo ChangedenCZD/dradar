@@ -255,6 +255,30 @@ def test_failed_trial_reports_stopped_to_server(monkeypatch, tmp_path):
     )]
 
 
+def test_failed_trial_reports_only_structured_failure_diagnostic(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    diagnostic = {
+        "schema": "dradar-runner-failure-v1",
+        "failure_code": "trial_timeout",
+        "trial_timeout_sec": 3600,
+        "zcode_session_timeout_sec": 3660,
+    }
+
+    def always_fails(*args, **kwargs):
+        raise RunnerError("secret must remain local", failure_diagnostic=diagnostic)
+
+    monkeypatch.setattr(runloop, "run_trial", always_fails)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
+    assert runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc",
+    ) == "failed"
+    assert stopped[0][1]["failure_diagnostic"] == diagnostic
+    assert "secret" not in json.dumps(stopped[0][1])
+
+
 def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
         monkeypatch, tmp_path):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
@@ -331,3 +355,42 @@ def test_mark_stopped_surfaces_nonretryable_cleanup_failure(capsys):
     assert "could not confirm checkout cleanup" in out
     assert "assignment-2" in out
     assert "retry `dradar resume`" in out
+
+
+def test_mark_stopped_downgrades_only_diagnostic_422(capsys):
+    attempts = []
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            attempts.append((assignment_id, kwargs))
+            if len(attempts) == 1:
+                raise ApiError(
+                    "server returned 422: unsupported failure_diagnostic schema",
+                    status_code=422,
+                )
+            return {"ok": True}
+
+    assert runloop._mark_stopped_quietly(
+        Client(), "assignment-3", failure_kind="runner_failed",
+        failure_diagnostic={"schema": "dradar-runner-failure-v1"},
+    ) is True
+    assert len(attempts) == 2
+    assert "failure_diagnostic" in attempts[0][1]
+    assert "failure_diagnostic" not in attempts[1][1]
+    assert capsys.readouterr().out == ""
+
+
+def test_mark_stopped_does_not_downgrade_unrelated_422(capsys):
+    attempts = []
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            attempts.append((assignment_id, kwargs))
+            raise ApiError("server returned 422: stale fence", status_code=422)
+
+    assert runloop._mark_stopped_quietly(
+        Client(), "assignment-4", failure_kind="runner_failed",
+        failure_diagnostic={"schema": "dradar-runner-failure-v1"},
+    ) is False
+    assert len(attempts) == 1
+    assert "could not confirm checkout cleanup" in capsys.readouterr().out
