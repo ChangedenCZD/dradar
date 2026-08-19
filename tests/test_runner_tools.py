@@ -503,12 +503,15 @@ from dradar.runner import _normalize_utf16_patch, _verify_dsh_artifact_binding
 
 
 def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
+               trajectory_payload=None, runtime_diagnostic=None,
+               zcode_outcome=None, provider_usage_sidecar=None,
                result=None, rc=0):
     """Stub build_pier_command + subprocess.run; the fake 'pier' lays down the
     trial-dir layout the real one would. Returns a dict capturing job_name."""
     captured = {}
 
-    def fake_build(assignment, tasks_root, jobs_dir, job_name, home, dev_agent=None):
+    def fake_build(assignment, tasks_root, jobs_dir, job_name, home,
+                   dev_agent=None, **provider_kwargs):
         captured["job_name"] = job_name
         return ["pier", "run", job_name]
 
@@ -523,7 +526,26 @@ def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
             if patch:
                 (trial / "artifacts" / "model.patch").write_text("diff")
             if trajectory:
-                (trial / "agent" / "trajectory.json").write_text("[]")
+                payload = (
+                    trajectory_payload
+                    if trajectory_payload is not None
+                    else []
+                )
+                (trial / "agent" / "trajectory.json").write_text(
+                    json.dumps(payload)
+                )
+            if runtime_diagnostic is not None:
+                (trial / "agent" / "zcode-runtime-diagnostic.json").write_text(
+                    json.dumps(runtime_diagnostic)
+                )
+            if zcode_outcome is not None:
+                (trial / "agent" / "zcode-outcome.json").write_text(
+                    json.dumps(zcode_outcome)
+                )
+            if provider_usage_sidecar is not None:
+                (trial / "agent" / "provider-usage.json").write_text(
+                    json.dumps(provider_usage_sidecar)
+                )
             if result is not None:
                 (trial / "result.json").write_text(json.dumps(result))
             self.returncode = rc
@@ -702,6 +724,268 @@ def test_run_trial_missing_patch_raises(tmp_path, monkeypatch):
     _fake_pier(monkeypatch, tmp_path, patch=False)
     with pytest.raises(RunnerError, match="model.patch missing"):
         run_trial(_assignment("codex"), tmp_path, tmp_path)
+
+
+def _zcode_assignment_for_trial():
+    return _assignment(
+        runner_mod.ZCODE_AGENT,
+        model=runner_mod.ZCODE_MODEL,
+        effort="max",
+    ) | {
+        "provider": runner_mod.ZCODE_PROVIDER,
+        "agent_version": runner_mod.ZCODE_CLI_VERSION,
+        "est_minutes": 30,
+    }
+
+
+def _prepare_fake_zcode(monkeypatch, tmp_path):
+    cli = tmp_path / "zcode.cjs"
+    cli.write_text("pinned", encoding="utf-8")
+    key = tmp_path / "zcode-key"
+    key.write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(runner_mod, "_validated_zcode_cli_path", lambda: cli)
+    monkeypatch.setattr(
+        runner_mod, "create_zcode_api_key_file", lambda _work_dir: key,
+    )
+
+
+def test_zcode_terminal_reader_rejects_oversized_json_without_loading_it(
+        tmp_path):
+    oversized = tmp_path / "oversized.json"
+    with oversized.open("wb") as stream:
+        stream.truncate(runner_mod._ZCODE_TERMINAL_ARTIFACT_MAX_BYTES + 1)
+
+    assert runner_mod._read_capped_json_object(
+        oversized, runner_mod._ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
+    ) == {}
+
+
+def test_run_trial_rejects_real_zcode_model_error_rc0_signature(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={
+            "agent_result": {
+                "n_agent_steps": 72,
+                "metadata": {"provider_usage": {
+                    "schema": "dradar-subscription-provider-usage-v1",
+                    "provider": "zcode",
+                    "model": runner_mod.ZCODE_MODEL,
+                    "complete": False,
+                    "request_count": 0,
+                    "request_usage_complete": False,
+                    "session_usage_model_request_count": 134,
+                    "usage_incomplete_reason":
+                        "provider_aggregate_missing_or_invalid",
+                }},
+            },
+        },
+        trajectory_payload={
+            "steps": [
+                {"source": "user", "message": "task"},
+                {"source": "agent", "message": "unfinished work"},
+            ],
+            "final_metrics": {
+                "extra": {
+                    "model_error_count": 1,
+                    "session_usage_model_request_count": 134,
+                    "model_request_count": 0,
+                },
+            },
+        },
+        zcode_outcome={
+            "schema": "dradar-zcode-outcome-v1",
+            "sessionId": "sess_real_signature",
+            "state": {"projection": {"status": "idle", "turnCount": 73}},
+            "usage": {"modelErrorCount": 1, "modelRequestCount": 134},
+            "events": {"events": []},
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": False,
+            "request_count": 0,
+            "request_usage_complete": False,
+            "model_error_count": 1,
+        },
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "idle",
+            "turn_count": 73,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    with pytest.raises(
+        RunnerError, match="provider_model_error",
+    ) as exc:
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+    assert exc.value.failure_diagnostic == {
+        "schema": "dradar-runner-failure-v1",
+        "failure_code": "agent_no_artifact",
+        "trial_timeout_sec": runner_mod.BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC,
+        "zcode_session_timeout_sec":
+            runner_mod.BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC + 60,
+        "est_minutes": 30.0,
+        "zcode_last_status": "idle",
+        "zcode_turn_count": 73,
+        "zcode_seen_running": True,
+        "zcode_terminal_observed": True,
+    }
+
+
+def test_run_trial_rejects_zcode_rc0_without_meaningful_agent_result(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        trajectory=False,
+        result={
+            "agent_result": {
+                "n_agent_steps": None,
+                "metadata": None,
+                "n_input_tokens": None,
+                "n_output_tokens": None,
+            },
+            "exception_info": None,
+        },
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "idle",
+            "turn_count": 1,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    with pytest.raises(RunnerError, match="empty_agent_result"):
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+
+def test_run_trial_accepts_recovered_zcode_model_error_with_valid_patch(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={
+            "agent_result": {
+                "n_agent_steps": 18,
+                "metadata": {"provider_usage": {
+                    "schema": "dradar-subscription-provider-usage-v1",
+                    "provider": "zcode",
+                    "model": runner_mod.ZCODE_MODEL,
+                    "complete": True,
+                    "request_count": 25,
+                    "request_usage_complete": True,
+                    "request_usage_observed": True,
+                    "usage_evidence_tier": "complete_reconciled",
+                    "n_input_tokens": 100_000,
+                    "n_cache_tokens": 80_000,
+                    "n_output_tokens": 5_000,
+                }},
+            },
+        },
+        trajectory_payload={
+            "steps": [{"source": "agent", "message": "completed patch"}],
+            "final_metrics": {"extra": {"model_error_count": 1}},
+        },
+        zcode_outcome={
+            "schema": "dradar-zcode-outcome-v1",
+            "sessionId": "sess_valid_patch",
+            "state": {"projection": {"status": "idle", "turnCount": 18}},
+            "usage": {"modelErrorCount": 1, "modelRequestCount": 25},
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": True,
+            "request_count": 25,
+            "request_usage_complete": True,
+            "request_usage_observed": True,
+            "usage_evidence_tier": "complete_reconciled",
+            "model_error_count": 1,
+        },
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "idle",
+            "turn_count": 18,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    artifact = run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+    assert artifact.returncode == 0
+    assert artifact.patch.read_text(encoding="utf-8") == "diff"
+    assert summarize_result(artifact.result)["n_agent_steps"] == 18
+
+
+def test_run_trial_keeps_zcode_patch_gradeable_when_only_usage_is_incomplete(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={
+            "agent_result": {
+                "n_agent_steps": 12,
+                "metadata": {"provider_usage": {
+                    "schema": "dradar-subscription-provider-usage-v1",
+                    "provider": "zcode",
+                    "model": runner_mod.ZCODE_MODEL,
+                    "complete": False,
+                    "request_count": 0,
+                    "request_usage_complete": False,
+                    "usage_incomplete_reason":
+                        "provider_aggregate_missing_or_invalid",
+                }},
+            },
+        },
+        trajectory_payload={
+            "steps": [{"source": "agent", "message": "completed patch"}],
+            "final_metrics": {"extra": {"model_error_count": 0}},
+        },
+        zcode_outcome={
+            "schema": "dradar-zcode-outcome-v1",
+            "sessionId": "sess_usage_only",
+            "state": {"projection": {"status": "idle", "turnCount": 12}},
+            "usage": {"modelErrorCount": 0, "modelRequestCount": 12},
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": False,
+            "request_count": 0,
+            "request_usage_complete": False,
+            "model_error_count": 0,
+        },
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "idle",
+            "turn_count": 12,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    artifact = run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+    assert artifact.returncode == 0
+    assert artifact.patch.is_file()
 
 
 def _fake_completed_checkpoint_pier(
