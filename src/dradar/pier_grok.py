@@ -65,6 +65,23 @@ def _grok_model_preflight_command(remote_cli: str) -> str:
     )
 
 
+def _grok_prompt_command(
+    remote_cli: str, flags: list[str], instruction: str, stream: str,
+) -> str:
+    """Build an option-safe Grok invocation for an arbitrary task prompt.
+
+    Grok accepts the prompt as a positional argument.  Put every trusted
+    adapter flag before ``--`` and the complete untrusted benchmark prompt
+    after it so a leading dash can never be parsed as another CLI option.
+    """
+
+    cli = " ".join(shlex.quote(part) for part in flags)
+    return (
+        f"{shlex.quote(remote_cli)} {cli} -- {shlex.quote(instruction)} "
+        f"2>&1 </dev/null | tee {shlex.quote(stream)}"
+    )
+
+
 def _grok_usage_facts(events: list[dict]) -> dict:
     """Cross-check Grok's official per-response and terminal token ledgers."""
 
@@ -420,12 +437,7 @@ class GrokBuild(BaseInstalledAgent):
             "--deny", "Bash(*GROK_HOME*)",
             "--deny", f"Bash(*{remote_user_home}*)",
         ]
-        cli = " ".join(shlex.quote(part) for part in flags)
-        command = (
-            f"{shlex.quote(remote_cli)} -p {shlex.quote(instruction)} "
-            f"{cli} 2>&1 </dev/null | "
-            f"tee {shlex.quote(stream)}"
-        )
+        command = _grok_prompt_command(remote_cli, flags, instruction, stream)
         try:
             await self.exec_as_agent(environment, command=command, env=env)
         finally:

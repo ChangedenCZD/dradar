@@ -41,6 +41,8 @@ from .providers import (
     DSH_RUN_CONFIG_VERSION,
     DSH_RUNTIME_PROFILE,
     GROK_AGENT,
+    GROK_MODEL,
+    GROK_PROVIDER,
     GROK_RUN_CONFIG_VERSION,
     GROK_RUNTIME_PROFILE,
     KIMI_AGENT,
@@ -975,6 +977,161 @@ def _dsh_completed_outcome(
     }
 
 
+def _grok_completed_outcome(
+    assignment: dict, trial_dir: Path, patch: Path, result: Path | None,
+) -> dict | None:
+    """Return strict Grok completion evidence after a nonzero outer rc.
+
+    Grok's adapter writes three independent views before Pier post-processing:
+    the task result, an ATIF trajectory, and the reconciled provider ledger.
+    Require all three to agree with the leased identity and the harvested diff;
+    a nonzero rc by itself is never evidence that paid work completed.
+    """
+
+    if (
+        assignment.get("agent") != GROK_AGENT
+        or assignment.get("provider") != GROK_PROVIDER
+        or assignment.get("model") != GROK_MODEL
+    ):
+        return None
+    trajectory_path = trial_dir / "agent" / "trajectory.json"
+    try:
+        result_value = json.loads(result.read_text(encoding="utf-8")) if result else None
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        patch_bytes = patch.read_bytes()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(result_value, dict) or not isinstance(trajectory, dict):
+        return None
+
+    def parse_instant(value: object) -> datetime | None:
+        try:
+            instant = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return instant if instant.tzinfo is not None else None
+
+    overall_start = parse_instant(result_value.get("started_at"))
+    overall_finish = parse_instant(result_value.get("finished_at"))
+    phases = []
+    for name in ("environment_setup", "agent_setup", "agent_execution"):
+        phase = result_value.get(name)
+        if not isinstance(phase, dict):
+            return None
+        started = parse_instant(phase.get("started_at"))
+        finished = parse_instant(phase.get("finished_at"))
+        if started is None or finished is None or finished < started:
+            return None
+        phases.append((started, finished))
+    if (
+        result_value.get("exception_info")
+        or overall_start is None
+        or overall_finish is None
+        or overall_finish < overall_start
+        or phases[0][0] < overall_start
+        or any(phases[index][0] < phases[index - 1][1] for index in range(1, 3))
+        or phases[-1][1] > overall_finish
+        or not patch_bytes
+        or not patch_structure_is_valid(patch_bytes)
+        or scan_secrets(patch_bytes)
+    ):
+        return None
+
+    expected_version = assignment.get("agent_version")
+    agent = trajectory.get("agent")
+    agent_extra = agent.get("extra") if isinstance(agent, dict) else None
+    steps = trajectory.get("steps")
+    metrics = trajectory.get("final_metrics")
+    if (
+        trajectory.get("schema_version") != "ATIF-v1.7"
+        or not isinstance(trajectory.get("session_id"), str)
+        or not trajectory["session_id"]
+        or not isinstance(agent, dict)
+        or agent.get("name") != GROK_AGENT
+        or agent.get("model_name") != assignment["model"]
+        or not isinstance(expected_version, str)
+        or not expected_version
+        or agent.get("version") != expected_version
+        or not isinstance(agent_extra, dict)
+        or agent_extra.get("provider") != assignment["provider"]
+        or agent_extra.get("oauth") is not True
+        or not isinstance(steps, list)
+        or not steps
+        or not isinstance(metrics, dict)
+    ):
+        return None
+    for index, step in enumerate(steps, start=1):
+        if (
+            not isinstance(step, dict)
+            or step.get("step_id") != index
+            or step.get("source") not in {"agent", "user"}
+            or not isinstance(step.get("message"), str)
+            or not step["message"]
+        ):
+            return None
+        if step["source"] == "agent" and (
+            step.get("model_name") != assignment["model"]
+            or step.get("reasoning_effort") != assignment.get("effort")
+            or step.get("llm_call_count") != 1
+        ):
+            return None
+    if not any(step["source"] == "agent" for step in steps):
+        return None
+
+    usage = _subscription_trial_usage(
+        trial_dir, {"grok_cli_version": expected_version},
+    )
+    names = ("n_input_tokens", "n_cache_tokens", "n_output_tokens")
+    metric_names = {
+        "n_input_tokens": "total_prompt_tokens",
+        "n_cache_tokens": "total_cached_tokens",
+        "n_output_tokens": "total_completion_tokens",
+    }
+    agent_result = result_value.get("agent_result")
+    embedded_usage = (
+        (agent_result.get("metadata") or {}).get("provider_usage")
+        if isinstance(agent_result, dict) else None
+    )
+    if (
+        usage is None
+        or usage.get("schema") != "dradar-subscription-provider-usage-v1"
+        or usage.get("provider") != "grok"
+        or usage.get("model") != assignment["model"]
+        or usage.get("complete") is not True
+        or usage.get("request_usage_complete") is not True
+        or usage.get("request_usage_observed") is not True
+        or not isinstance(usage.get("request_count"), int)
+        or isinstance(usage.get("request_count"), bool)
+        or usage["request_count"] < 1
+        or metrics.get("total_steps") != len(steps)
+        or not isinstance(agent_result, dict)
+        or agent_result.get("n_agent_steps") != len(steps)
+        or not isinstance(embedded_usage, dict)
+        or any(
+            metrics.get(metric_names[name]) != usage.get(name)
+            or agent_result.get(name) != usage.get(name)
+            or embedded_usage.get(name) != usage.get(name)
+            for name in names
+        )
+        or embedded_usage.get("schema") != usage.get("schema")
+        or embedded_usage.get("provider") != usage.get("provider")
+        or embedded_usage.get("model") != usage.get("model")
+        or embedded_usage.get("complete") is not True
+        or embedded_usage.get("request_count") != usage.get("request_count")
+    ):
+        return None
+    return {
+        "schema": "dradar-grok-completion-v1",
+        "provider": usage["provider"],
+        "model": usage["model"],
+        "agent_version": expected_version,
+        "trajectory_schema": trajectory["schema_version"],
+        "session_id": trajectory["session_id"],
+        "request_count": usage["request_count"],
+        "n_agent_steps": len(steps),
+    }
+
+
 def _bundled_completed_outcome(
     assignment: dict, trial_dir: Path, patch: Path, result: Path | None,
 ) -> dict | None:
@@ -1783,16 +1940,26 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         dsh_completion = _dsh_completed_outcome(
             art.trial_dir, art.patch, art.result,
         )
+    grok_completion = None
+    if (
+        assignment.get("agent") == GROK_AGENT
+        and art.returncode != 0
+        and not stats.get("exception_info")
+    ):
+        grok_completion = _grok_completed_outcome(
+            assignment, art.trial_dir, art.patch, art.result,
+        )
     bundled_completion = None
     if (
         art.returncode != 0
         and not stats.get("exception_info")
         and dsh_completion is None
+        and grok_completion is None
     ):
         bundled_completion = _bundled_completed_outcome(
             assignment, art.trial_dir, art.patch, art.result,
         )
-    postrun_completion = dsh_completion or bundled_completion
+    postrun_completion = dsh_completion or grok_completion or bundled_completion
     interrupted = bool(stats.get("exception_info")) or (
         art.returncode != 0 and postrun_completion is None
     )
@@ -1873,6 +2040,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             ),
             "subscription_oauth_coordination": "native-shared-lock-v1",
         })
+        if grok_completion is not None:
+            meta.update({
+                "grok_completion_evidence": grok_completion,
+                "pier_postrun_warning": True,
+                "pier_failure_phase": "post_agent",
+            })
     if assignment.get("agent") == KIMI_AGENT:
         meta.update({
             "model_config_version": KIMI_RUN_CONFIG_VERSION,

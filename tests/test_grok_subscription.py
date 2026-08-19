@@ -257,6 +257,44 @@ def test_grok_model_preflight_emits_only_bounded_failure_category(
     assert "token.example" not in proc.stdout + proc.stderr
 
 
+def test_grok_prompt_is_positional_after_option_terminator(
+    tmp_path: Path,
+) -> None:
+    source = Path(providers.__file__).with_name("pier_grok.py").read_text()
+    module = ast.parse(source)
+    helper = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_grok_prompt_command"
+    )
+    namespace = {"shlex": shlex}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "pier_grok.py", "exec"),
+         namespace)
+    fake = tmp_path / "grok fake"
+    fake.write_text(
+        "#!/bin/sh\nprintf '%s\\0' \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o700)
+    stream = tmp_path / "stream file"
+    instruction = "- first bullet\nquote: 'single' and \"double\""
+    flags = ["--model", "grok-4.6", "--reasoning-effort", "xhigh"]
+
+    command = namespace["_grok_prompt_command"](
+        str(fake), flags, instruction, str(stream),
+    )
+    proc = subprocess.run(
+        ["bash", "-o", "pipefail", "-c", command],
+        capture_output=True, check=False,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.split(b"\0")[:-1] == [
+        part.encode() for part in [*flags, "--", instruction]
+    ]
+    assert stream.read_bytes() == proc.stdout
+
+
 def test_grok_usage_keeps_cached_input_as_prompt_subset() -> None:
     source = Path(providers.__file__).with_name("pier_grok.py").read_text()
     module = ast.parse(source)
