@@ -2368,6 +2368,109 @@ def _zcode_failure_diagnostic(
     return diagnostic
 
 
+def _read_json_object(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _zcode_false_success_reason(
+    result_path: Path | None,
+    trajectory_path: Path | None,
+    outcome_path: Path | None,
+    runtime_diagnostic: dict[str, object],
+) -> str | None:
+    """Recognize only hard ZCode rc=0 false-success evidence.
+
+    ZCode can return to ``idle`` with process status zero after the provider
+    reports a model error.  Pier then writes a syntactically valid result even
+    though there is no completed provider turn to account for and, in the
+    follow-on failure mode, no agent output at all.  Such a result must keep
+    the assignment retryable instead of being uploaded as an ordinary model
+    answer.
+
+    Incomplete token telemetry alone is deliberately *not* a failure: the
+    accounting path already fails closed, and a real patch must still be
+    gradeable when the provider merely omitted usage.  A positive provider
+    model-error counter is different: it is a hard terminal failure even when
+    ZCode returns process status zero.
+    """
+    result = _read_json_object(result_path)
+    agent_result = result.get("agent_result")
+    if not isinstance(agent_result, dict):
+        agent_result = {}
+    metadata = agent_result.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    provider_usage = metadata.get("provider_usage")
+    if not isinstance(provider_usage, dict):
+        provider_usage = {}
+
+    request_count = provider_usage.get("request_count")
+    provider_terminal = (
+        provider_usage.get("schema") == "dradar-subscription-provider-usage-v1"
+        and provider_usage.get("provider") == "zcode"
+        and provider_usage.get("model") == ZCODE_MODEL
+        and provider_usage.get("complete") is True
+        and provider_usage.get("request_usage_complete") is True
+        and isinstance(request_count, int)
+        and not isinstance(request_count, bool)
+        and request_count > 0
+    )
+
+    outcome = _read_json_object(outcome_path)
+    raw_usage = outcome.get("usage")
+    if not isinstance(raw_usage, dict):
+        raw_usage = {}
+    trajectory = _read_json_object(trajectory_path)
+    metrics = trajectory.get("final_metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    extra = metrics.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    model_error_count = raw_usage.get(
+        "modelErrorCount", extra.get("model_error_count")
+    )
+    explicit_model_error = (
+        isinstance(model_error_count, int)
+        and not isinstance(model_error_count, bool)
+        and model_error_count > 0
+    )
+
+    steps = agent_result.get("n_agent_steps")
+    meaningful_agent_result = (
+        isinstance(steps, int)
+        and not isinstance(steps, bool)
+        and steps > 0
+    )
+    if not meaningful_agent_result:
+        trajectory_steps = trajectory.get("steps")
+        meaningful_agent_result = (
+            isinstance(trajectory_steps, list)
+            and any(
+                isinstance(step, dict)
+                and step.get("source") in {"agent", "assistant"}
+                and isinstance(step.get("message"), str)
+                and bool(step["message"].strip())
+                for step in trajectory_steps
+            )
+        )
+
+    status = runtime_diagnostic.get("zcode_last_status")
+    if status in {"error", "failed", "stopped"}:
+        return "terminal_status"
+    if explicit_model_error:
+        return "provider_model_error"
+    if not meaningful_agent_result and not provider_terminal:
+        return "empty_agent_result"
+    return None
+
+
 @contextmanager
 def _dsh_tasks_overlay(
     assignment: dict,
@@ -2796,6 +2899,27 @@ def run_trial(
                 "agent_no_artifact",
             ),
         )
+    if effective_agent == ZCODE_AGENT and proc.returncode == 0:
+        runtime_diagnostic = _zcode_runtime_diagnostic(jobs_dir, job_name)
+        false_success_reason = _zcode_false_success_reason(
+            result,
+            trajectory,
+            trial_dir / "agent" / "zcode-outcome.json",
+            runtime_diagnostic,
+        )
+        if false_success_reason is not None:
+            raise RunnerError(
+                "ZCode returned process status 0 without a gradeable terminal "
+                f"result ({false_success_reason}); local artifacts were kept "
+                "and the assignment remains retryable",
+                failure_diagnostic=_zcode_failure_diagnostic(
+                    effective_assignment,
+                    tasks_root / assignment["task_id"],
+                    jobs_dir,
+                    job_name,
+                    "agent_no_artifact",
+                ),
+            )
     returncode = proc.returncode
     if terminal_error is not None and returncode in (None, 0):
         # A TERM-aware Pier may exit cleanly after a DRadar watchdog fired.
