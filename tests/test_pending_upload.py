@@ -78,11 +78,23 @@ class FakeClient:
         self.behavior = behavior  # callable(assignment_id) -> dict | raises ApiError
         self.calls = []
         self.stopped = []
+        self.intent_calls = []
 
     def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
-               outcome="completed", resume_generation=None):
+               outcome="completed", resume_generation=None,
+               upload_intent_id=None):
         self.calls.append(assignment_id)
+        self.last_upload_intent_id = upload_intent_id
         return self.behavior(assignment_id)
+
+    def register_submission_upload_intent(
+        self, assignment_id, nonce, session_id, resume_generation,
+        upload_intent_id,
+    ):
+        self.intent_calls.append((
+            assignment_id, session_id, resume_generation, upload_intent_id,
+        ))
+        return upload_intent_id
 
     def checkpoint_discard(self, assignment_id, checkpoint_id,
                            resume_generation, reason):
@@ -116,6 +128,70 @@ def test_upload_success_clears_ledger(tmp_path: Path, monkeypatch):
     outcome = runloop._upload_trial(client, _entry(trial_dir, meta={"k": "v"}))
     assert outcome == "submitted"
     assert pending.load(tmp_path) == []
+
+
+def test_session_bound_upload_registers_intent_before_submit(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    client = FakeClient(
+        lambda _aid: {"submission_id": "s1", "grade_status": "pending"},
+    )
+    outcome = runloop._upload_trial(
+        client,
+        _entry(
+            trial_dir,
+            resume_generation=3,
+            runner_session_id="session-1234",
+        ),
+    )
+    assert outcome == "submitted"
+    assert client.intent_calls[0][:3] == ("a1", "session-1234", 3)
+    assert client.calls == ["a1"]
+    assert client.last_upload_intent_id == client.intent_calls[0][3]
+    assert len(client.last_upload_intent_id) == 64
+
+
+def test_intent_registration_conflict_keeps_artifact_without_submit(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    class StaleIntentClient(FakeClient):
+        def register_submission_upload_intent(self, *_args, **_kwargs):
+            raise ApiError(
+                "server returned 409: stale recovery generation",
+                status_code=409,
+            )
+
+    client = StaleIntentClient(lambda _aid: pytest.fail("must not submit"))
+    outcome = runloop._upload_trial(
+        client, _entry(trial_dir, runner_session_id="session-1234"),
+    )
+    assert outcome == "upload-failed"
+    assert client.calls == []
+    assert pending.load(tmp_path)[0]["runner_session_id"] == "session-1234"
+
+
+def test_old_server_without_intent_endpoint_keeps_legacy_submit_compatibility(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    class OldServerClient(FakeClient):
+        def register_submission_upload_intent(self, *_args, **_kwargs):
+            raise ApiError("server returned 404: not found", status_code=404)
+
+    client = OldServerClient(
+        lambda _aid: {"submission_id": "s1", "grade_status": "pending"},
+    )
+    assert runloop._upload_trial(
+        client, _entry(trial_dir, runner_session_id="session-1234"),
+    ) == "submitted"
+    assert client.last_upload_intent_id is None
 
 
 def test_opted_in_session_archive_runs_after_ack_before_job_cleanup(
@@ -317,7 +393,7 @@ def test_upload_replaces_single_session_cost_and_sends_verified_bundle(
     assert outcome == "submitted"
 
 
-def test_upload_sends_kimi_audit_bundle_without_overriding_result_tokens(
+def test_upload_uses_reconciled_kimi_provider_usage_with_audit_bundle(
     tmp_path: Path, monkeypatch,
 ):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
@@ -337,13 +413,47 @@ def test_upload_sends_kimi_audit_bundle_without_overriding_result_tokens(
     monkeypatch.setattr(
         runloop, "build_kimi_trajectory_bundle", lambda _path: bundle,
     )
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "provider-usage.json").write_text(json.dumps({
+        "schema": "dradar-subscription-provider-usage-v1",
+        "provider": "kimi-code",
+        "model": "k3",
+        "complete": True,
+        "request_count": 1,
+        "session_usage_model_request_count": 1,
+        "completed_turn_count": 1,
+        "turn_prompt_count": 1,
+        "n_input_tokens": 300,
+        "n_cache_tokens": 200,
+        "n_output_tokens": 21,
+        "request_usage_complete": True,
+        "request_usage_observed": True,
+        "usage_evidence_tier": "complete_reconciled",
+        "timed_usage_complete": True,
+        "request_ledger_duplicate_count": 0,
+        "request_ledger_source": "kimi-code-0.36.1-main-wire-v1",
+        "token_usage_events": [{
+            "occurred_at": "2026-08-20T00:00:00Z",
+            "n_input_tokens": 300,
+            "n_cache_tokens": 200,
+            "n_output_tokens": 21,
+        }],
+    }))
 
     class CaptureClient(FakeClient):
         def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
                    outcome="completed", resume_generation=None,
                    trajectory_bundle=None):
-            assert meta["n_output_tokens"] == 321
-            assert "usage_aggregation" not in meta
+            assert meta["n_output_tokens"] == 21
+            assert meta["usage_aggregation_complete"] is True
+            assert meta["session_usage_model_request_count"] == 1
+            assert meta["completed_turn_count"] == 1
+            assert meta["turn_prompt_count"] == 1
+            assert meta["request_ledger_duplicate_count"] == 0
+            assert meta["request_ledger_source"] == (
+                "kimi-code-0.36.1-main-wire-v1"
+            )
             assert trajectory_bundle is not None
             uploaded = json.loads(trajectory_bundle.read_text())
             assert uploaded["schema_version"] == bundle["schema_version"]
@@ -352,9 +462,62 @@ def test_upload_sends_kimi_audit_bundle_without_overriding_result_tokens(
 
     outcome = runloop._upload_trial(
         CaptureClient(lambda _aid: None),
-        _entry(trial_dir, meta={"n_output_tokens": 321}),
+        _entry(trial_dir, meta={
+            "n_output_tokens": 321,
+            "kimi_cli_version": "0.36.1",
+        }),
     )
     assert outcome == "submitted"
+
+
+def test_incomplete_kimi_usage_keeps_tokens_and_cost_unavailable(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "provider-usage.json").write_text(json.dumps({
+        "schema": "dradar-subscription-provider-usage-v1",
+        "provider": "kimi-code",
+        "model": "k3",
+        "complete": False,
+        "request_count": 1,
+        "n_input_tokens": 300,
+        "n_cache_tokens": 200,
+        "n_output_tokens": 21,
+        "request_usage_complete": False,
+        "request_usage_observed": True,
+        "usage_evidence_tier": "observed_unreconciled",
+        "usage_incomplete_reason": "turn_completion_ledger_mismatch",
+        "timed_usage_complete": False,
+        "provider_actual_cost_observed": False,
+        "cost_semantics": "unavailable_incomplete_tokens",
+        "token_usage_events": [{
+            "occurred_at": "2026-08-20T00:00:00Z",
+            "n_input_tokens": 300,
+            "n_cache_tokens": 200,
+            "n_output_tokens": 21,
+        }],
+    }))
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert meta["usage_aggregation_complete"] is False
+            assert meta["n_input_tokens"] is None
+            assert meta["n_cache_tokens"] is None
+            assert meta["n_output_tokens"] is None
+            assert meta["cost_usd"] is None
+            assert meta["provider_actual_cost_observed"] is False
+            assert meta["cost_semantics"] == "unavailable_incomplete_tokens"
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    assert runloop._upload_trial(
+        CaptureClient(lambda _aid: None),
+        _entry(trial_dir, meta={"kimi_cli_version": "0.36.1"}),
+    ) == "submitted"
 
 
 def test_upload_suppresses_cost_when_any_subagent_usage_is_missing(
@@ -832,6 +995,58 @@ def test_crash_mid_submit_leaves_a_ledger_entry(tmp_path: Path, monkeypatch):
     assert Path(entries[0]["patch_source_path"]).is_file()
 
 
+def test_response_loss_restart_reuses_intent_and_clears_already_submitted(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    def disconnect(_aid):
+        raise ApiError("Server disconnected", status_code=None)
+
+    first = FakeClient(disconnect)
+    entry = _entry(
+        trial_dir,
+        resume_generation=0,
+        runner_session_id="session-1234",
+    )
+    assert runloop._upload_trial(first, entry) == "upload-failed"
+    persisted = pending.load(tmp_path)
+    assert len(persisted) == 1
+    saved = persisted[0]["upload_intent"]
+    assert saved["id"] == first.intent_calls[0][3]
+    assert saved["manifest"]["session_id"] == "session-1234"
+
+    def already_submitted(_aid):
+        raise ApiError(
+            "server returned 409: already submitted", status_code=409,
+        )
+
+    restarted = FakeClient(already_submitted)
+    assert runloop._upload_trial(restarted, persisted[0]) == "submitted"
+    assert restarted.intent_calls[0][3] == saved["id"]
+    assert restarted.last_upload_intent_id == saved["id"]
+    assert pending.load(tmp_path) == []
+
+
+def test_saved_intent_rejects_changed_prepared_meta(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    def disconnect(_aid):
+        raise ApiError("Server disconnected", status_code=None)
+
+    first = FakeClient(disconnect)
+    assert runloop._upload_trial(first, _entry(
+        trial_dir, runner_session_id="session-1234",
+    )) == "upload-failed"
+    changed = pending.load(tmp_path)[0]
+    changed["meta"] = {"changed_after_intent": True}
+    second = FakeClient(lambda _aid: pytest.fail("must not submit changed body"))
+    assert runloop._upload_trial(second, changed) == "upload-failed"
+    assert second.intent_calls == []
+
+
 def test_successful_submit_leaves_no_pre_recorded_entry_behind(tmp_path: Path, monkeypatch):
     # Negative control for record-before-submit: on success the pre-recorded
     # entry must be removed, not linger and get re-uploaded on the next go.
@@ -1115,8 +1330,8 @@ def test_oversized_projected_request_omits_bundle_before_submit(
     # Keep the test fixture tiny while exercising the production size-budget
     # branch: the patch + framing fit, but adding the bundle does not.
     monkeypatch.setattr(
-        runloop, "_UPLOAD_BODY_BUDGET_BYTES",
-        runloop._MULTIPART_OVERHEAD_BUDGET_BYTES + 200,
+            runloop, "_UPLOAD_BODY_BUDGET_BYTES",
+            runloop._MULTIPART_OVERHEAD_BUDGET_BYTES + 2_000,
     )
     trial_dir = _make_trial_dir(tmp_path)
     sessions = trial_dir / "agent" / "sessions"
@@ -1135,6 +1350,21 @@ def test_oversized_projected_request_omits_bundle_before_submit(
     assert client.calls == [False]
     assert pending.load(tmp_path) == []
     assert "omitting the optional trajectory bundle" in capsys.readouterr().out
+
+
+def test_required_upload_body_is_capped_even_without_bundle(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        runloop, "_UPLOAD_BODY_BUDGET_BYTES",
+        runloop._MULTIPART_OVERHEAD_BUDGET_BYTES + 1,
+    )
+    trial_dir = _make_trial_dir(tmp_path)
+    client = FakeClient(lambda _aid: pytest.fail("oversized body must not submit"))
+    assert runloop._upload_trial(client, _entry(trial_dir)) == "upload-failed"
+    assert client.calls == []
+    assert len(pending.load(tmp_path)) == 1
 
 
 def test_bundle_edge_413_retries_once_without_optional_bundle(

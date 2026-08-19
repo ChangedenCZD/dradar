@@ -41,6 +41,8 @@ from .providers import (
     DSH_RUN_CONFIG_VERSION,
     DSH_RUNTIME_PROFILE,
     GROK_AGENT,
+    GROK_MODEL,
+    GROK_PROVIDER,
     GROK_RUN_CONFIG_VERSION,
     GROK_RUNTIME_PROFILE,
     KIMI_AGENT,
@@ -66,6 +68,7 @@ from .scrub import (
     scrub_json_bytes,
 )
 from .session_archive import archive_after_submit
+from .submission_intent import submission_payload_manifest, upload_intent_id
 from .telemetry import RunnerTelemetry
 from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
@@ -974,6 +977,161 @@ def _dsh_completed_outcome(
     }
 
 
+def _grok_completed_outcome(
+    assignment: dict, trial_dir: Path, patch: Path, result: Path | None,
+) -> dict | None:
+    """Return strict Grok completion evidence after a nonzero outer rc.
+
+    Grok's adapter writes three independent views before Pier post-processing:
+    the task result, an ATIF trajectory, and the reconciled provider ledger.
+    Require all three to agree with the leased identity and the harvested diff;
+    a nonzero rc by itself is never evidence that paid work completed.
+    """
+
+    if (
+        assignment.get("agent") != GROK_AGENT
+        or assignment.get("provider") != GROK_PROVIDER
+        or assignment.get("model") != GROK_MODEL
+    ):
+        return None
+    trajectory_path = trial_dir / "agent" / "trajectory.json"
+    try:
+        result_value = json.loads(result.read_text(encoding="utf-8")) if result else None
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        patch_bytes = patch.read_bytes()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(result_value, dict) or not isinstance(trajectory, dict):
+        return None
+
+    def parse_instant(value: object) -> datetime | None:
+        try:
+            instant = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return instant if instant.tzinfo is not None else None
+
+    overall_start = parse_instant(result_value.get("started_at"))
+    overall_finish = parse_instant(result_value.get("finished_at"))
+    phases = []
+    for name in ("environment_setup", "agent_setup", "agent_execution"):
+        phase = result_value.get(name)
+        if not isinstance(phase, dict):
+            return None
+        started = parse_instant(phase.get("started_at"))
+        finished = parse_instant(phase.get("finished_at"))
+        if started is None or finished is None or finished < started:
+            return None
+        phases.append((started, finished))
+    if (
+        result_value.get("exception_info")
+        or overall_start is None
+        or overall_finish is None
+        or overall_finish < overall_start
+        or phases[0][0] < overall_start
+        or any(phases[index][0] < phases[index - 1][1] for index in range(1, 3))
+        or phases[-1][1] > overall_finish
+        or not patch_bytes
+        or not patch_structure_is_valid(patch_bytes)
+        or scan_secrets(patch_bytes)
+    ):
+        return None
+
+    expected_version = assignment.get("agent_version")
+    agent = trajectory.get("agent")
+    agent_extra = agent.get("extra") if isinstance(agent, dict) else None
+    steps = trajectory.get("steps")
+    metrics = trajectory.get("final_metrics")
+    if (
+        trajectory.get("schema_version") != "ATIF-v1.7"
+        or not isinstance(trajectory.get("session_id"), str)
+        or not trajectory["session_id"]
+        or not isinstance(agent, dict)
+        or agent.get("name") != GROK_AGENT
+        or agent.get("model_name") != assignment["model"]
+        or not isinstance(expected_version, str)
+        or not expected_version
+        or agent.get("version") != expected_version
+        or not isinstance(agent_extra, dict)
+        or agent_extra.get("provider") != assignment["provider"]
+        or agent_extra.get("oauth") is not True
+        or not isinstance(steps, list)
+        or not steps
+        or not isinstance(metrics, dict)
+    ):
+        return None
+    for index, step in enumerate(steps, start=1):
+        if (
+            not isinstance(step, dict)
+            or step.get("step_id") != index
+            or step.get("source") not in {"agent", "user"}
+            or not isinstance(step.get("message"), str)
+            or not step["message"]
+        ):
+            return None
+        if step["source"] == "agent" and (
+            step.get("model_name") != assignment["model"]
+            or step.get("reasoning_effort") != assignment.get("effort")
+            or step.get("llm_call_count") != 1
+        ):
+            return None
+    if not any(step["source"] == "agent" for step in steps):
+        return None
+
+    usage = _subscription_trial_usage(
+        trial_dir, {"grok_cli_version": expected_version},
+    )
+    names = ("n_input_tokens", "n_cache_tokens", "n_output_tokens")
+    metric_names = {
+        "n_input_tokens": "total_prompt_tokens",
+        "n_cache_tokens": "total_cached_tokens",
+        "n_output_tokens": "total_completion_tokens",
+    }
+    agent_result = result_value.get("agent_result")
+    embedded_usage = (
+        (agent_result.get("metadata") or {}).get("provider_usage")
+        if isinstance(agent_result, dict) else None
+    )
+    if (
+        usage is None
+        or usage.get("schema") != "dradar-subscription-provider-usage-v1"
+        or usage.get("provider") != "grok"
+        or usage.get("model") != assignment["model"]
+        or usage.get("complete") is not True
+        or usage.get("request_usage_complete") is not True
+        or usage.get("request_usage_observed") is not True
+        or not isinstance(usage.get("request_count"), int)
+        or isinstance(usage.get("request_count"), bool)
+        or usage["request_count"] < 1
+        or metrics.get("total_steps") != len(steps)
+        or not isinstance(agent_result, dict)
+        or agent_result.get("n_agent_steps") != len(steps)
+        or not isinstance(embedded_usage, dict)
+        or any(
+            metrics.get(metric_names[name]) != usage.get(name)
+            or agent_result.get(name) != usage.get(name)
+            or embedded_usage.get(name) != usage.get(name)
+            for name in names
+        )
+        or embedded_usage.get("schema") != usage.get("schema")
+        or embedded_usage.get("provider") != usage.get("provider")
+        or embedded_usage.get("model") != usage.get("model")
+        or embedded_usage.get("complete") is not True
+        or embedded_usage.get("request_count") != usage.get("request_count")
+    ):
+        return None
+    return {
+        "schema": "dradar-grok-completion-v1",
+        "provider": usage["provider"],
+        "model": usage["model"],
+        "agent_version": expected_version,
+        "trajectory_schema": trajectory["schema_version"],
+        "session_id": trajectory["session_id"],
+        "request_count": usage["request_count"],
+        "n_agent_steps": len(steps),
+    }
+
+
 def _bundled_completed_outcome(
     assignment: dict, trial_dir: Path, patch: Path, result: Path | None,
 ) -> dict | None:
@@ -1164,7 +1322,10 @@ def _upload_trial(
             "timed_usage_incomplete_reason", "usage_aggregate_source",
             "usage_incomplete_reason", "usage_evidence_tier",
             "session_usage_model_request_count", "request_ledger_duplicate_count",
-            "request_ledger_source",
+            "request_ledger_source", "session_usage_request_attempt_count",
+            "session_usage_request_retry_count",
+            "provider_actual_cost_observed", "cost_semantics",
+            "completed_turn_count", "turn_prompt_count",
             "cache_creation_tokens", "subscription_reported_cost_usd",
             "subscription_reported_cost_basis",
         ):
@@ -1174,7 +1335,13 @@ def _upload_trial(
         for key in ("n_input_tokens", "n_cache_tokens", "n_output_tokens"):
             upload_meta[key] = (
                 usage[key]
-                if usage["complete"] or usage.get("request_usage_observed") is True
+                if (
+                    usage["complete"]
+                    or (
+                        usage.get("provider") != "kimi-code"
+                        and usage.get("request_usage_observed") is True
+                    )
+                )
                 else None
             )
 
@@ -1231,15 +1398,16 @@ def _upload_trial(
             None if entry.get("omit_trajectory_bundle")
             else trajectory_bundle_scrubbed
         )
-        if submit_bundle is not None:
-            projected_bytes = _estimated_upload_body_bytes(
-                upload_patch, traj_scrubbed, result_scrubbed,
-                submit_bundle, upload_meta,
-            )
-            if projected_bytes > _UPLOAD_BODY_BUDGET_BYTES:
+        projected_bytes = _estimated_upload_body_bytes(
+            upload_patch, traj_scrubbed, result_scrubbed,
+            submit_bundle, upload_meta,
+        )
+        if projected_bytes > _UPLOAD_BODY_BUDGET_BYTES:
+            if submit_bundle is not None:
                 # Persist before submitting so a crash or later transport
                 # failure cannot rebuild and resend the same oversized body.
                 entry["omit_trajectory_bundle"] = True
+                entry.pop("upload_intent", None)
                 pending.record(HOME, entry)
                 submit_bundle = None
                 print(
@@ -1248,6 +1416,18 @@ def _upload_trial(
                     f"{_UPLOAD_BODY_BUDGET_BYTES / 1_000_000:.0f} MB request "
                     "budget; omitting the optional trajectory bundle"
                 )
+                projected_bytes = _estimated_upload_body_bytes(
+                    upload_patch, traj_scrubbed, result_scrubbed,
+                    None, upload_meta,
+                )
+            if projected_bytes > _UPLOAD_BODY_BUDGET_BYTES:
+                print(
+                    f"  {task_id}: required upload body is "
+                    f"{projected_bytes / 1_000_000:.1f} MB, above the safe "
+                    f"{_UPLOAD_BODY_BUDGET_BYTES / 1_000_000:.0f} MB request "
+                    "budget; kept for retry without allocating the body"
+                )
+                return "upload-failed"
         while True:
             submit_kwargs = {
                 "outcome": outcome,
@@ -1255,6 +1435,61 @@ def _upload_trial(
             }
             if submit_bundle is not None:
                 submit_kwargs["trajectory_bundle"] = submit_bundle
+            runner_session_id = entry.get("runner_session_id")
+            if runner_session_id:
+                manifest = submission_payload_manifest(
+                    assignment_id=assignment_id,
+                    session_id=runner_session_id,
+                    resume_generation=int(entry.get("resume_generation", 0)),
+                    outcome=outcome,
+                    meta=upload_meta,
+                    patch=upload_patch,
+                    trajectory=traj_scrubbed,
+                    result=result_scrubbed,
+                    trajectory_bundle=submit_bundle,
+                )
+                calculated_intent_id = upload_intent_id(manifest)
+                saved_intent = entry.get("upload_intent")
+                if saved_intent is not None and (
+                    not isinstance(saved_intent, dict)
+                    or saved_intent.get("id") != calculated_intent_id
+                    or saved_intent.get("manifest") != manifest
+                ):
+                    print(
+                        f"  {task_id}: prepared upload changed after its "
+                        "content-bound intent was saved; kept for explicit "
+                        "recovery instead of changing the pending result"
+                    )
+                    return "upload-failed"
+                try:
+                    registered_intent_id = client.register_submission_upload_intent(
+                        assignment_id,
+                        entry["nonce"],
+                        runner_session_id,
+                        int(entry.get("resume_generation", 0)),
+                        calculated_intent_id,
+                    )
+                except ApiError as exc:
+                    if exc.status_code != 404:
+                        print(
+                            f"  {task_id}: could not register the content-bound "
+                            f"upload recovery intent ({exc}) — kept for retry "
+                            "without sending an unfenced submission"
+                        )
+                        return "upload-failed"
+                else:
+                    if registered_intent_id != calculated_intent_id:
+                        print(
+                            f"  {task_id}: server returned a mismatched upload "
+                            "intent identity; kept for retry"
+                        )
+                        return "upload-failed"
+                    entry["upload_intent"] = {
+                        "id": calculated_intent_id,
+                        "manifest": manifest,
+                    }
+                    pending.record(HOME, entry)
+                    submit_kwargs["upload_intent_id"] = calculated_intent_id
             try:
                 ack = client.submit(
                     assignment_id, entry["nonce"], upload_patch, traj_scrubbed,
@@ -1268,6 +1503,7 @@ def _upload_trial(
                     # second request so a crash/transport failure cannot make
                     # the next retry rebuild and resend the rejected artifact.
                     entry["omit_trajectory_bundle"] = True
+                    entry.pop("upload_intent", None)
                     pending.record(HOME, entry)
                     submit_bundle = None
                     print(
@@ -1704,16 +1940,26 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         dsh_completion = _dsh_completed_outcome(
             art.trial_dir, art.patch, art.result,
         )
+    grok_completion = None
+    if (
+        assignment.get("agent") == GROK_AGENT
+        and art.returncode != 0
+        and not stats.get("exception_info")
+    ):
+        grok_completion = _grok_completed_outcome(
+            assignment, art.trial_dir, art.patch, art.result,
+        )
     bundled_completion = None
     if (
         art.returncode != 0
         and not stats.get("exception_info")
         and dsh_completion is None
+        and grok_completion is None
     ):
         bundled_completion = _bundled_completed_outcome(
             assignment, art.trial_dir, art.patch, art.result,
         )
-    postrun_completion = dsh_completion or bundled_completion
+    postrun_completion = dsh_completion or grok_completion or bundled_completion
     interrupted = bool(stats.get("exception_info")) or (
         art.returncode != 0 and postrun_completion is None
     )
@@ -1794,6 +2040,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             ),
             "subscription_oauth_coordination": "native-shared-lock-v1",
         })
+        if grok_completion is not None:
+            meta.update({
+                "grok_completion_evidence": grok_completion,
+                "pier_postrun_warning": True,
+                "pier_failure_phase": "post_agent",
+            })
     if assignment.get("agent") == KIMI_AGENT:
         meta.update({
             "model_config_version": KIMI_RUN_CONFIG_VERSION,
@@ -1844,6 +2096,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
         "archive_session": getattr(args, "archive_session", False),
         "resume_generation": assignment.get("resume_generation", 0),
+        "runner_session_id": telemetry.session_id if telemetry is not None else None,
     }, ask_cleanup=(
         outcome == "completed"
         and not args.keep

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import ast
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -321,30 +322,48 @@ def test_kimi_wire_usage_sums_request_records_without_cache_overlap() -> None:
         if isinstance(node, ast.FunctionDef)
         and node.name in {"_usage_instant", "_kimi_usage_facts"}
     ]
-    namespace = {"Any": Any, "datetime": datetime, "timezone": timezone}
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
     exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
          namespace)
     status = lambda usage, at: {
         "time": at,
         "type": "usage.record",
         "usageScope": "turn",
+        "model": "kimi-code/k3",
         "usage": usage,
     }
     facts = namespace["_kimi_usage_facts"]([
+        {"type": "metadata", "protocol_version": "1"},
+        {"type": "turn.prompt", "time": "2026-08-18T00:59:59Z"},
+        {"type": "llm.request", "model": "k3",
+         "turnStep": "1.1", "time": "2026-08-18T00:59:59.500Z"},
         status({
             "inputOther": 1_964,
             "inputCacheCreation": 101,
             "inputCacheRead": 19_200,
             "output": 27,
         }, "2026-08-18T01:00:00Z"),
+        {"type": "llm.request", "model": "k3",
+         "turnStep": "1.2", "time": "2026-08-18T01:00:01Z"},
         status({
             "inputOther": 10,
             "inputCacheCreation": 20,
             "inputCacheRead": 30,
             "output": 4,
         }, "2026-08-18T01:00:02Z"),
-        {"type": "turn.ended"},
-        {"type": "turn.ended"},
+        {"type": "llm.request", "model": "k3",
+         "turnStep": "1.3", "time": "2026-08-18T01:00:03Z"},
+        status({
+            "inputOther": 0,
+            "inputCacheCreation": 0,
+            "inputCacheRead": 0,
+            "output": 0,
+        }, "2026-08-18T01:00:04Z"),
+        {"type": "turn.ended", "turnId": 1, "reason": "completed",
+         "time": "2026-08-18T01:00:05Z"},
         {"message": {"type": "Unrelated"}},
     ])
     assert facts["complete"] is True
@@ -352,20 +371,25 @@ def test_kimi_wire_usage_sums_request_records_without_cache_overlap() -> None:
     assert facts["n_cache_tokens"] == 19_230
     assert facts["n_output_tokens"] == 31
     assert facts["cache_creation_tokens"] == 121
-    assert facts["request_count"] == 2
-    assert facts["completed_turn_count"] == 2
+    assert facts["request_count"] == 3
+    assert facts["session_usage_model_request_count"] == 3
+    assert facts["completed_turn_count"] == 1
+    assert facts["turn_prompt_count"] == 1
+    assert facts["request_ledger_duplicate_count"] == 0
     assert facts["request_usage_complete"] is True
     assert sum(e["n_input_tokens"] for e in facts["token_usage_events"]) == 21_325
 
     incomplete = namespace["_kimi_usage_facts"]([
+        {"type": "metadata", "protocol_version": "1"},
+        {"type": "turn.prompt", "time": "2026-08-18T00:59:59Z"},
+        {"type": "llm.request", "model": "k3",
+         "turnStep": "1.1", "time": "2026-08-18T00:59:59.500Z"},
         status({
             "inputOther": 1_964,
             "inputCacheCreation": 0,
             "inputCacheRead": 19_200,
             "output": 27,
         }, "2026-08-18T01:00:00Z"),
-        {"type": "turn.ended"},
-        {"type": "turn.ended"},
     ])
     assert incomplete["complete"] is False
     assert incomplete["request_usage_complete"] is False
@@ -375,6 +399,130 @@ def test_kimi_wire_usage_sums_request_records_without_cache_overlap() -> None:
     assert incomplete["n_cache_tokens"] == 19_200
     assert incomplete["n_output_tokens"] == 27
     assert len(incomplete["token_usage_events"]) == 1
+
+
+def test_kimi_wire_usage_fails_closed_on_replay_conflict_and_bad_terminal() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+    usage = {
+        "inputOther": 10, "inputCacheCreation": 1,
+        "inputCacheRead": 20, "output": 3,
+    }
+
+    def one_turn(*, reason: str = "completed") -> list[dict]:
+        return [
+            {"type": "metadata", "protocol_version": "1"},
+            {"type": "turn.prompt", "time": 1_787_000_000_000},
+            {"type": "llm.request", "model": "k3",
+             "turnStep": "1.1", "time": 1_787_000_000_100},
+            {"type": "usage.record", "usageScope": "turn",
+             "model": "kimi-code/k3", "time": 1_787_000_000_200,
+             "usage": dict(usage)},
+            {"type": "turn.ended", "turnId": 1, "reason": reason,
+             "time": 1_787_000_000_300},
+        ]
+
+    facts = namespace["_kimi_usage_facts"](one_turn())
+    assert facts["complete"] is True
+
+    replayed = one_turn()
+    replayed.insert(4, dict(replayed[3]))
+    replayed_facts = namespace["_kimi_usage_facts"](replayed)
+    assert replayed_facts["complete"] is False
+    assert replayed_facts["request_usage_observed"] is False
+    assert replayed_facts["request_ledger_duplicate_count"] == 1
+    assert replayed_facts["token_usage_events"] == []
+
+    conflicting = one_turn()
+    conflict = json.loads(json.dumps(conflicting[3]))
+    conflict["usage"]["output"] += 1
+    conflicting.insert(4, conflict)
+    conflict_facts = namespace["_kimi_usage_facts"](conflicting)
+    assert conflict_facts["complete"] is False
+    assert conflict_facts["request_usage_observed"] is False
+
+    limited = namespace["_kimi_usage_facts"](one_turn(reason="resource_limit"))
+    assert limited["complete"] is False
+    assert limited["request_usage_observed"] is True
+    assert limited["usage_incomplete_reason"] == "turn_completion_ledger_mismatch"
+
+    cross_session = one_turn()
+    cross_session.insert(1, {"type": "metadata", "protocol_version": "1"})
+    cross_session_facts = namespace["_kimi_usage_facts"](cross_session)
+    assert cross_session_facts["complete"] is False
+    assert cross_session_facts["request_usage_observed"] is False
+    assert cross_session_facts["usage_incomplete_reason"] == (
+        "request_ledger_unavailable_or_invalid"
+    )
+
+
+def test_kimi_wire_groups_retries_and_accepts_multiturn_equal_millis() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+
+    def request(step: str, at: int, **extra) -> dict:
+        return {"type": "llm.request", "model": "k3", "turnStep": step,
+                "time": at, **extra}
+
+    def usage(at: int, output: int) -> dict:
+        return {
+            "type": "usage.record", "usageScope": "turn",
+            "model": "kimi-code/k3", "time": at,
+            "usage": {"inputOther": 10, "inputCacheCreation": 0,
+                      "inputCacheRead": 20, "output": output},
+        }
+
+    records = [
+        {"type": "metadata", "protocol_version": "1"},
+        {"type": "turn.prompt", "time": 100},
+        request("0.1", 110),
+        request("0.1", 120, attempt="2/10"),
+        usage(200, 3),
+        request("0.2", 200),
+        usage(200, 4),
+        {"type": "turn.ended", "turnId": 0, "reason": "completed", "time": 210},
+        {"type": "turn.prompt", "time": 300},
+        request("1.1", 310),
+        usage(400, 5),
+        {"type": "turn.ended", "turnId": 1, "reason": "completed", "time": 410},
+    ]
+    facts = namespace["_kimi_usage_facts"](records)
+    assert facts["complete"] is True
+    assert facts["request_count"] == 3
+    assert facts["session_usage_model_request_count"] == 3
+    assert facts["session_usage_request_attempt_count"] == 4
+    assert facts["session_usage_request_retry_count"] == 1
+    assert facts["completed_turn_count"] == 2
+    assert facts["turn_prompt_count"] == 2
+
+    replay = list(records)
+    replay.insert(5, request("0.1", 201))
+    replayed = namespace["_kimi_usage_facts"](replay)
+    assert replayed["complete"] is False
+    assert replayed["request_usage_observed"] is False
+    assert replayed["request_ledger_duplicate_count"] == 1
 
 
 def test_kimi_copies_only_the_main_agent_durable_wire() -> None:

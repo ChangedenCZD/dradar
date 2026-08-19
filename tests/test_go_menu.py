@@ -20,6 +20,10 @@ from dradar.providers import (
     DSH_RUN_CONFIG_VERSION,
     DSH_RUNTIME_PROFILE,
     DSH_VERSION,
+    GROK_AGENT,
+    GROK_CLI_VERSION,
+    GROK_MODEL,
+    GROK_PROVIDER,
 )
 from dradar.runner import RunnerError, TrialArtifacts
 
@@ -747,6 +751,195 @@ def test_complete_bundle_survives_nonzero_pier_postrun_rc(monkeypatch, tmp_path:
         "root_session_count": 1,
         "subagent_session_count": 1,
     }
+
+
+def _write_complete_grok_artifacts(art: TrialArtifacts) -> dict:
+    usage = {
+        "schema": "dradar-subscription-provider-usage-v1",
+        "provider": "grok",
+        "model": GROK_MODEL,
+        "complete": True,
+        "request_count": 2,
+        "n_input_tokens": 300,
+        "n_cache_tokens": 120,
+        "n_output_tokens": 30,
+        "request_usage_complete": True,
+        "request_usage_observed": True,
+        "timed_usage_complete": False,
+        "usage_evidence_tier": "complete_reconciled",
+        "token_usage_events": [
+            {"n_input_tokens": 100, "n_cache_tokens": 40,
+             "n_output_tokens": 10},
+            {"n_input_tokens": 200, "n_cache_tokens": 80,
+             "n_output_tokens": 20},
+        ],
+    }
+    phases = {
+        "environment_setup": {
+            "started_at": "2026-08-19T15:00:01Z",
+            "finished_at": "2026-08-19T15:01:00Z",
+        },
+        "agent_setup": {
+            "started_at": "2026-08-19T15:01:00Z",
+            "finished_at": "2026-08-19T15:01:01Z",
+        },
+        "agent_execution": {
+            "started_at": "2026-08-19T15:01:01Z",
+            "finished_at": "2026-08-19T15:09:59Z",
+        },
+    }
+    result = {
+        "started_at": "2026-08-19T15:00:00Z",
+        "finished_at": "2026-08-19T15:10:00Z",
+        "exception_info": None,
+        "agent_result": {
+            "n_input_tokens": 300,
+            "n_cache_tokens": 120,
+            "n_output_tokens": 30,
+            "n_agent_steps": 1,
+            "metadata": {"provider_usage": usage},
+        },
+        **phases,
+    }
+    assert art.result is not None
+    art.result.write_text(json.dumps(result), encoding="utf-8")
+    agent = art.trial_dir / "agent"
+    agent.mkdir(exist_ok=True)
+    (agent / "provider-usage.json").write_text(
+        json.dumps(usage), encoding="utf-8",
+    )
+    (agent / "trajectory.json").write_text(json.dumps({
+        "schema_version": "ATIF-v1.7",
+        "session_id": "grok-session-1",
+        "agent": {
+            "name": GROK_AGENT,
+            "version": GROK_CLI_VERSION,
+            "model_name": GROK_MODEL,
+            "extra": {"provider": GROK_PROVIDER, "oauth": True},
+        },
+        "steps": [{
+            "step_id": 1,
+            "source": "agent",
+            "message": "Implementation complete.",
+            "model_name": GROK_MODEL,
+            "reasoning_effort": "xhigh",
+            "llm_call_count": 1,
+        }],
+        "final_metrics": {
+            "total_prompt_tokens": 300,
+            "total_cached_tokens": 120,
+            "total_completion_tokens": 30,
+            "total_steps": 1,
+        },
+    }), encoding="utf-8")
+    art.patch.write_text(
+        "diff --git a/result.txt b/result.txt\n"
+        "new file mode 100644\n--- /dev/null\n+++ b/result.txt\n"
+        "@@ -0,0 +1 @@\n+done\n",
+        encoding="utf-8",
+    )
+    return usage
+
+
+def test_grok_complete_evidence_survives_nonzero_pier_postrun_rc(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    art = _fake_art(tmp_path, rc=1, result_data={})
+    art.codex_cli_version = None
+    art.grok_cli_version = GROK_CLI_VERSION
+    _write_complete_grok_artifacts(art)
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+    assignment = {
+        **ASSIGNMENT,
+        "agent": GROK_AGENT,
+        "provider": GROK_PROVIDER,
+        "model": GROK_MODEL,
+        "effort": "xhigh",
+        "agent_version": GROK_CLI_VERSION,
+    }
+
+    tag = runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "submitted"
+    sub = client.submissions[0]
+    assert sub["outcome"] == "completed"
+    assert sub["meta"]["pier_returncode"] == 1
+    assert sub["meta"]["pier_postrun_warning"] is True
+    assert sub["meta"]["pier_failure_phase"] == "post_agent"
+    assert sub["meta"]["grok_completion_evidence"] == {
+        "schema": "dradar-grok-completion-v1",
+        "provider": "grok",
+        "model": GROK_MODEL,
+        "agent_version": GROK_CLI_VERSION,
+        "trajectory_schema": "ATIF-v1.7",
+        "session_id": "grok-session-1",
+        "request_count": 2,
+        "n_agent_steps": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["secret-patch", "incomplete-usage", "wrong-model", "bad-metrics",
+     "missing-phase-finish"],
+)
+def test_grok_nonzero_rc_stays_interrupted_without_every_completion_gate(
+    monkeypatch, tmp_path: Path, tamper: str,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    art = _fake_art(tmp_path, rc=1, result_data={})
+    art.codex_cli_version = None
+    art.grok_cli_version = GROK_CLI_VERSION
+    _write_complete_grok_artifacts(art)
+    agent = art.trial_dir / "agent"
+    if tamper == "secret-patch":
+        art.patch.write_text(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n"
+            "+OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n",
+            encoding="utf-8",
+        )
+    elif tamper == "incomplete-usage":
+        usage = json.loads((agent / "provider-usage.json").read_text())
+        usage["complete"] = False
+        usage["usage_incomplete_reason"] = (
+            "terminal_aggregate_missing_or_inconsistent"
+        )
+        (agent / "provider-usage.json").write_text(json.dumps(usage))
+    elif tamper == "wrong-model":
+        trajectory = json.loads((agent / "trajectory.json").read_text())
+        trajectory["agent"]["model_name"] = "grok-other"
+        (agent / "trajectory.json").write_text(json.dumps(trajectory))
+    elif tamper == "bad-metrics":
+        trajectory = json.loads((agent / "trajectory.json").read_text())
+        trajectory["final_metrics"]["total_prompt_tokens"] += 1
+        (agent / "trajectory.json").write_text(json.dumps(trajectory))
+    else:
+        assert art.result is not None
+        result = json.loads(art.result.read_text())
+        result["agent_execution"]["finished_at"] = None
+        art.result.write_text(json.dumps(result))
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+    assignment = {
+        **ASSIGNMENT,
+        "agent": GROK_AGENT,
+        "provider": GROK_PROVIDER,
+        "model": GROK_MODEL,
+        "effort": "xhigh",
+        "agent_version": GROK_CLI_VERSION,
+    }
+
+    tag = runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "interrupted"
+    assert client.submissions[0]["outcome"] == "interrupted"
+    assert "grok_completion_evidence" not in client.submissions[0]["meta"]
 
 
 def test_dsh_completed_agent_survives_nonzero_pier_postrun_rc(
